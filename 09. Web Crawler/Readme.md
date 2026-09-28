@@ -1,5 +1,9 @@
 # Chapter 9: Design a Web Crawler
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 A **web crawler**, also known as a spider or robot, is used to discover and collect web content, such as web pages, images, and videos. This chapter focuses on designing a scalable web crawler for **search engine indexing**.
 

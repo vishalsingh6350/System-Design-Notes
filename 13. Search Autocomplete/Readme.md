@@ -1,5 +1,9 @@
 # Chapter 13: Design a Search Autocomplete System
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 Autocomplete, also known as typeahead or incremental search, provides real-time suggestions to users as they type in search boxes. The system must efficiently deliver top-k relevant and popular suggestions based on historical query data.
 

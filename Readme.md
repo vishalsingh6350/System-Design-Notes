@@ -1,5 +1,10 @@
 
 # [System Design Interview - An Insider's Guide (Vol 1 and 2)](https://bytebytego.com/courses/system-design-interview)
+
+> [!IMPORTANT]
+> **Disclaimer & Attribution:**
+> I am **not the original author** of this content. These notes and materials are created and compiled strictly for **personal study, learning, and reference purposes**. The content is based on the books [*System Design Interview – An Insider's Guide* (Volume 1 & 2)](https://bytebytego.com/courses/system-design-interview) by Alex Xu and related resources. All credit, original work, and copyrights belong to the respective authors and publishers.
+
 These notes are based on the System Design Interview books - [Vol 1 and Vol 2 2nd Ed](https://www.goodreads.com/book/show/54109255-system-design-interview-an-insider-s-guide) 
 
 Check the notes here: https://pagefy.io/system-design/system-design-interview-by-alex-xu

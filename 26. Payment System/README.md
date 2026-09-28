@@ -1,5 +1,9 @@
 # Chapter 26: Payment System
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 We'll design a **payment system** in this chapter, which underpins all of modern **e-commerce**.
 

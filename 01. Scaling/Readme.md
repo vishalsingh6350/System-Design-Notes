@@ -1,5 +1,9 @@
 # Chapter 1: Scale from Zero to Millions of Users
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 Scaling a system to support millions of users is a complex, iterative journey requiring refinement and optimization. This chapter outlines how to begin with a single server setup and scale the architecture step by step to handle millions of users.
 

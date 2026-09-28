@@ -1,5 +1,9 @@
 # Chapter 23: Distributed Email Service
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 
 We'll design a **distributed email service**, similar to **Gmail** in this chapter.

@@ -1,5 +1,9 @@
 # Chapter 18: Google Maps
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 
 We'll design a simple version of **Google Maps**.

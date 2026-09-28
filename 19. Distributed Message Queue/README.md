@@ -1,5 +1,9 @@
 # Chapter 19: Distributed Message Queue
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 
 We'll be designing a **distributed message queue** in this chapter.

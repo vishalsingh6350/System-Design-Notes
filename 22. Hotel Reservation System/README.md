@@ -1,5 +1,9 @@
 # Chapter 22: Hotel Reservation System
 
+> [!NOTE]
+> **Disclaimer:** I am not the original author of this material. These notes are compiled strictly for personal study and reference based on *System Design Interview – An Insider's Guide* by Alex Xu. All credit and original rights belong to the original author and publisher.
+
+
 ## Introduction
 In this chapter, we're designing a **hotel reservation system**, similar to Marriott International.
 
