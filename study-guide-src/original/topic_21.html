@@ -1,0 +1,444 @@
+<h3>Introduction</h3>
+<p><strong>Digital advertising</strong> is a big industry with the rise of Facebook, YouTube, TikTok, etc.</p>
+<p>Hence, tracking ad click events is important. In this chapter, we explore how to design an <strong>ad click event aggregation</strong> system at Facebook/Google scale.</p>
+<p>Digital advertising has a process called <strong>real-time bidding (RTB)</strong>, where digital advertising inventory is bought and sold:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/digital-advertising-example.png" alt="digital-advertising-example">
+<p>Speed of RTB is important as it usually occurs within a second.
+Data accuracy is also very important as it impacts how much money advertisers pay.</p>
+<p>Based on ad click event aggregations, advertisers can make decisions such as adjust target audience and keywords.</p>
+
+<h3>Step 1: Understand the Problem and Establish Design Scope</h3>
+<ul>
+<li>C: What is the format of the input data?</li>
+<li>I: 1bil ad clicks per day and 2mil ads in total. Number of ad-click events grows 30% year-over-year.</li>
+<li>C: What are some of the most important queries our system needs to support?</li>
+<li>I: Top queries to take into consideration:
+  <ul>
+    <li>Return number of click events for ad X in last Y minutes</li>
+    <li>Return top 100 most clicked ads in the past 1min. Both parameters should be configurable. Aggregation occurs every minute.</li>
+    <li>Support data filtering by <code>ip</code>, <code>user_id</code>, <code>country</code> for the above queries</li>
+  </ul>
+</li>
+<li>C: Do we need to worry about edge cases? Some of the ones I can think of:
+  <ul>
+    <li>There might be events that arrive later than expected</li>
+    <li>There might be duplicate events</li>
+    <li>Different parts of the system might be down, so we need to consider system recovery</li>
+  </ul>
+</li>
+<li>I: That's a good list, take those into consideration</li>
+<li>C: What is the latency requirement?</li>
+<li>I: A few minutes of e2e latency for ad click aggregation. For RTB, it is less than a second. It is ok to have that latency for ad click aggregation as those are usually used for billing and reporting.</li>
+</ul>
+
+<h4>Functional requirements</h4>
+<ul>
+<li>Aggregate the number of clicks of <code>ad_id</code> in the last Y minutes</li>
+<li>Return top 100 most clicked <code>ad_id</code> every minute</li>
+<li>Support aggregation filtering by different attributes</li>
+<li>Dataset volume is at Facebook or Google scale</li>
+</ul>
+
+<h4>Non-functional requirements</h4>
+<ul>
+<li>Correctness of the aggregation result is important as it's used for RTB and ads billing</li>
+<li>Properly handle delayed or duplicate events</li>
+<li>Robustness - system should be resilient to partial failures</li>
+<li>Latency - a few minutes of e2e latency at most</li>
+</ul>
+
+<h4>Back-of-the-envelope estimation</h4>
+<ul>
+<li>1bil DAU</li>
+<li>Assuming user clicks 1 ad per day -&gt; 1bil ad clicks per day</li>
+<li>Ad click QPS = 10,000</li>
+<li>Peak QPS is 5 times the number = 50,000</li>
+<li>A single ad click occupies 0.1KB storage. Daily storage requirement is 100gb</li>
+<li>Monthly storage = 3tb</li>
+</ul>
+
+<h3>Step 2: Propose High-Level Design and Get Buy-In</h3>
+<p>In this section, we discuss query API design, data model and high-level design.</p>
+
+<h4>Query API Design</h4>
+<p>The API is a contract between the client and the server. In our case, the client is the dashboard user - data scientist/analyst, advertiser, etc.</p>
+<p>Here's our functional requirements:</p>
+<ul>
+<li>Aggregate the number of clicks of <code>ad_id</code> in the last Y minutes</li>
+<li>Return top N most clicked <code>ad_id</code> in the last M minutes</li>
+<li>Support aggregation filtering by different attributes</li>
+</ul>
+<p>We need two endpoints to achieve those requirements. Filtering can be done via query parameters on one of them.</p>
+<p><strong>Aggregate number of clicks of ad_id in the last M minutes</strong>:</p>
+<pre><code>GET /v1/ads/{:ad_id}/aggregated_count
+</code></pre>
+<p>Query parameters:</p>
+<ul>
+<li>from - start minute. Default is now - 1 min</li>
+<li>to - end minute. Default is now</li>
+<li>filter - identifier for different filtering strategies. Eg 001 means "non-US clicks".</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>ad_id - ad identifier</li>
+<li>count - aggregated count between start and end minutes</li>
+</ul>
+<p><strong>Return top N most clicked ad_ids in the last M minutes</strong></p>
+<pre><code>GET /v1/ads/popular_ads
+</code></pre>
+<p>Query parameters:</p>
+<ul>
+<li>count - top N most clicked ads</li>
+<li>window - aggregation window size in minutes</li>
+<li>filter - identifier for different filtering strategies</li>
+</ul>
+<p>Response:</p>
+<ul>
+<li>list of ad_ids</li>
+</ul>
+
+<h4>Data model</h4>
+<p>In our system, we have raw and aggregated data.</p>
+<p>Raw data looks like this:</p>
+<pre><code>[AdClickEvent] ad001, 2021-01-01 00:00:01, user 1, 207.148.22.22, USA
+</code></pre>
+<p>Here's an example in a structured format:</p>
+<table>
+<thead><tr><th>ad_id</th><th>click_timestamp</th><th>user</th><th>ip</th><th>country</th></tr></thead>
+<tbody>
+<tr><td>ad001</td><td>2021-01-01 00:00:01</td><td>user1</td><td>207.148.22.22</td><td>USA</td></tr>
+<tr><td>ad001</td><td>2021-01-01 00:00:02</td><td>user1</td><td>207.148.22.22</td><td>USA</td></tr>
+<tr><td>ad002</td><td>2021-01-01 00:00:02</td><td>user2</td><td>209.153.56.11</td><td>USA</td></tr>
+</tbody>
+</table>
+<p>Here's the aggregated version:</p>
+<table>
+<thead><tr><th>ad_id</th><th>click_minute</th><th>filter_id</th><th>count</th></tr></thead>
+<tbody>
+<tr><td>ad001</td><td>202101010000</td><td>0012</td><td>2</td></tr>
+<tr><td>ad001</td><td>202101010000</td><td>0023</td><td>3</td></tr>
+<tr><td>ad001</td><td>202101010001</td><td>0012</td><td>1</td></tr>
+<tr><td>ad001</td><td>202101010001</td><td>0023</td><td>6</td></tr>
+</tbody>
+</table>
+<p>The <code>filter_id</code> helps us achieve our filtering requirements.</p>
+<table>
+<thead><tr><th>filter_id</th><th>region</th><th>IP</th><th>user_id</th></tr></thead>
+<tbody>
+<tr><td>0012</td><td>US</td><td>*</td><td>*</td></tr>
+<tr><td>0013</td><td>*</td><td>123.1.2.3</td><td>*</td></tr>
+</tbody>
+</table>
+<p>To support quickly returning top N most clicked ads in the last M minutes, we'll also maintain this structure:</p>
+<table>
+<thead><tr><th>most_clicked_ads</th><th></th><th></th></tr></thead>
+<tbody>
+<tr><td>window_size</td><td>integer</td><td>The aggregation window size (M) in minutes</td></tr>
+<tr><td>update_time_minute</td><td>timestamp</td><td>Last updated timestamp (in 1-minute granularity)</td></tr>
+<tr><td>most_clicked_ads</td><td>array</td><td>List of ad IDs in JSON format.</td></tr>
+</tbody>
+</table>
+<p>What are some pros and cons between storing raw data and storing aggregated data?</p>
+<ul>
+<li>Raw data enables using the full data set and supports data filtering and recalculation</li>
+<li>On the other hand, aggregated data allows us to have a smaller data set and a faster query</li>
+<li>Raw data means having a larger data store and a slower query</li>
+<li>Aggregated data, however, is derived data, hence there is some data loss.</li>
+</ul>
+<p>In our design, we'll use a combination of both approaches:</p>
+<ul>
+<li>It's a good idea to keep the raw data around for debugging. If there is some bug in aggregation, we can discover the bug and backfill.</li>
+<li>Aggregated data should be stored as well for faster query performance.</li>
+<li>Raw data can be stored in cold storage to avoid extra storage costs.</li>
+</ul>
+<p>When it comes to the database, there are several factors to take into consideration:</p>
+<ul>
+<li>What does the data look like? Is it relational, document or blob?</li>
+<li>Is the workload read-heavy, write-heavy or both?</li>
+<li>Are transactions needed?</li>
+<li>Do the queries rely on OLAP functions like SUM and COUNT?</li>
+</ul>
+<p>For the raw data, we can see that the average QPS is 10k and peak QPS is 50k, so the system is write-heavy.
+On the other hand, read traffic is low as raw data is mostly used as backup if anything goes wrong.</p>
+<p>Relational databases can do the job, but it can be challenging to scale the writes.
+Alternatively, we can use Cassandra or InfluxDB which have better native support for heavy write loads.</p>
+<p>Another option is to use Amazon S3 with a columnar data format like ORC, Parquet or AVRO. Since this setup is unfamiliar, we'll stick to Cassandra.</p>
+<p>For aggregated data, the workload is both read and write heavy as aggregated data is constantly queried for dashboards and alerts.
+It is also write-heavy as data is aggregated and written every minute by the aggregation service.
+Hence, we'll use the same data store (Cassandra) here as well.</p>
+
+<h4>High-level design</h4>
+<p>Here's how our system looks like:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/high-level-design-1.png" alt="high-level-design-1">
+<p>Data flows as an unbounded data stream on both inputs and outputs.</p>
+<p>In order to avoid having a synchronous sink, where a consumer crashing can cause the whole system to stall,
+we'll leverage asynchronous processing using message queues (Kafka) to decouple consumers and producers.</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/high-level-design-2.png" alt="high-level-design-2">
+<p>The first message queue stores ad click event data:</p>
+<table>
+<thead><tr><th>ad_id</th><th>click_timestamp</th><th>user_id</th><th>ip</th><th>country</th></tr></thead>
+<tbody></tbody>
+</table>
+<p>The second message queue contains ad click counts, aggregated per-minute:</p>
+<table>
+<thead><tr><th>ad_id</th><th>click_minute</th><th>count</th></tr></thead>
+<tbody></tbody>
+</table>
+<p>As well as top N clicked ads aggregated per minute:</p>
+<table>
+<thead><tr><th>update_time_minute</th><th>most_clicked_ads</th></tr></thead>
+<tbody></tbody>
+</table>
+<p>The second message queue is there in order to achieve end to end exactly-once atomic commit semantics:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/atomic-commit.png" alt="atomic-commit">
+<p>For the aggregation service, using the MapReduce framework is a good option:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/ad-count-map-reduce.png" alt="ad-count-map-reduce">
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/top-100-map-reduce.png" alt="top-100-map-reduce">
+<p>Each node is responsible for one single task and it sends the processing result to the downstream node.</p>
+<p>The map node is responsible for reading from the data source, then filtering and transforming the data.</p>
+<p>For example, the map node can allocate data across different aggregation nodes based on the <code>ad_id</code>:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/map-node.png" alt="map-node">
+<p>Alternatively, we can distribute ads across Kafka partitions and let the aggregation nodes subscribe directly within a consumer group.
+However, the mapping node enables us to sanitize or transform the data before subsequent processing.</p>
+<p>Another reason might be that we don't have control over how data is produced,
+so events related to the same <code>ad_id</code> might go on different partitions.</p>
+<p>The aggregate node counts ad click events by <code>ad_id</code> in-memory every minute.</p>
+<p>The reduce node collects aggregated results from aggregate node and produces the final result:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/reduce-node.png" alt="reduce-node">
+<p>This DAG model uses the MapReduce paradigm. It takes big data and leverages parallel distributed computing to turn it into regular-sized data.</p>
+<p>In the DAG model, intermediate data is stored in-memory and different nodes communicate with each other using TCP or shared memory.</p>
+<p>Let's explore how this model can now help us to achieve our various use-cases.</p>
+<p><strong>Use-case 1 - aggregate the number of clicks</strong>:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/use-case-1.png" alt="use-case-1">
+<ul>
+<li>Ads are partitioned using <code>ad_id % 3</code></li>
+</ul>
+<p><strong>Use-case 2 - return top N most clicked ads</strong>:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/use-case-2.png" alt="use-case-2">
+<ul>
+<li>In this case, we're aggregating the top 3 ads, but this can be extended to top N ads easily</li>
+<li>Each node maintains a heap data structure for fast retrieval of top N ads</li>
+</ul>
+<p><strong>Use-case 3 - data filtering</strong>:
+To support fast data filtering, we can predefine filtering criterias and pre-aggregate based on it:</p>
+<table>
+<thead><tr><th>ad_id</th><th>click_minute</th><th>country</th><th>count</th></tr></thead>
+<tbody>
+<tr><td>ad001</td><td>202101010001</td><td>USA</td><td>100</td></tr>
+<tr><td>ad001</td><td>202101010001</td><td>GPB</td><td>200</td></tr>
+<tr><td>ad001</td><td>202101010001</td><td>others</td><td>3000</td></tr>
+<tr><td>ad002</td><td>202101010001</td><td>USA</td><td>10</td></tr>
+<tr><td>ad002</td><td>202101010001</td><td>GPB</td><td>25</td></tr>
+<tr><td>ad002</td><td>202101010001</td><td>others</td><td>12</td></tr>
+</tbody>
+</table>
+<p>This technique is called the <strong>star schema</strong> and is widely used in data warehouses.
+The filtering fields are called <strong>dimensions</strong>.</p>
+<p>This approach has the following benefits:</p>
+<ul>
+<li>Simple to undertand and build</li>
+<li>Current aggregation service can be reused to create more dimensions in the star schema.</li>
+<li>Accessing data based on filtering criteria is fast as results are pre-calculated</li>
+</ul>
+<p>A limitation of this approach is that it creates many more buckets and records, especially when we have lots of filtering criterias.</p>
+
+<h3>Step 3: Design Deep Dive</h3>
+<p>Let's dive deeper into some of the more interesting topics.</p>
+
+<h4>Streaming vs. Batching</h4>
+<p>The high-level architecture we proposed is a type of stream processing system.
+Here's a comparison between three types of systems:</p>
+<table>
+<thead><tr><th></th><th>Services (Online system)</th><th>Batch system (offline system)</th><th>Streaming system (near real-time system)</th></tr></thead>
+<tbody>
+<tr><td>Responsiveness</td><td>Respond to the client quickly</td><td>No response to the client needed</td><td>No response to the client needed</td></tr>
+<tr><td>Input</td><td>User requests</td><td>Bounded input with finite size. A large amount of data</td><td>Input has no boundary (infinite streams)</td></tr>
+<tr><td>Output</td><td>Responses to clients</td><td>Materialized views, aggregated metrics, etc.</td><td>Materialized views, aggregated metrics, etc.</td></tr>
+<tr><td>Performance measurement</td><td>Availability, latency</td><td>Throughput</td><td>Throughput, latency</td></tr>
+<tr><td>Example</td><td>Online shopping</td><td>MapReduce</td><td>Flink [13]</td></tr>
+</tbody>
+</table>
+<p>In our design, we used a mixture of batching and streaming.</p>
+<p>We used streaming for processing data as it arrives and generates aggregated results in near real-time.
+We used batching, on the other hand, for historical data backup.</p>
+<p>A system which contains two processing paths - batch and streaming, simultaneously, this architecture is called lambda.
+A disadvantage is that you have two processing paths with two different codebases to maintain.</p>
+<p>Kappa is an alternative architecture, which combines batch and stream processing in one processing path.
+The key idea is to use a single stream processing engine.</p>
+<p>Lambda architecture:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/lambda-architecture.png" alt="lambda-architecture">
+<p>Kappa architecture:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/kappa-architecture.png" alt="kappa-architecture">
+<p>Our high-level design uses Kappa architecture as reprocessing of historical data also goes through the aggregation service.</p>
+<p>Whenever we have to recalculate aggregated data due to eg a major bug in aggregation logic, we can recalculate the aggregation from the raw data we store.</p>
+<ul>
+<li>Recalculation service retrieves data from raw storage. This is a batch job.</li>
+<li>Retrieved data is sent to a dedicated aggregation service, so that the real-time processing aggregation service is not impacted.</li>
+<li>Aggregated results are sent to the second message queue, after which we update the results in the aggregation database.</li>
+</ul>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/recalculation-example.png" alt="recalculation-example">
+
+<h4>Time</h4>
+<p>We need a timestamp to perform aggregation. It can be generated in two places:</p>
+<ul>
+<li>event time - when ad click occurs</li>
+<li>Processing time - system time when the server processes the event</li>
+</ul>
+<p>Due to the usage of async processing (message queues) and network delays, there can be significant difference between event time and processing time.</p>
+<ul>
+<li>If we use processing time, aggregation results can be inaccurate</li>
+<li>If we use event time, we have to deal with delayed events</li>
+</ul>
+<p>There is no perfect solution, we need to consider trade-offs:</p>
+<table>
+<thead><tr><th></th><th>Pros</th><th>Cons</th></tr></thead>
+<tbody>
+<tr><td>Event time</td><td>Aggregation results are more accurate</td><td>Clients might have the wrong time or timestamp might be generated by malicious users</td></tr>
+<tr><td>Processing time</td><td>Server timestamp is more reliable</td><td>The timestamp is not accurate if event is late</td></tr>
+</tbody>
+</table>
+<p>Since data accuracy is important, we'll use the event time for aggregation.</p>
+<p>To mitigate the issue of delayed events, a technique called "watermark" can be leveraged.</p>
+<p>In the example below, event 2 misses the window where it needs to be aggregated:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/watermark-technique.png" alt="watermark-technique">
+<p>However, if we purposefully extend the aggregation window, we can reduce the likelihood of missed events.
+The extended part of a window is called a "watermark":</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/watermark-2.png" alt="watermark-2">
+<ul>
+<li>Short watermark increases likelihood of missed events, but reduces latency</li>
+<li>Longer watermark reduces likelihood of missed events, but increases latency</li>
+</ul>
+<p>There is always likelihood of missed events, regardless of the watermark's size. But there is no use in optimizing for such low-probability events.</p>
+<p>We can instead resolve such inconsistencies by doing end-of-day reconciliation.</p>
+
+<h4>Aggregation window</h4>
+<p>There are four types of window functions:</p>
+<ul>
+<li>Tumbling (fixed) window</li>
+<li>Hopping window</li>
+<li>Sliding window</li>
+<li>Session window</li>
+</ul>
+<p>In our design, we leverage a tumbling window for ad click aggregations:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/tumbling-window.png" alt="tumbling-window">
+<p>As well as a sliding window for the top N clicked ads in M minutes aggregation:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/sliding-window.png" alt="sliding-window">
+
+<h4>Delivery guarantees</h4>
+<p>Since the data we're aggregating is going to be used for billing, data accuracy is a priority.</p>
+<p>Hence, we need to discuss:</p>
+<ul>
+<li>How to avoid processing duplicate events</li>
+<li>How to ensure all events are processed</li>
+</ul>
+<p>There are three delivery guarantees we can use - at-most-once, at-least-once and exactly once.</p>
+<p>In most circumstances, at-least-once is sufficient when a small amount of duplicates is acceptable.
+This is not the case for our system, though, as a difference in small percent can result in millions of dollars of discrepancy.
+Hence, we'll need to use exactly-once delivery semantics.</p>
+
+<h4>Data deduplication</h4>
+<p>One of the most common data quality issues is duplicated data.</p>
+<p>It can come from a wide range of sources:</p>
+<ul>
+<li>Client-side - a client might resend the same event multiple times. Duplicated events sent with malicious intent are best handled by a risk engine.</li>
+<li>Server outage - An aggregation service node goes down in the middle of aggregation and the upstream service hasn't received an acknowledgment so event is resent.</li>
+</ul>
+<p>Here's an example of data duplication occurring due to failure to acknowledge an event on the last hop:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example.png" alt="data-duplication-example">
+<p>In this example, offset 100 will be processed and sent downstream multiple times.</p>
+<p>One option to try and mitigate this is to store the last seen offset in HDFS/S3, but this risks the result never reaching downstream:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example-2.png" alt="data-duplication-example-2">
+<p>Finally, we can store the offset while interacting with downstream atomically. To achieve this, we need to implement a distributed transaction:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example-3.png" alt="data-duplication-example-3">
+<p><strong>Personal side-note</strong>: Alternatively, if the downstream system handles the aggregation result idempotently, there is no need for a distributed transaction.</p>
+
+<h4>Scale the system</h4>
+<p>Let's discuss how we scale the system as it grows.</p>
+<p>We have three independent components - message queue, aggregation service and database.
+Since they are decoupled, we can scale them independently.</p>
+<p>How do we scale the message queue:</p>
+<ul>
+<li>We don't put a limit on producers, so they can be scaled easily</li>
+<li>Consumers can be scaled by assigning them to consumer groups and increasing the number of consumers.</li>
+<li>For this to work, we also need to ensure there are enough partitions created preemptively</li>
+<li>Also, consumer rebalancing can take a while when there are thousands of consumers so it is recommended to do it off peak hours</li>
+<li>We could also consider partitioning the topic by geography, eg <code>topic_na</code>, <code>topic_eu</code>, etc.</li>
+</ul>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/scale-consumers.png" alt="scale-consumers">
+<p>How do we scale the aggregation service:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/aggregation-service-scaling.png" alt="aggregation-service-scaling">
+<ul>
+<li>The map-reduce nodes can easily be scaled by adding more nodes</li>
+<li>The throughput of the aggregation service can be scaled by by utilising multi-threading</li>
+<li>Alternatively, we can leverage resource providers such as Apache YARN to utilize multi-processing</li>
+<li>Option 1 is easier, but option 2 is more widely used in practice as it's more scalable</li>
+<li>Here's the multi-threading example:</li>
+</ul>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/multi-threading-example.png" alt="multi-threading-example">
+<p>How do we scale the database:</p>
+<ul>
+<li>If we use Cassandra, it natively supports horizontal scaling utilizing consistent hashing</li>
+<li>If a new node is added to the cluster, data automatically gets rebalanced across all (virtual) nodes</li>
+<li>With this approach, no manual (re)sharding is required</li>
+</ul>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/cassandra-scalability.png" alt="cassandra-scalability">
+<p>Another scalability issue to consider is the hotspot issue - what if an ad is more popular and gets more attention than others?</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/hotspot-issue.png" alt="hotspot-issue">
+<ul>
+<li>In the above example, aggregation service nodes can apply for extra resources via the resource manager</li>
+<li>The resource manager allocates more resources, so the original node isn't overloaded</li>
+<li>The original node splits the events into 3 groups and each of the aggregation nodes handles 100 events</li>
+<li>Result is written back to the original aggregation node</li>
+</ul>
+<p>Alternative, more sophisticated ways to handle the hotspot problem:</p>
+<ul>
+<li>Global-Local Aggregation</li>
+<li>Split Distinct Aggregation</li>
+</ul>
+
+<h4>Fault Tolerance</h4>
+<p>Within the aggregation nodes, we are processing data in-memory. If a node goes down, the processed data is lost.</p>
+<p>We can leverage consumer offsets in kafka to continue from where we left off once another node picks up the slack.
+However, there is additional intermediary state we need to maintain, as we're aggregating the top N ads in M minutes.</p>
+<p>We can make snapshots at a particular minute for the on-going aggregation:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/fault-tolerance-example.png" alt="fault-tolerance-example">
+<p>If a node goes down, the new node can read the latest committed consumer offset, as well as the latest snapshot to continue the job:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/fault-tolerance-recovery-example.png" alt="fault-tolerance-recovery-example">
+
+<h4>Data monitoring and correctness</h4>
+<p>As the data we're aggregating is critical as it's used for billing, it is very important to have rigorous monitoring in place in order to ensure correctness.</p>
+<p>Some metrics we might want to monitor:</p>
+<ul>
+<li><strong>Latency</strong>: Timestamps of different events can be tracked in order to understand the e2e latency of the system</li>
+<li><strong>Message queue size</strong>: If there is a sudden increase in queue size, we need to add more aggregation nodes. As Kafka is implemented via a distributed commit log, we need to keep track of records-lag metrics instead.</li>
+<li><strong>System resources on aggregation nodes</strong>: CPU, disk, JVM, etc.</li>
+</ul>
+<p>We also need to implement a reconciliation flow which is a batch job, running at the end of the day.
+It calculates the aggregated results from the raw data and compares them against the actual data stored in the aggregation database:</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/reconciliation-flow.png" alt="reconciliation-flow">
+
+<h4>Alternative design</h4>
+<p>In a generalist system design interview, you are not expected to know the internals of specialized software used in big data processing.</p>
+<p>Explaining the thought process and discussing trade-offs is more important than knowing specific tools, which is why the chapter covers a generic solution.</p>
+<p>An alternative design, which leverages off-the-shelf tooling, is to store ad click data in Hive with an ElasticSearch layer on top built for faster queries.</p>
+<p>Aggregation is typically done in OLAP databases such as ClickHouse or Druid.</p>
+<img class="orig-img" src="21.%20Ad%20Click%20Event%20Aggregation/images/alternative-design.png" alt="alternative-design">
+
+<h3>Step 4: Wrap up</h3>
+<p>Things we covered:</p>
+<ul>
+<li>Data model and API Design</li>
+<li>Using MapReduce to aggregate ad click events</li>
+<li>Scaling the message queue, aggregation service and database</li>
+<li>Mitigating the hotspot issue</li>
+<li>Monitoring the system continuously</li>
+<li>Using reconciliation to ensure correctness</li>
+<li>Fault tolerance</li>
+</ul>
+<p>The ad click event aggregation is a typical big data processing system.</p>
+<p>It would be easier to understand and design it if you have prior knowledge of related technologies:</p>
+<ul>
+<li>Apache Kafka</li>
+<li>Apache Spark</li>
+<li>Apache Flink</li>
+</ul>

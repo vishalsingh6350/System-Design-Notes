@@ -1,0 +1,193 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 8 pm on a Friday in downtown San Francisco and you open a map app: "restaurants within 500 m". Your phone sends two numbers, 37.776720 and -122.416730, and within a blink you get a ranked list of nearby places. Out of 200 million businesses on the planet, the system had to find the few dozen inside a small circle around you, while 100 million daily users fire around 5,000 searches per second, spiking in exactly the dense neighbourhoods where businesses cluster. The catch is that databases are brilliant at sorting along one line but clumsy at asking "what is near this point in two dimensions?"</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The system is two services on one database cluster: a read-only Location-Based Service that answers "what is near me" and a Business Service that manages the businesses themselves. The intellectual heart is the geospatial index that turns 2D proximity into a 1D lookup.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Geospatial Index</span> <span class="why">— the whole problem is making 2D "nearby" searchable; every other choice follows from which index you pick</span>
+      <ul>
+        <li>Hash family: even grid, geohash
+          <ul><li><span class="peripheral">Geohash: 12 precision levels; shared prefix = nearby</span></li><li><span class="peripheral">Boundary issues &rarr; also search 8 neighbours</span></li></ul>
+        </li>
+        <li>Tree family: quadtree, Google S2, R-tree
+          <ul><li><span class="peripheral">Quadtree splits until &le;100 businesses per leaf</span></li><li><span class="peripheral">S2: Hilbert curve, geofencing</span></li></ul>
+        </li>
+        <li>Naive 2D search: lat/long range query (baseline to reject)</li>
+      </ul>
+    </li>
+    <li><span class="hub">Location-Based Service (LBS)</span> <span class="why">— the hot, read-only, stateless path that handles ~5,000 QPS</span>
+      <ul>
+        <li><code>GET /v1/search/nearby</code> with latitude, longitude, radius (default 5000 m)</li>
+        <li>Radius &rarr; geohash length &rarr; own cell + 8 neighbours</li>
+        <li>Parallel Redis calls, then rank by distance</li>
+      </ul>
+    </li>
+    <li><span class="hub">Business Service &amp; Data Store</span> <span class="why">— the source of truth for business details and owner edits</span>
+      <ul>
+        <li>Business CRUD APIs (<code>GET/POST/PUT/DELETE /v1/businesses</code>)</li>
+        <li>MySQL primary-replica cluster; business table sharded by business ID
+          <ul><li><span class="peripheral">Geohash index table fits one server: use read replicas, not shards</span></li></ul>
+        </li>
+        <li>Updates not real-time; batch processed daily
+          <ul><li><span class="peripheral">Replica lag is acceptable</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Caching &amp; Deployment</span> <span class="why">— what makes the read path fast and resilient under peaks</span>
+      <ul>
+        <li>Cache key = geohash (not raw coordinates)</li>
+        <li>Two Redis caches: geohash &rarr; business IDs; business_id &rarr; details</li>
+        <li>
+          Multi-region deployment
+          <ul><li><span class="peripheral">GDPR / CCPA privacy compliance</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The geospatial index is the hub because it is what LBS queries, what the cache is keyed on, and what determines whether the data must be rebuilt (quadtree) or simply re-hashed (geohash). LBS and Business Service are split because their traffic shapes differ: LBS is massive, read-only and stateless, while Business Service is lower-volume and owns writes.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">A nearby search is a funnel: coordinates become a cell code, the cell code becomes a list of IDs, the IDs become rich details, and the details become a ranked list.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Load Balancer</h4>
+      <p><strong>Input:</strong> HTTP requests from clients.</p>
+      <p><strong>Output:</strong> <code>/search/nearby</code> routed to LBS; <code>/businesses/{id}</code> routed to Business Service.</p>
+      <p class="io-story">A fork in the road: "looking for places?" goes left, "looking at one place?" goes right.</p>
+      <p class="io-arrow">&rarr; feeds into: LBS or Business Service</p>
+    </div>
+    <div class="io-block">
+      <h4>LBS: radius to geohash</h4>
+      <p><strong>Input:</strong> latitude, longitude, radius.</p>
+      <p><strong>Output:</strong> The user's geohash at the right precision plus its 8 neighbouring geohashes.</p>
+      <p class="io-story">Turns "this exact spot and 500 m around it" into "this tile and the eight tiles touching it".</p>
+      <p class="io-arrow">&rarr; feeds into: Geohash Redis</p>
+    </div>
+    <div class="io-block">
+      <h4>Geohash Redis</h4>
+      <p><strong>Input:</strong> A list of 9 geohashes.</p>
+      <p><strong>Output:</strong> Business IDs in each of those cells, fetched with parallel queries.</p>
+      <p class="io-story">A set of pigeonholes labelled by tile code; each holds the IDs of businesses located in that tile.</p>
+      <p class="io-arrow">&rarr; feeds into: Business Info Redis</p>
+    </div>
+    <div class="io-block">
+      <h4>Business Info Redis</h4>
+      <p><strong>Input:</strong> Business IDs.</p>
+      <p><strong>Output:</strong> Full details: name, address, reviews, location.</p>
+      <p class="io-story">The card catalogue: give it an ID, get the full card.</p>
+      <p class="io-arrow">&rarr; feeds into: LBS ranking</p>
+    </div>
+    <div class="io-block">
+      <h4>LBS ranking</h4>
+      <p><strong>Input:</strong> Candidate businesses with coordinates.</p>
+      <p><strong>Output:</strong> Results sorted by distance from the user, returned to the client.</p>
+      <p class="io-story">The tiles gave a rough neighbourhood; ranking measures the real distance and orders the list.</p>
+      <p class="io-arrow">&rarr; feeds into: the client's map</p>
+    </div>
+    <div class="io-block">
+      <h4>Business Service &amp; DB cluster</h4>
+      <p><strong>Input:</strong> Owner create/update/delete requests; customer detail views.</p>
+      <p><strong>Output:</strong> Writes to the MySQL primary, replicated to replicas and synced into the Redis caches, batch processed daily.</p>
+      <p class="io-story">The back office that edits the records; the front counter (Redis) gets its copies refreshed on a schedule.</p>
+      <p class="io-arrow">&rarr; feeds into: Redis caches used by LBS</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one search</h4>
+    <ol class="journey-steps">
+      <li>You search for restaurants within 500 m. The client sends latitude 37.776720, longitude -122.416730, radius 500 m to the load balancer.</li>
+      <li>The load balancer sees <code>/search/nearby</code> and forwards the request to one of the stateless LBS servers.</li>
+      <li>LBS consults the radius-to-precision table: 500 m maps to geohash length 6. It encodes your coordinates into a 6-character geohash.</li>
+      <li>Because you might be standing near a cell edge, LBS computes the 8 neighbouring geohashes, giving a list of 9: <code>[my_geohash, neighbor1, ..., neighbor8]</code>.</li>
+      <li>LBS queries the Geohash Redis server for all 9 in parallel. Each returns a list of business IDs, like <code>9q9hvu &rarr; [343, 347, 112]</code>.</li>
+      <li>LBS fetches full details for those IDs from the Business Info Redis server.</li>
+      <li>LBS computes the distance from you to each business, sorts them, and returns the ranked list.</li>
+      <li>Later, a restaurant owner updates their hours through Business Service. The write goes to the MySQL primary and is picked up in the daily batch, so up to a day of staleness is expected and harmless.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A proximity service converts two-dimensional location into a one-dimensional key (a geohash or a tree path) so that "what is near me?" becomes a fast, cacheable lookup instead of a scan.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine the Earth covered in nested tiles, like a floor where each tile can be cut into four smaller tiles, and those into four more. Every tile has a postcode spelled out letter by letter, and longer postcodes mean smaller tiles: that postcode is the geohash. To find what is near you, you read your own postcode at the right length for your radius, then peek at the eight tiles touching yours (neighbour search). A pigeonhole wall holds the business IDs for each postcode (Geohash Redis), and a card catalogue holds each business's details (Business Info Redis). A quadtree is the same floor, but tiles are cut only where it is crowded, so a dense downtown gets tiny tiles and a desert gets huge ones.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">100M DAU &times; 5 / 86,400 &asymp; 5,000 QPS</span><span class="beacon-def">Read-heavy search load; optimise reads and caching.</span></div>
+    <div class="beacon"><span class="beacon-term">200M businesses</span><span class="beacon-def">Large but the index still fits in memory on one server (GBs).</span></div>
+    <div class="beacon"><span class="beacon-term">1D index vs 2D query</span><span class="beacon-def">A normal DB index speeds only one dimension, so lat/long range queries stay slow.</span></div>
+    <div class="beacon"><span class="beacon-term">Geohash</span><span class="beacon-def">Interleaves longitude and latitude bits into one string; 12 precision levels.</span></div>
+    <div class="beacon"><span class="beacon-term">Longer shared prefix = closer</span><span class="beacon-def">Geohash's guarantee; the reverse (close implies shared prefix) is not guaranteed.</span></div>
+    <div class="beacon"><span class="beacon-term">500 m &rarr; length 6</span><span class="beacon-def">Choose the minimal geohash length for the radius (1-2 km &rarr; 5; 5-20 km &rarr; 4).</span></div>
+    <div class="beacon"><span class="beacon-term">Own cell + 8 neighbours</span><span class="beacon-def">The fix for boundary issues: never trust a single cell.</span></div>
+    <div class="beacon"><span class="beacon-term">Quadtree (&le;100 per leaf)</span><span class="beacon-def">In-memory tree that splits crowded areas; adapts to density and supports k-nearest.</span></div>
+    <div class="beacon"><span class="beacon-term">O(n log n) build, minutes</span><span class="beacon-def">Quadtree servers cannot serve while building, so roll out releases incrementally.</span></div>
+    <div class="beacon"><span class="beacon-term">Google S2 / Hilbert curve</span><span class="beacon-def">Maps the sphere to 1D; great for geofencing arbitrary areas with variable cell levels.</span></div>
+    <div class="beacon"><span class="beacon-term">Cache key = geohash</span><span class="beacon-def">Raw GPS is noisy and users move; the geohash is a stable key.</span></div>
+    <div class="beacon"><span class="beacon-term">Shard business table, replicate index</span><span class="beacon-def">Business data sharded by ID; geohash index fits one server, so add read replicas.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Almost every question lands on the index: why naive search fails, how geohash works and breaks, when a quadtree wins, and how the final architecture stitches it to Redis. Drill these four and you can reconstruct the rest.</p>
+
+  <div class="drill">
+    <h4>Why naive 2D search fails, and the two index families</h4>
+    <p>The intuitive approach draws a box around the user and asks the database for every business whose latitude is within the radius and whose longitude is within the radius. Without indexes that scans the whole table. With separate indexes on latitude and longitude it is only slightly better: each index returns a huge band (a horizontal strip and a vertical strip spanning the globe), and the database must intersect those two enormous sets.</p>
+    <p>The root problem is that a database index speeds search in one dimension only. So the better approach maps 2D space into one dimension. Two families do this. Hash-based: the even grid and geohash. Tree-based: quadtree, Google S2 and R-tree.</p>
+    <div class="pitfall"><strong>Common trap:</strong> proposing an even grid. Fixed-size cells ignore density: a downtown cell holds thousands of businesses while a rural or ocean cell holds none.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Geohash: postcodes for the planet</h4>
+    <p>Split the world into four quadrants along the prime meridian and the equator, labelling each with two bits. Split each quadrant into four again, and keep going. Each step adds bits, alternating between longitude and latitude, and the resulting bit string is encoded as a short alphanumeric string. There are 12 precision levels; each extra character means a smaller cell.</p>
+    <figure class="guide-fig"><img src="16.%20Proximity%20Service/images/geohash.png" alt="World split into four quadrants labelled 00, 01, 10, 11"><figcaption>The first cut: four quadrants labelled 01, 11, 00, 10 across the equator and prime meridian. Every deeper level repeats this inside a single quadrant.</figcaption></figure>
+    <p>Choosing precision is a table lookup: take the minimal geohash length that covers the radius. 500 m needs length 6; 1 km and 2 km need length 5; 5 km and 20 km need length 4. The useful property is that a longer shared prefix means two points are closer, so a prefix match finds everything in a cell.</p>
+    <p>The catch is at the edges. Two places can be metres apart yet share no prefix at all (for example on opposite sides of the equator), and two places can share a long prefix but sit in different cells. The fix is simple and always applied: search your own cell plus its 8 neighbours.</p>
+    <figure class="guide-fig"><img src="16.%20Proximity%20Service/images/boundary-issue.png" alt="Geohash boundary issue with nearby points in different cells"><figcaption>The trap in one picture: proximity on the ground does not guarantee a shared prefix. That is why the query fans out to neighbouring cells.</figcaption></figure>
+  </div>
+
+  <div class="drill">
+    <h4>Quadtree: tiles that shrink where it is crowded</h4>
+    <p>A quadtree recursively splits 2D space into four quadrants, and each internal node has exactly four children. It keeps splitting a region until no leaf holds more than a threshold of businesses (100 in the notes). Dense cities therefore get deep, fine-grained branches, while empty areas stop early with large leaves.</p>
+    <div class="anim" data-anim="quadtree"></div>
+    <figure class="guide-fig"><img src="16.%20Proximity%20Service/images/building-quadtree.png" alt="Quadtree built from 200m businesses down to leaves of at most 100"><figcaption>Start at the root with 200m (million) businesses, split into nw/ne/sw/se, and keep splitting only the crowded branches until every square leaf holds 100 or fewer.</figcaption></figure>
+    <p>It is an in-memory structure built on each LBS server at startup. It needs only GBs of memory, so it fits on one server, but building it is O(n log n) and takes a few minutes for about 200 million businesses. During that time the server cannot serve traffic, so new releases must roll out incrementally to a subset of servers. Adding or updating a business either triggers an incremental rebuild (with lots of cache invalidation) or an on-the-fly update that needs locking.</p>
+    <table class="compare"><thead><tr><th>Criterion</th><th>Geohash</th><th>Quadtree</th><th>Google S2</th></tr></thead><tbody>
+      <tr><td>Implementation</td><td>Easy; no tree to build</td><td>Slightly harder</td><td>Harder to implement</td></tr>
+      <tr><td>Density-aware cells</td><td>No, fixed grid size</td><td>Yes, adapts to population</td><td>Yes, min/max level and max cells</td></tr>
+      <tr><td>Best query</td><td>Fixed-radius search</td><td>k-nearest (e.g. closest gas station)</td><td>Geofencing arbitrary areas</td></tr>
+      <tr><td>Updating the index</td><td>Easy</td><td>Complex; may rebuild tree</td><td>Not covered in the notes</td></tr>
+      <tr><td>Known weakness</td><td>Boundary issues</td><td>Startup build time, rebalancing</td><td>Complexity</td></tr>
+    </tbody></table>
+    <div class="pitfall"><strong>Common trap:</strong> restarting all quadtree servers at once during a deploy. Each takes minutes to rebuild and cannot serve meanwhile, so an all-at-once rollout means an outage.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Scaling, caching and the final architecture</h4>
+    <p>The business table is sharded by business ID so data spreads evenly. The geohash index table is different: it maps geohash to business ID, one row per business, and it fits on a single server, so sharding adds complexity with no benefit. Read replicas handle the read load instead. The primary-replica setup can briefly serve stale data, which is fine because business information is not updated in real time and changes are batch processed daily.</p>
+    <p>For caching, raw coordinates make a poor key: GPS readings are imprecise and users move, so almost every request would miss. The geohash is stable, so it becomes the key. Two caches result: geohash &rarr; list of business IDs, and business_id &rarr; business details.</p>
+    <figure class="guide-fig"><img src="16.%20Proximity%20Service/images/final-design.png" alt="Final proximity service architecture with LBS, Business Service, Redis cluster and database cluster"><figcaption>Follow the circled numbers down the left side: request &rarr; load balancer &rarr; LBS (steps 3-4 compute geohashes) &rarr; Redis reads (5-6). On the right, Business Service writes to the primary, which replicates and syncs into the Redis cluster.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Stateless LBS scales horizontally; parallel Redis reads keep latency low; multi-region deployment handles peaks and outages.</p></div><div class="con"><strong>Costs</strong><p>Data is eventually consistent: a business edit is not visible until the daily batch and cache sync.</p></div></div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Jot an answer in the margin with your stylus, then tap to compare.</p>
+  <details class="qa"><summary>Why does indexing latitude and longitude separately still perform poorly?</summary><div class="qa-answer"><p>A database index speeds search in only one dimension. Each index returns a huge strip of candidates, and the database must intersect those two large sets. Geospatial indexing solves this by mapping 2D location to a single 1D key.</p></div></details>
+  <details class="qa"><summary>What happens if LBS searches only the user's own geohash cell?</summary><div class="qa-answer"><p>Businesses just across a cell boundary are missed, even if they are a few metres away, because nearby points need not share a prefix. That is why LBS always adds the 8 neighbouring cells.</p></div></details>
+  <details class="qa"><summary>A user wants restaurants within 500 m. Which geohash length, and why that one?</summary><div class="qa-answer"><p>Length 6, from the radius-to-precision table. You pick the minimal length whose cells cover the radius, so the cell plus its neighbours captures the search circle without pulling in far too many candidates.</p></div></details>
+  <details class="qa"><summary>Compare geohash and quadtree for a "find the 5 closest gas stations" query.</summary><div class="qa-answer"><p>Quadtree is better: it supports k-nearest searches and adapts cell size to density. Geohash is built for fixed-radius search and cannot dynamically resize its grid, although it is simpler and easier to update.</p></div></details>
+  <details class="qa"><summary>Why is the geohash a better cache key than the raw coordinates?</summary><div class="qa-answer"><p>GPS coordinates are imprecise and change as users move, so exact coordinates rarely repeat and would almost always miss the cache. Many nearby users share the same geohash, making it a stable, high-hit-rate key.</p></div></details>
+  <details class="qa"><summary>Why shard the business table but not the geohash index table?</summary><div class="qa-answer"><p>The business table holds rich details for 200 million businesses and benefits from even distribution by business ID. The geohash index is small enough to fit on one server, so sharding only adds complexity; read replicas handle the read load.</p></div></details>
+  <details class="qa"><summary>What operational risk does the quadtree introduce, and how is it handled?</summary><div class="qa-answer"><p>Building it at startup takes a few minutes (O(n log n) for about 200 million businesses), during which the server cannot serve traffic. Releases are rolled out incrementally to a subset of servers at a time so capacity remains.</p></div></details>
+</div>

@@ -1,0 +1,220 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>A game studio announces a free in-game reward, one per account. Within minutes a bot farm is hammering the claim endpoint thousands of times a second, creating throwaway accounts and draining the reward pool, while real players stare at spinning loaders because the servers are drowning. Your cloud bill climbs by the minute. What you need is a bouncer at the door who counts, remembers, and politely says "not yet" with an HTTP 429 when someone is coming in too fast. That bouncer is a rate limiter, and the hard part is making it fast, accurate and consistent when it is running on many servers at once.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The design splits into four questions: what must it do, where does it sit, how does it count, and how does it stay correct at scale. The algorithm hub is the heart; the others are the body built around it.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Requirements &amp; purpose</span> <span class="why">— they decide which algorithm and placement are acceptable</span>
+      <ul>
+        <li>Why: prevent DoS/resource starvation, reduce cost, prevent overload
+          <ul><li><span class="peripheral">Real uses: limiting posts, account creations, reward claims</span></li></ul>
+        </li>
+        <li>Must: accurate throttling, minimal latency, low memory, distributed, clear exceptions, high fault tolerance
+          <ul><li><span class="peripheral">Server-side API limiter, multiple throttle rules, inform users when throttled</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Placement</span> <span class="why">— determines whether the limiter can be trusted and how it fits the stack</span>
+      <ul>
+        <li>Client-side: unreliable (can be tampered with)</li>
+        <li>Server-side: preferred for control</li>
+        <li>Middleware / API gateway: flexible, natural with microservices
+          <ul><li><span class="peripheral">Guidelines: match current tech stack, pick algorithm by business needs, buy commercial if resources are limited</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Counting algorithms</span> <span class="why">— the core decision; each trades accuracy, memory and burst behavior differently</span>
+      <ul>
+        <li>Token bucket: refill at fixed rate, each request spends a token
+          <ul><li><span class="peripheral">Parameters: bucket size, refill rate</span></li></ul>
+        </li>
+        <li>Leaking bucket: FIFO queue drained at a fixed rate
+          <ul><li><span class="peripheral">Example implementation: uber-go/ratelimit</span></li></ul>
+        </li>
+        <li>Fixed window counter: one counter per time slot
+          <ul><li><span class="peripheral">Edge-burst flaw</span></li></ul>
+        </li>
+        <li>Sliding window log: store timestamps; sliding window counter: weighted blend of windows</li>
+      </ul>
+    </li>
+    <li><span class="hub">Architecture &amp; distributed correctness</span> <span class="why">— one limiter is easy; many limiter instances sharing counters is the real problem</span>
+      <ul>
+        <li>Counters in in-memory cache (Redis); middleware checks, then forwards or rejects</li>
+        <li>Race conditions and sync: locks, Lua scripts, Redis sorted sets, centralized store
+          <ul><li><span class="peripheral">Multi-data center for latency, eventual consistency, monitoring and rule tuning</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Requirements come first because "low memory" and "accurate" pull in opposite directions and force the algorithm choice. Placement decides where the counting happens; the algorithm decides how; and the Redis-backed architecture decides whether that counting still holds when dozens of servers are counting at once. The algorithms hub is where interviewers spend the most time.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Every request passes the same short gauntlet: identify, count, compare, decide. Each box is small and fast, because the limiter sits on the hot path of every call.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Client</h4>
+      <p><strong>Input:</strong> A user action, e.g. "claim reward".</p>
+      <p><strong>Output:</strong> An HTTP request sent toward the API.</p>
+      <p class="io-story">A guest walking up to the club door. You cannot trust the guest to count their own entries, which is why client-side limiting is unreliable.</p>
+      <p class="io-arrow">&rarr; feeds into: rate limiter middleware</p>
+    </div>
+    <div class="io-block">
+      <h4>Rate limiter middleware (API gateway)</h4>
+      <p><strong>Input:</strong> The request plus an identity to limit on (such as a user or IP) and the matching throttle rule.</p>
+      <p><strong>Output:</strong> A lookup of the relevant counter or bucket in Redis.</p>
+      <p class="io-story">The bouncer checking the guest list before letting anyone near the bar.</p>
+      <p class="io-arrow">&rarr; feeds into: Redis counter store</p>
+    </div>
+    <div class="io-block">
+      <h4>Redis counter store</h4>
+      <p><strong>Input:</strong> A key for this client and window/bucket.</p>
+      <p><strong>Output:</strong> The current count or token level, updated atomically.</p>
+      <p class="io-story">A shared tally board in memory that every bouncer at every door reads and writes, fast because it never touches disk.</p>
+      <p class="io-arrow">&rarr; feeds into: algorithm decision</p>
+    </div>
+    <div class="io-block">
+      <h4>Algorithm decision</h4>
+      <p><strong>Input:</strong> Current count/tokens and the rule's limit.</p>
+      <p><strong>Output:</strong> Allow or throttle.</p>
+      <p class="io-story">The rulebook: "no more than N entries per minute" or "one token per entry".</p>
+      <p class="io-arrow">&rarr; feeds into: API servers (allowed) or a throttled response (rejected)</p>
+    </div>
+    <div class="io-block">
+      <h4>API servers</h4>
+      <p><strong>Input:</strong> Only the requests that passed.</p>
+      <p><strong>Output:</strong> Normal responses, with servers kept below overload.</p>
+      <p class="io-story">The bar inside the club, never more crowded than it can serve.</p>
+      <p class="io-arrow">&rarr; feeds into: the client's response</p>
+    </div>
+    <div class="io-block">
+      <h4>Throttled response + monitoring</h4>
+      <p><strong>Input:</strong> Rejected requests and analytics about them.</p>
+      <p><strong>Output:</strong> A clear error telling the user they are throttled (commonly HTTP 429 Too Many Requests), plus data used to tune rules.</p>
+      <p class="io-story">The bouncer saying "come back in a minute", and the manager later reviewing the door log to decide if the rules are too strict or too loose.</p>
+      <p class="io-arrow">&rarr; feeds into: rule and algorithm adjustments</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one request</h4>
+    <ol class="journey-steps">
+      <li>A player taps "Claim reward". The app sends a request to the API gateway, not directly to the reward service.</li>
+      <li>The middleware identifies the caller and finds the matching throttle rule, say a token bucket of size 4 refilled with 4 tokens per minute.</li>
+      <li>It reads the player's bucket from Redis: 1 token left. Because Redis is in memory, the lookup adds only minimal latency.</li>
+      <li>The request consumes the token (bucket now 0) and is forwarded to the API servers, which process the claim.</li>
+      <li>A bot using the same account fires a second request 2 seconds later. The bucket is empty, so the middleware rejects it immediately and the API servers never see it.</li>
+      <li>The client receives a clear throttled error (commonly HTTP 429) and knows to back off, rather than silently failing.</li>
+      <li>The refiller adds tokens at the next interval; the player's legitimate next claim goes through.</li>
+      <li>Meanwhile monitoring shows how many requests were dropped, so the team can adjust the bucket size or refill rate if real players are being blocked.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A rate limiter controls how fast clients or services may send traffic, protecting servers from abuse, cost blowouts and overload. The design is a choice of placement and counting algorithm, backed by a fast shared counter store that stays correct under concurrency.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a nightclub. The <strong>bouncer at the door</strong> is the rate limiter middleware: it stands in front of the club (the <strong>API servers</strong>) so the crowd inside never exceeds capacity. The <strong>clicker counter</strong> in the bouncer's hand is the Redis counter; when a club has several doors, all bouncers share one tally board, which is why the store must be centralized and updated atomically. The <strong>house rules</strong> ("four guests a minute", "one wristband per entry") are the algorithm and its parameters. A guest turned away is told why and when to return, which is the throttled response. And the manager reviewing the door logs each night is monitoring, tuning the rules so real customers are not left outside.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Server-side / middleware placement</span><span class="beacon-def">The limiter must sit where clients cannot tamper with it; API gateway is natural with microservices.</span></div>
+    <div class="beacon"><span class="beacon-term">Token bucket</span><span class="beacon-def">Tokens refill at a fixed rate; each request spends one. Allows bursts up to bucket size.</span></div>
+    <div class="beacon"><span class="beacon-term">Bucket size + refill rate</span><span class="beacon-def">The two knobs of token bucket; mis-tuning them is its main weakness.</span></div>
+    <div class="beacon"><span class="beacon-term">Leaking bucket</span><span class="beacon-def">FIFO queue drained at a fixed rate; gives a stable outflow but bursts delay newer requests.</span></div>
+    <div class="beacon"><span class="beacon-term">Fixed window counter</span><span class="beacon-def">One counter per time slot; simple, but bursts at window edges can exceed the quota.</span></div>
+    <div class="beacon"><span class="beacon-term">Sliding window log</span><span class="beacon-def">Keeps a timestamp per request; most accurate, but memory-hungry.</span></div>
+    <div class="beacon"><span class="beacon-term">Sliding window counter</span><span class="beacon-def">Blends current and previous window counts; memory-efficient, smooths spikes, slightly approximate.</span></div>
+    <div class="beacon"><span class="beacon-term">Redis (in-memory counters)</span><span class="beacon-def">Fast shared counter storage; signals that the limiter is centralized, not per-server.</span></div>
+    <div class="beacon"><span class="beacon-term">Race condition</span><span class="beacon-def">Two servers read the same count and both allow; fixed with locks, Lua scripts or sorted sets.</span></div>
+    <div class="beacon"><span class="beacon-term">Eventual consistency</span><span class="beacon-def">Across data centers, counters sync lazily, trading a little accuracy for low latency.</span></div>
+    <div class="beacon"><span class="beacon-term">Throttled response</span><span class="beacon-def">Users must be clearly told they were limited (commonly HTTP 429), part of the "clear exception handling" requirement.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers probe the algorithms hardest, especially token bucket and the fixed-window edge problem, then the distributed race condition. Placement is quick but must be justified.</p>
+
+  <div class="drill">
+    <h4>Where the limiter lives</h4>
+    <p>A client-side limiter is unreliable: a malicious client can simply remove or bypass it. Server-side limiting gives you control. A popular middle path is middleware, often an API gateway, sitting between clients and API servers so that throttled requests never reach your business logic.</p>
+    <figure class="guide-fig"><img src="04.%20Rate%20Limiter/images/rate_limiter_architecture.png" alt="Rate limiter middleware between client and API servers"><figcaption>The limiter sits in the path of every request, before the API servers. Rejected traffic stops at the middleware, which is exactly what protects the servers.</figcaption></figure>
+    <ol class="steps">
+      <li>Evaluate your current tech stack and choose the option that fits it efficiently.</li>
+      <li>Select the algorithm that matches business needs.</li>
+      <li>If you already use microservices with an API gateway, put the limiter there.</li>
+      <li>If engineering resources are limited, a commercial solution may be the better choice.</li>
+    </ol>
+  </div>
+
+  <div class="drill">
+    <h4>Token bucket: the default workhorse</h4>
+    <p>Imagine a bucket that holds a fixed number of tokens. A refiller drops new tokens in at a steady rate; once the bucket is full, extra tokens overflow and are lost. Each incoming request must take one token. If a token is available, the request passes; if the bucket is empty, the request is dropped.</p>
+    <p>Because tokens accumulate while traffic is quiet, a short burst up to the bucket size can pass all at once. That makes it forgiving for real users, and it needs only a count and a timestamp per bucket, so it is memory-efficient.</p>
+    <div class="anim" data-anim="token-bucket"></div>
+    <figure class="guide-fig"><img src="04.%20Rate%20Limiter/images/token-bucket.png" alt="Token bucket: refiller adds tokens, requests consume them or are dropped"><figcaption>Trace both paths: tokens flowing in from the refiller, and requests either taking a token and proceeding or finding the bucket empty and being dropped.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Easy to implement, memory-efficient, and allows short bursts of traffic.</p></div>
+      <div class="con"><strong>Costs</strong><p>Two parameters, bucket size and refill rate, can be tricky to tune correctly.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Comparing the five algorithms</h4>
+    <p>The leaking bucket is the token bucket's strict sibling: requests enter a FIFO queue and are processed at a fixed rate, like water dripping from a hole. The outflow is perfectly steady, but a burst fills the queue with old requests and newer ones wait or are dropped.</p>
+    <p>The window-based algorithms count requests in time. The fixed window counter uses one counter per interval and resets it at each boundary. The sliding window log stores every request's timestamp and counts only those inside the rolling window. The sliding window counter estimates the rolling count from the current window's count plus a weighted share of the previous window's.</p>
+    <table class="compare">
+      <thead><tr><th>Algorithm</th><th>Mechanism</th><th>Pros</th><th>Cons</th></tr></thead>
+      <tbody>
+        <tr><td>Token bucket</td><td>Fixed-rate refill; request spends a token</td><td>Easy, memory-efficient, allows bursts</td><td>Parameter tuning</td></tr>
+        <tr><td>Leaking bucket</td><td>FIFO queue processed at fixed rate</td><td>Memory-efficient, stable outflow</td><td>Bursts delay recent requests</td></tr>
+        <tr><td>Fixed window counter</td><td>Counter per fixed interval</td><td>Simple, efficient</td><td>Edge bursts exceed quota</td></tr>
+        <tr><td>Sliding window log</td><td>Timestamps in rolling window</td><td>Accurate</td><td>High memory</td></tr>
+        <tr><td>Sliding window counter</td><td>Blend of current and previous window</td><td>Memory-efficient, smooths spikes</td><td>Approximate, not perfectly strict</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>The fixed-window edge problem</h4>
+    <p>A fixed window counter looks airtight: "5 requests per minute, reset on the minute". But the counter only knows about its own slot. If a client sends 5 requests in the last seconds of one minute and 5 more in the first seconds of the next, both windows see a legal 5, yet 10 requests passed within a few seconds.</p>
+    <p>This is the classic weakness interviewers want you to spot, and it is exactly why the sliding window variants exist: they measure a rolling window, so a burst straddling the boundary is still counted together.</p>
+    <div class="anim" data-anim="window-burst"></div>
+    <figure class="guide-fig"><img src="04.%20Rate%20Limiter/images/fixed-window-issue.png" alt="Burst of requests at the boundary of two fixed windows exceeding the quota"><figcaption>Look at the shaded span crossing the boundary: each window is under its limit, but the span between them holds double the allowed traffic.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> saying the fixed window is "accurate" because each window respects its limit. Its failure is precisely at the edges, where a rolling view would reject the extra requests.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Distributed correctness with Redis</h4>
+    <p>Counters live in Redis because in-memory operations are fast enough to sit on every request's path. The flow is simple: the client hits the middleware, the middleware checks and updates the counter in Redis, and the request is processed or rejected.</p>
+    <p>The danger appears with many limiter instances. If two instances read "count = 3" at the same moment, both increment to 4 and both allow, even though one should have been blocked. That is a race condition. Locks fix it but slow everything down; Lua scripts run the read-and-update as one atomic step inside Redis; sorted sets suit timestamp-based sliding windows. A centralized data store keeps every instance looking at the same numbers.</p>
+    <figure class="guide-fig"><img src="04.%20Rate%20Limiter/images/architecture.png" alt="High-level rate limiter architecture with middleware, Redis and API servers"><figcaption>Every limiter instance talks to the same Redis store. Passing requests continue to the API servers; rejected ones return an error to the client.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Challenge</th><th>Remedy in the notes</th></tr></thead>
+      <tbody>
+        <tr><td>Race conditions</td><td>Locks, Lua scripts, Redis sorted sets</td></tr>
+        <tr><td>Synchronization across instances</td><td>Centralized data store</td></tr>
+        <tr><td>Latency for global users</td><td>Multi-data center setup</td></tr>
+        <tr><td>Syncing counters across data centers</td><td>Eventual consistency</td></tr>
+        <tr><td>Rules drifting from reality</td><td>Monitoring and analytics to adjust rules</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch or write your answer in the margin with your stylus, then reveal.</p>
+  <details class="qa"><summary>Why is client-side rate limiting considered unreliable?</summary><div class="qa-answer"><p>The client is under the user's control, so a malicious user can modify or bypass it. Server-side or middleware limiting keeps enforcement where you control it.</p></div></details>
+  <details class="qa"><summary>Compare token bucket and leaking bucket.</summary><div class="qa-answer"><p>Token bucket refills tokens at a fixed rate and lets requests through as long as tokens remain, so it allows bursts up to the bucket size. Leaking bucket queues requests in FIFO order and processes them at a fixed rate, giving a stable outflow but delaying recent requests during bursts. Both are memory-efficient.</p></div></details>
+  <details class="qa"><summary>What happens with a fixed window counter if a burst lands at a window boundary?</summary><div class="qa-answer"><p>Requests at the end of one window and the start of the next are counted separately, so each window stays under its limit while the combined burst exceeds the quota. Sliding window algorithms fix this by measuring a rolling window.</p></div></details>
+  <details class="qa"><summary>Why would you choose a sliding window counter over a sliding window log?</summary><div class="qa-answer"><p>The log is accurate but stores a timestamp per request, which consumes a lot of memory. The counter approximates the rolling count from two window counters, so it is memory-efficient and still smooths spikes, at the cost of not being perfectly strict.</p></div></details>
+  <details class="qa"><summary>What race condition can occur in a distributed rate limiter, and how is it solved?</summary><div class="qa-answer"><p>Two instances can read the same counter value simultaneously, both increment, and both allow a request that should have been blocked. Solutions include locks, Lua scripts that make the read-and-update atomic in Redis, and Redis sorted sets, with a centralized data store for synchronization.</p></div></details>
+  <details class="qa"><summary>Why store counters in Redis instead of a database on disk?</summary><div class="qa-answer"><p>The limiter runs on every request, so it must add minimal latency. In-memory counters in Redis are fast to read and update, whereas disk access would slow down every call.</p></div></details>
+  <details class="qa"><summary>What are the two parameters of a token bucket and why do they matter?</summary><div class="qa-answer"><p>Bucket size (how many tokens it can hold, which caps the burst) and refill rate (tokens added per unit time, which sets the sustained rate). Tuning them well is the main challenge of the algorithm.</p></div></details>
+</div>

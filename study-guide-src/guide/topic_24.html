@@ -1,0 +1,211 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>Somewhere a company is pouring 100 petabytes a year into your service: nightly database backups, millions of tiny thumbnails, and 200 MB video masters. They never edit any of it; they write it once and read it back, sometimes years later, and they expect every byte to still be there even if a whole rack catches fire. Meanwhile each spinning hard disk manages only 100 to 150 random seeks per second and fails at a steady, predictable rate. Designing an S3-like object store means building a warehouse of nearly unlimited size on top of unreliable shelves, cheaply, while promising six nines of durability.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The whole design follows from one split: metadata (what and where) is stored separately from data (the bytes). Read the map as "the split", then "how each half works", then "how we keep bytes alive".</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Separate metadata from data</span> <span class="why">— the UNIX inode idea; lets each side scale independently</span>
+      <ul>
+        <li>Object = immutable key-value pair: URI is the key, bytes are the value</li>
+        <li>Write once, read many (~95% of operations are reads)
+          <ul><li><span class="peripheral">Block vs file vs object storage comparison</span></li><li><span class="peripheral">Flat namespace; "folders" simulated by name prefixes</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Data store</span> <span class="why">— where bytes physically live, addressed by object UUID</span>
+      <ul>
+        <li>Data routing service (stateless), placement service (virtual cluster map, Paxos/Raft), data nodes</li>
+        <li>Small objects packed into large WAL-style files; object_mapping table in SQLite on each node
+          <ul><li><span class="peripheral">Files pinned to CPU cores to avoid write-lock contention</span></li></ul>
+        </li>
+        <li>Primary replicates to two secondaries before replying (strong consistency)</li>
+      </ul>
+    </li>
+    <li><span class="hub">Durability</span> <span class="why">— the promise the whole product is sold on</span>
+      <ul>
+        <li>Replicate across failure domains (rack, DC, network)</li>
+        <li>3-copy replication vs 8+4 erasure coding</li>
+        <li>Checksums per file and per object to catch silent corruption
+          <ul><li><span class="peripheral">HDD annual failure rate 0.81% &rarr; 3 copies give 6 nines</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Metadata store</span> <span class="why">— maps names to UUIDs and answers listing and versioning queries</span>
+      <ul>
+        <li>Bucket table (small, one server) and object table (sharded by hash(bucket_name, object_name))</li>
+        <li>Listing by prefix via a denormalized table sharded by bucket ID</li>
+        <li>Versioning via TIMEUUID object_version; delete markers
+          <ul><li><span class="peripheral">Per-user bucket limits keep the bucket table small</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Lifecycle operations</span> <span class="why">— getting big files in and dead bytes out</span>
+      <ul>
+        <li>Multipart upload with upload ID and per-part ETags</li>
+        <li>Garbage collection via compaction
+          <ul><li><span class="peripheral">Lazy deletion, orphan parts, corrupted data</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Everything hangs off the metadata/data split: the data store only ever deals with opaque UUIDs and bytes, while the metadata store only deals with names, buckets and versions. Durability is a property of the data store, and listing, versioning and sharding are properties of the metadata store. Lifecycle operations touch both, which is why they come last.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">An upload passes through a gatekeeper, a bytes path and a names path. Keep the two paths distinct in your head and the rest falls into place.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Load balancer + API service</h4>
+      <p><strong>Input:</strong> RESTful HTTP requests such as PUT /bucket-to-share/script.txt.</p>
+      <p><strong>Output:</strong> Orchestrated calls to IAM, the data store and the metadata store; an HTTP response.</p>
+      <p class="io-story">The warehouse front office. It never touches boxes itself; it checks your paperwork and tells the loading crew and the records clerk what to do.</p>
+      <p class="io-arrow">&rarr; feeds into: IAM</p>
+    </div>
+    <div class="io-block">
+      <h4>IAM</h4>
+      <p><strong>Input:</strong> The caller's identity and the requested action on a bucket.</p>
+      <p><strong>Output:</strong> Allow or deny (authentication, authorization, access control).</p>
+      <p class="io-story">The security desk that checks your badge before you enter any aisle.</p>
+      <p class="io-arrow">&rarr; feeds into: data store (on writes) or metadata store (on reads)</p>
+    </div>
+    <div class="io-block">
+      <h4>Data routing + placement service</h4>
+      <p><strong>Input:</strong> Object bytes to store, or a UUID to fetch.</p>
+      <p><strong>Output:</strong> The right primary data node, chosen from the virtual cluster map via consistent hashing.</p>
+      <p class="io-story">A dispatcher with a live map of every shelf, which it keeps current by listening to heartbeats; it points each box to a replication group.</p>
+      <p class="io-arrow">&rarr; feeds into: data nodes</p>
+    </div>
+    <div class="io-block">
+      <h4>Data nodes</h4>
+      <p><strong>Input:</strong> Object bytes.</p>
+      <p><strong>Output:</strong> Bytes appended to a large file, a row in the local object_mapping table (object_id, filename, file_offset, object_size), copies on two secondaries, and a UUID.</p>
+      <p class="io-story">The shelves. Small parcels are packed tightly into big crates, a small ledger records which crate and position each parcel sits at, and two other shelves get identical copies.</p>
+      <p class="io-arrow">&rarr; feeds into: API service (returns the UUID)</p>
+    </div>
+    <div class="io-block">
+      <h4>Metadata store</h4>
+      <p><strong>Input:</strong> bucket_id, object_name, object_id (UUID), version and other metadata.</p>
+      <p><strong>Output:</strong> Name-to-UUID lookups, prefix listings, version history.</p>
+      <p class="io-story">The card catalogue. It does not hold the parcels; it tells you which UUID a name refers to, which the shelves then locate.</p>
+      <p class="io-arrow">&rarr; feeds into: every download (name &rarr; UUID &rarr; bytes)</p>
+    </div>
+    <div class="io-block">
+      <h4>Garbage collector</h4>
+      <p><strong>Input:</strong> Deleted, orphaned or corrupted objects inside data files.</p>
+      <p><strong>Output:</strong> Compacted files with only live objects and an updated object_mapping table.</p>
+      <p class="io-story">The night crew that repacks half-empty crates into full ones and throws out the empties.</p>
+      <p class="io-arrow">&rarr; feeds into: reclaimed disk space on primaries, replicas or all 12 erasure-coded nodes</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one upload</h4>
+    <ol class="journey-steps">
+      <li>A user sends HTTP PUT to create a bucket named "bucket-to-share". The API service asks IAM whether the user may write, then creates a bucket entry in the metadata store and returns success.</li>
+      <li>Next, PUT /bucket-to-share/script.txt arrives with Content-Length: 4567 and a custom header x-amz-meta-author: Alex. The load balancer routes it to a stateless API service replica.</li>
+      <li>IAM confirms the user's identity and write permission on the bucket.</li>
+      <li>The API service streams the 4,567 bytes to the data store. The data routing service consults the placement service, and consistent hashing deterministically picks this object's replication group.</li>
+      <li>The primary data node appends the bytes to the end of its current data file, say "/data/c", and inserts a row into its SQLite object_mapping table: object_id, filename /data/c, the starting offset, and size 4567.</li>
+      <li>The primary replicates to two secondary data nodes and replies only after they succeed, choosing strong consistency over lower latency. A UUID is returned to the API service.</li>
+      <li>The API service writes a metadata row: bucket_id, object_name script.txt, object_id (the UUID), plus other metadata. The client gets a success response.</li>
+      <li>Later, GET /bucket-to-share/script.txt reverses the route: IAM checks read permission, the metadata store maps the name to the UUID, and the data store looks up filename and offset and streams back 4,567 bytes.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Store huge volumes of immutable objects cheaply and durably by separating names from bytes, packing bytes efficiently on disk, and spreading redundancy across failure domains.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a vast automated warehouse. At the front, a card catalogue maps each item's name to a barcode (metadata store: name to UUID), while the shelves out back only understand barcodes (data store). A dispatcher with a live floor plan decides which aisle a new box goes to (placement service with the virtual cluster map), and small parcels are packed into shipping crates with a packing list taped inside (WAL-style data files plus the object_mapping table). Every box is either photocopied onto shelves in three different buildings (replication) or split into puzzle pieces with spare pieces stored across aisles, so any few lost pieces can be rebuilt (8+4 erasure coding). A tamper seal on every crate reveals rot (checksums), and a night crew repacks crates to reclaim space (compaction).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">100 PB/year, 6 nines durability, 4 nines availability</span><span class="beacon-def">Durability is the headline requirement; it shapes replication and erasure coding choices.</span></div>
+    <div class="beacon"><span class="beacon-term">100-150 IOPS per HDD</span><span class="beacon-def">Disk seeks are scarce; pack small objects together and read sequentially.</span></div>
+    <div class="beacon"><span class="beacon-term">0.68 bil objects, 0.68 TB metadata</span><span class="beacon-def">At 1 KB each, metadata is tiny compared to data; store it separately.</span></div>
+    <div class="beacon"><span class="beacon-term">Object immutability</span><span class="beacon-def">No in-place updates, only replace or delete; enables append-only files and versioning.</span></div>
+    <div class="beacon"><span class="beacon-term">Metadata vs data split</span><span class="beacon-def">Like a UNIX inode and its blocks; scale each store independently.</span></div>
+    <div class="beacon"><span class="beacon-term">Placement service (5 or 7 nodes, Paxos/Raft)</span><span class="beacon-def">Critical brain of the data store; a 7-node cluster tolerates 3 failures.</span></div>
+    <div class="beacon"><span class="beacon-term">object_mapping in SQLite</span><span class="beacon-def">Per-node lookup of (filename, offset, size); local, so no network hop.</span></div>
+    <div class="beacon"><span class="beacon-term">Replication: 200% overhead, 6 nines</span><span class="beacon-def">Fast reads and simple; the choice for latency-sensitive data.</span></div>
+    <div class="beacon"><span class="beacon-term">Erasure coding 8+4: 50% overhead, 11 nines</span><span class="beacon-def">Cheaper and more durable, but slower reads and more computation.</span></div>
+    <div class="beacon"><span class="beacon-term">Failure domain</span><span class="beacon-def">Rack, DC or network that can fail together; copies must span them.</span></div>
+    <div class="beacon"><span class="beacon-term">hash(bucket_name, object_name)</span><span class="beacon-def">Object table shard key; avoids hot buckets but makes listing hard.</span></div>
+    <div class="beacon"><span class="beacon-term">TIMEUUID object_version + delete marker</span><span class="beacon-def">Versions sort by time; deleting adds a version that returns 404.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The data store internals and the durability math are where this design is won or lost; metadata sharding and multipart uploads are the most common follow-ups.</p>
+
+  <div class="drill">
+    <h4>Inside the data store: routing, placement and nodes</h4>
+    <p>The data store has three parts. The data routing service is stateless: it asks the placement service where to put or find data, then reads from or writes to data nodes. The placement service holds the virtual cluster map, a picture of the physical topology, and prunes nodes that stop sending heartbeats. Data nodes hold the bytes, and each runs a daemon that reports how many drives it manages and how full each one is.</p>
+    <figure class="guide-fig"><img src="24.%20S3-like%20Object%20Storage/images/data-store-main-components.png" alt="Data routing service, placement service and data nodes"><figcaption>Notice the routing service sits in the request path while the placement service sits beside it as an advisor, and heartbeats flow from data nodes to placement.</figcaption></figure>
+    <p>Because placement is critical, it runs as a 5- or 7-node cluster synchronized by Paxos or Raft; 7 nodes survive 3 failures. Given an object's UUID, consistent hashing deterministically selects its replication group. The primary writes locally, replicates to two secondaries, and only then replies, so every successful write is already on three nodes at the price of higher latency.</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Waiting for all replicas means any later read from any replica sees the object: strong consistency.</p></div><div class="con"><strong>Costs</strong><p>Write latency grows with the slowest replica.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>How bytes are organized on disk</h4>
+    <p>The naive approach, one file per object, collapses with many small objects. Each file consumes at least a whole disk block (typically 4 KB), wasting space on tiny objects, and millions of files mean millions of inodes, which operating systems handle poorly and cap at a maximum.</p>
+    <figure class="guide-fig"><img src="24.%20S3-like%20Object%20Storage/images/wal-optimization.png" alt="Many small objects appended into one large file"><figcaption>Objects are appended one after another into a single large file until it reaches its capacity (a few GB), then a new file begins.</figcaption></figure>
+    <p>The fix is to append many objects into one big file, WAL style. Appends to a single file must be serialized, so cores would queue behind each other; confining each file to a specific core removes that contention. To find an object again, each node keeps an object_mapping table of object_id, filename, file_offset and object_size.</p>
+    <p>Where should that table live? A shared database cluster would need aggressive scaling and add a network hop to every read. Since each node only cares about its own objects, a lightweight relational DB, SQLite, runs inside each data node. Relational wins over RocksDB here because the access pattern is low write, high read.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Proposing a central lookup database for object locations. The notes favour a local SQLite per node because data nodes only need their own mappings.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Durability: replication vs erasure coding</h4>
+    <p>Hardware fails, and disasters take out whole racks or data centers at once. So copies must be spread across failure domains, not just across disks. With a typical HDD annual failure rate of 0.81%, three copies yield six nines of durability.</p>
+    <p>Erasure coding takes a different approach. Data is split into chunks and extra parity chunks are computed; if some chunks are lost, the rest can rebuild them. With 8+4, eight data chunks and four parity chunks are spread across failure domains, and up to four can be lost. Think of it as tearing a letter into eight strips and writing four clever summary strips, any eight of which rebuild the letter.</p>
+    <div class="anim" data-anim="erasure-coding"></div>
+    <figure class="guide-fig"><img src="24.%20S3-like%20Object%20Storage/images/erasure-coding-across-failure-domains.png" alt="8+4 erasure-coded chunks spread across failure domains"><figcaption>Each of the 12 chunks sits in a different failure domain, so a single rack or DC loss costs at most a few chunks.</figcaption></figure>
+    <table class="compare"><thead><tr><th></th><th>3-copy replication</th><th>8+4 erasure coding</th></tr></thead><tbody>
+      <tr><td>Storage overhead</td><td>200%</td><td>50%</td></tr>
+      <tr><td>Durability</td><td>6 nines</td><td>11 nines</td></tr>
+      <tr><td>Read speed</td><td>Fast; read one copy</td><td>Slower; collect chunks from many locations</td></tr>
+      <tr><td>Compute</td><td>Low</td><td>Higher; compute and store parities</td></tr>
+      <tr><td>Implementation</td><td>Simple</td><td>Much harder</td></tr>
+      <tr><td>Best for</td><td>Latency-sensitive data</td><td>Cost efficiency and durability</td></tr>
+    </tbody></table>
+    <p>Whole-disk failures are obvious; partial corruption is not. So checksums (hashes of the contents) are stored for every file and every object, and verified on read. With 8+4 erasure coding, each of the 8 data pieces is fetched and its checksum verified separately.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Metadata: sharding, listing and versioning</h4>
+    <p>The bucket table is small (users have a bucket limit) and fits one server, scaled for reads with replicas. The object table does not fit. Sharding by bucket_id creates hotspots because a single bucket can hold billions of objects. The chosen key is hash(bucket_name, object_name), since most queries look up an object by bucket and name.</p>
+    <p>That choice makes listing hard: "all objects under abc/ in bucket 123" is scattered across every shard. You could query every shard and merge, but pagination breaks because each shard returns different result counts and needs its own limit and offset. Since object stores are not optimized for listing anyway, the answer is a separate denormalized listing table sharded by bucket ID, so a listing hits one instance.</p>
+    <p>Versioning adds an object_version column of type TIMEUUID so versions sort by time, and each new version gets a new object_id. Deleting does not erase anything: it adds a new version with a special delete marker, and a GET for that name returns 404.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Multipart upload and garbage collection</h4>
+    <p>Uploading a multi-gigabyte file in one request means one network hiccup restarts everything. Multipart upload splits the file into chunks that travel independently.</p>
+    <ol class="steps">
+      <li>Client initiates a multipart upload; the data store returns an upload ID.</li>
+      <li>Client splits the file into parts and uploads each one with that upload ID.</li>
+      <li>For each part, the data store returns an ETag, an MD5 checksum of that part.</li>
+      <li>Client sends "complete multipart upload" with the upload ID, part numbers and all ETags.</li>
+      <li>The data store reassembles the object, which can take a few minutes, then returns success.</li>
+    </ol>
+    <p>Leftover parts become garbage, alongside lazily deleted objects and data that failed checksum verification. The garbage collector reclaims space by compaction: it copies live objects from an old file such as "data/b" into a new file "data/d", then updates the object_mapping table in one database transaction. Compaction runs only on files past a size threshold to avoid creating lots of small files, and deletions must reach every copy: primary and replicas, or all 12 nodes under 8+4 erasure coding.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Work each one out in the margin with your stylus, then reveal to check.</p>
+  <details class="qa"><summary>Why separate the metadata store from the data store?</summary><div class="qa-answer"><p>Like a UNIX inode and its data blocks, names and locations are small and query-heavy while bytes are large and opaque. Splitting them lets each store be scaled and optimized independently.</p></div></details>
+  <details class="qa"><summary>What goes wrong if every object is stored as its own file?</summary><div class="qa-answer"><p>Small objects waste most of a 4 KB block, and millions of files create millions of inodes, which operating systems handle poorly and cap. Packing objects into large append-only files fixes both.</p></div></details>
+  <details class="qa"><summary>Compare 3-copy replication with 8+4 erasure coding.</summary><div class="qa-answer"><p>Replication costs 200% extra storage for 6 nines and gives fast, simple reads. Erasure coding costs 50% extra for 11 nines but needs more computation, is harder to build, and reads are slower because chunks come from many places.</p></div></details>
+  <details class="qa"><summary>What happens if a portion of a disk silently corrupts an object?</summary><div class="qa-answer"><p>A whole-disk failure would be noticed, but partial corruption would not. Checksums stored per file and per object detect the mismatch on read, and the corrupted data becomes garbage to collect.</p></div></details>
+  <details class="qa"><summary>Why is listing objects by prefix slow, and how is it fixed?</summary><div class="qa-answer"><p>The object table is sharded by hash(bucket_name, object_name), so one prefix's objects are scattered across shards and pagination across shards is awkward. A denormalized listing table sharded by bucket ID keeps a listing on one instance.</p></div></details>
+  <details class="qa"><summary>How does deleting a versioned object work?</summary><div class="qa-answer"><p>A new version is added with a special object_id acting as a delete marker. Requests for the object then return 404, while older versions remain in the history.</p></div></details>
+  <details class="qa"><summary>Why does the placement service run on 5 or 7 nodes with Paxos or Raft?</summary><div class="qa-answer"><p>It is critical: every write needs its cluster map. A consensus cluster keeps replicas in sync and survives failures; 7 nodes tolerate 3 failures.</p></div></details>
+</div>

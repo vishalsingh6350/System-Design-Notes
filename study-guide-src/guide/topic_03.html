@@ -1,0 +1,204 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>The interviewer says six words, "Design a news feed system," and then goes quiet. The clock starts: 45 minutes. One candidate grabs the marker and starts drawing Kafka clusters before knowing whether the feed even has videos. Another asks four sharp questions, sketches five boxes, checks the numbers, and then invites the interviewer to pick which box to open up. Same knowledge, very different outcome. This chapter is the playbook that turns a vague prompt into a structured, collaborative 45 minutes.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The framework is four steps in strict order, wrapped in communication habits and a time budget. Each step's output is the next step's raw material, so skipping one leaves the next without a foundation.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Step 1: Understand the problem &amp; scope</span> <span class="why">— every later decision depends on knowing what is being built and at what scale</span>
+      <ul>
+        <li>Ask clarifying questions: key features, scale, web vs mobile, existing constraints
+          <ul><li><span class="peripheral">News feed examples: mobile or web? how many friends? images and videos? reverse chronological?</span></li></ul>
+        </li>
+        <li>Document assumptions on the whiteboard</li>
+      </ul>
+    </li>
+    <li><span class="hub">Step 2: High-level design &amp; buy-in</span> <span class="why">— the blueprint you and the interviewer agree on before investing in details</span>
+      <ul>
+        <li>Box diagram: clients, APIs, databases, caches, CDNs</li>
+        <li>Back-of-the-envelope check against scale constraints</li>
+        <li>Walk through use cases to catch edge cases
+          <ul><li><span class="peripheral">News feed split: feed publishing flow and feed retrieval flow</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Step 3: Design deep dive</span> <span class="why">— where you prove depth on the parts that matter most</span>
+      <ul>
+        <li>Prioritize key components; discuss bottlenecks; avoid over-engineering
+          <ul><li><span class="peripheral">URL shortener: hash function; chat: latency and online/offline status; news feed: publishing and retrieval</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Step 4: Wrap-up</span> <span class="why">— shows self-awareness and forward thinking</span>
+      <ul>
+        <li>Identify bottlenecks, recap decisions and trade-offs</li>
+        <li>Propose enhancements
+          <ul><li><span class="peripheral">Scaling from 1 million to 10 million users; error handling for server failures and network issues</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Cross-cutting habits</span> <span class="why">— the interview grades collaboration and communication, not just the diagram</span>
+      <ul>
+        <li>Dos: ask, communicate, iterate, stay flexible, focus on critical parts</li>
+        <li>Don'ts: premature solutions, going silent, over-engineering</li>
+        <li><span class="peripheral">Time: 3-10 / 10-15 / 10-25 / 3-5 minutes</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The four steps form a chain: scope produces requirements, requirements shape the blueprint, the agreed blueprint tells you where to dive, and the dive gives you material to reflect on in the wrap-up. The habits hub runs alongside all four, because the interviewer is evaluating how you handle ambiguity and collaborate just as much as the final architecture.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each step as a machine with a clear input and a deliverable output. If you cannot name the output of a step, you have not finished it.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Clarifying questions</h4>
+      <p><strong>Input:</strong> A vague prompt such as "Design a news feed system".</p>
+      <p><strong>Output:</strong> A short list of features, scale, platforms and constraints.</p>
+      <p class="io-story">A tailor measuring you before cutting any cloth.</p>
+      <p class="io-arrow">&rarr; feeds into: written assumptions</p>
+    </div>
+    <div class="io-block">
+      <h4>Documented assumptions</h4>
+      <p><strong>Input:</strong> The answers you received plus reasonable guesses where the interviewer left it to you.</p>
+      <p><strong>Output:</strong> A visible reference list on the whiteboard.</p>
+      <p class="io-story">A contract pinned to the wall; both sides can point to it when a later decision is questioned.</p>
+      <p class="io-arrow">&rarr; feeds into: the high-level blueprint and the estimates</p>
+    </div>
+    <div class="io-block">
+      <h4>High-level blueprint</h4>
+      <p><strong>Input:</strong> Requirements and assumptions.</p>
+      <p><strong>Output:</strong> A box diagram of clients, APIs, databases, caches and CDNs, split into main flows.</p>
+      <p class="io-story">An architect's floor plan: rooms and doors, no furniture yet.</p>
+      <p class="io-arrow">&rarr; feeds into: estimation check and use-case walkthrough</p>
+    </div>
+    <div class="io-block">
+      <h4>Estimates + use-case walkthrough</h4>
+      <p><strong>Input:</strong> The blueprint and the scale assumptions.</p>
+      <p><strong>Output:</strong> Confidence that the design meets scale, plus a list of edge cases, and the interviewer's buy-in.</p>
+      <p class="io-story">Walking through the floor plan pretending to be a resident at rush hour to see where people collide.</p>
+      <p class="io-arrow">&rarr; feeds into: choice of deep-dive targets</p>
+    </div>
+    <div class="io-block">
+      <h4>Deep dive</h4>
+      <p><strong>Input:</strong> The agreed blueprint and the components most relevant to this problem.</p>
+      <p><strong>Output:</strong> Detailed design of 1-3 critical components, with bottlenecks and solutions.</p>
+      <p class="io-story">Opening one wall to show the plumbing, not re-tiling every bathroom.</p>
+      <p class="io-arrow">&rarr; feeds into: wrap-up</p>
+    </div>
+    <div class="io-block">
+      <h4>Wrap-up</h4>
+      <p><strong>Input:</strong> The complete design and remaining minutes.</p>
+      <p><strong>Output:</strong> Bottlenecks named, decisions and trade-offs recapped, enhancements proposed.</p>
+      <p class="io-story">The final walkthrough with the client, including an honest list of what you would improve with more budget.</p>
+      <p class="io-arrow">&rarr; feeds into: the interviewer's overall impression</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one interview</h4>
+    <ol class="journey-steps">
+      <li>Minute 0: the prompt is "Design a news feed system." You resist the urge to draw and pick up the marker only to write "Questions".</li>
+      <li>Minutes 1-6: you ask whether it is a mobile app, web app or both; how many friends a user can have; whether the feed includes images and videos; and whether it is sorted in reverse chronological order. You write each answer down as an assumption.</li>
+      <li>Minutes 7-12: you draw boxes for clients, an API layer, databases, a cache and a CDN, and split the design into two flows: feed publishing and feed retrieval.</li>
+      <li>Minutes 13-18: you run a quick back-of-the-envelope estimate to show the design can handle the scale, and walk through "a user posts a photo" end to end to surface edge cases. You ask, "Does this look reasonable before I go deeper?"</li>
+      <li>Minutes 19-40: with the interviewer's nod, you deep dive into the feed publishing and retrieval processes, naming bottlenecks and how you would relieve them, while talking through your reasoning out loud.</li>
+      <li>When the interviewer suggests an alternative, you treat it as a teammate's idea, compare it honestly, and adjust.</li>
+      <li>Minutes 41-45: you recap the major decisions and trade-offs, name the remaining bottlenecks, and propose next steps: what changes to go from 1 million to 10 million users, and how you would handle server failures and network issues.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A system design interview simulates real-world problem solving under ambiguity. The 4-step framework gives you a repeatable path that shows technical depth, collaboration and communication in 45 minutes.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of commissioning a house with a client. First you <strong>interview the client</strong> about family size, budget and style; that is Step 1, scope and assumptions. Then you sketch a <strong>floor plan</strong> and get the client to sign off before ordering bricks; that is Step 2, the high-level design and buy-in. Next you <strong>detail the kitchen and plumbing</strong>, the rooms that make or break the house, rather than choosing doorknobs; that is Step 3, the deep dive into critical components. Finally you do a <strong>walkthrough</strong>, recapping choices and listing future upgrades; that is Step 4, the wrap-up. Throughout, the client is a partner in the room, which is exactly how you should treat the interviewer.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">4-step framework</span><span class="beacon-def">Scope, high-level design, deep dive, wrap-up: always in this order.</span></div>
+    <div class="beacon"><span class="beacon-term">Clarifying questions</span><span class="beacon-def">Features, scale, platform, constraints; they prevent solving the wrong problem.</span></div>
+    <div class="beacon"><span class="beacon-term">Written assumptions</span><span class="beacon-def">A shared reference that makes every later number and decision traceable.</span></div>
+    <div class="beacon"><span class="beacon-term">Buy-in</span><span class="beacon-def">The interviewer agrees with the blueprint before you invest time in details.</span></div>
+    <div class="beacon"><span class="beacon-term">Box diagram</span><span class="beacon-def">Clients, APIs, databases, caches, CDNs: the vocabulary of Step 2.</span></div>
+    <div class="beacon"><span class="beacon-term">Back-of-the-envelope check</span><span class="beacon-def">Confirms the blueprint can meet the stated scale.</span></div>
+    <div class="beacon"><span class="beacon-term">Use-case walkthrough</span><span class="beacon-def">Tracing real scenarios through the diagram to expose edge cases.</span></div>
+    <div class="beacon"><span class="beacon-term">Deep-dive target</span><span class="beacon-def">The component most specific to the problem, e.g. the hash function for a URL shortener.</span></div>
+    <div class="beacon"><span class="beacon-term">Over-engineering</span><span class="beacon-def">Adding complexity the requirements do not demand; a red flag, not a bonus.</span></div>
+    <div class="beacon"><span class="beacon-term">1M to 10M users</span><span class="beacon-def">The classic wrap-up follow-up: how would the design evolve at ten times the scale?</span></div>
+    <div class="beacon"><span class="beacon-term">3-10 / 10-15 / 10-25 / 3-5</span><span class="beacon-def">Minutes per step in a 45-minute interview; the deep dive gets the largest share.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Steps 1 and 2 are where most candidates lose points, the deep dive is where strong candidates earn them, and time management determines whether you even reach the wrap-up. Drill these.</p>
+
+  <div class="drill">
+    <h4>Step 1: scope before solutions</h4>
+    <p>The most common failure is jumping into a solution before understanding the problem. Interviewers treat that as a red flag because in real engineering, building the wrong thing is the most expensive mistake there is.</p>
+    <p>Good questions fall into four families: what are the most important features, what scale must the system handle, is it web, mobile or both, and are there existing technologies or constraints. Each answer should go on the whiteboard as an assumption so you and the interviewer share the same picture.</p>
+    <ol class="steps">
+      <li>Is it a mobile app, a web app, or both?</li>
+      <li>How many friends can a user have?</li>
+      <li>Should the feed include images and videos?</li>
+      <li>Is the feed sorted in reverse chronological order?</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> asking questions and then not writing the answers down. Five minutes later you cannot remember whether videos were in scope, and your design drifts.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Step 2: the blueprint and the buy-in</h4>
+    <p>The goal is a high-level architecture that the interviewer agrees with. Draw simple boxes for the key components (clients, APIs, databases, caches, CDNs) and treat the interviewer as a teammate who can redirect you early and cheaply.</p>
+    <p>Two checks make the blueprint trustworthy: a back-of-the-envelope calculation to confirm it can handle the scale, and a walkthrough of concrete use cases to reveal edge cases. For a news feed, splitting the drawing into a feed publishing flow (writing posts and populating friends' feeds) and a feed retrieval flow (aggregating friends' posts in reverse chronological order) makes both checks easier.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Early agreement means your deep-dive time is spent on what the interviewer actually cares about, and mistakes are caught when they are cheap to fix.</p></div>
+      <div class="con"><strong>Costs</strong><p>Takes 10-15 minutes you might be tempted to spend on details; skimping here makes the deep dive feel unanchored.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Step 3: choosing where to dig</h4>
+    <p>You cannot detail everything in 10-25 minutes, so the skill is prioritization. Focus on the components most relevant to this particular problem, discuss the bottlenecks they face, and propose concrete solutions.</p>
+    <table class="compare">
+      <thead><tr><th>Problem</th><th>Natural deep-dive focus</th></tr></thead>
+      <tbody>
+        <tr><td>URL shortener</td><td>Hash function design</td></tr>
+        <tr><td>Chat system</td><td>Latency reduction; online/offline status</td></tr>
+        <tr><td>News feed</td><td>Feed publishing and retrieval processes</td></tr>
+      </tbody>
+    </table>
+    <p>Balance is everything. Too shallow and you show no depth; too deep in an irrelevant corner and you over-engineer while the real bottleneck goes undiscussed.</p>
+    <div class="pitfall"><strong>Common trap:</strong> diving into a favorite technology rather than the problem's defining component. Ask yourself: "What would break first at scale?" and go there.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Time management and the wrap-up</h4>
+    <p>In a 45-minute interview, budget roughly 3-10 minutes for scope, 10-15 for high-level design, 10-25 for the deep dive and 3-5 for the wrap-up. The ranges flex with the problem, but the deep dive should always get the biggest slice.</p>
+    <p>The wrap-up is short but valuable. Name the bottlenecks you know remain, recap the major decisions and their trade-offs, and propose enhancements: how the design would scale from 1 million to 10 million users, and how it handles server failures or network issues. It shows you can critique your own work.</p>
+    <table class="compare">
+      <thead><tr><th>Do</th><th>Don't</th></tr></thead>
+      <tbody>
+        <tr><td>Ask questions to clarify ambiguity</td><td>Design before understanding requirements</td></tr>
+        <tr><td>Communicate your thought process</td><td>Go silent</td></tr>
+        <tr><td>Iterate with the interviewer as a collaborator</td><td>Over-engineer</td></tr>
+        <tr><td>Show flexibility and suggest alternatives</td><td></td></tr>
+        <tr><td>Focus on critical components</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Jot your answer in the margin with your stylus, then open the card to check.</p>
+  <details class="qa"><summary>Why is jumping straight into a solution penalized?</summary><div class="qa-answer"><p>Without clarifying requirements you may design the wrong system entirely. The interview evaluates how you handle ambiguity, and asking good questions first is the evidence of critical thinking the interviewer is looking for.</p></div></details>
+  <details class="qa"><summary>What are the four steps of the framework and their time budgets in a 45-minute interview?</summary><div class="qa-answer"><p>Understand the problem and scope (3-10 minutes), propose a high-level design and get buy-in (10-15), design deep dive (10-25), and wrap-up (3-5).</p></div></details>
+  <details class="qa"><summary>What happens if you skip getting buy-in on the high-level design?</summary><div class="qa-answer"><p>You risk spending the deep dive on areas the interviewer does not care about, or building on a blueprint they disagree with. Buy-in turns the interviewer into a collaborator and catches mistakes early, when they are cheap to fix.</p></div></details>
+  <details class="qa"><summary>How would you split a news feed design at the high level?</summary><div class="qa-answer"><p>Into a feed publishing flow, which writes posts to databases and populates friends' feeds, and a feed retrieval flow, which aggregates friends' posts and displays them in reverse chronological order.</p></div></details>
+  <details class="qa"><summary>Compare the deep-dive focus for a URL shortener and a chat system.</summary><div class="qa-answer"><p>A URL shortener's defining challenge is hash function design. A chat system's is latency reduction and handling online/offline status. The deep dive should target whichever component is most specific to the problem.</p></div></details>
+  <details class="qa"><summary>What belongs in the wrap-up?</summary><div class="qa-answer"><p>Identifying remaining bottlenecks, summarizing the major design decisions and trade-offs, and proposing enhancements such as scaling from 1 million to 10 million users and handling server failures or network issues.</p></div></details>
+</div>

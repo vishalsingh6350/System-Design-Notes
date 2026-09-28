@@ -1,0 +1,204 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You post a beach photo and, within seconds, it appears near the top of the feed of each of your friends: hundreds of people, scattered across the world, each opening the app at a different moment. Now multiply that by 10 million daily active users, some with up to 5,000 friends, all posting and scrolling at the same time. Every scroll must feel instant, yet every new post must somehow find its way into thousands of personal timelines. The news feed system is a giant sorting machine that decides, for every user, "what are the latest things from the people I care about?", and it has to answer before your thumb stops moving.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The whole design splits into two flows, a write path (publishing) and a read path (building the feed), joined in the middle by a cache of post IDs. Read the map as four hubs.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Feed publishing (write path)</span> <span class="why">— where a post is born and stored</span>
+      <ul>
+        <li>POST /v1/me/feed with content and auth_token</li>
+        <li>Web servers: authentication and rate limiting
+          <ul><li><span class="peripheral">rate limits prevent spam</span></li></ul>
+        </li>
+        <li>Post Service writes to post DB and post cache</li>
+        <li><span class="peripheral">Notification Service tells friends</span></li>
+      </ul>
+    </li>
+    <li><span class="hub">Fanout service</span> <span class="why">— the bridge that copies one post into many feeds; the chapter's central design decision</span>
+      <ul>
+        <li>Fanout on write (push) vs fanout on read (pull)
+          <ul><li><span class="peripheral">hybrid: push for most users, pull for celebrities</span></li></ul>
+        </li>
+        <li>Graph DB for friend IDs; user cache for settings (muted friends)</li>
+        <li>Message queue and fanout workers</li>
+      </ul>
+    </li>
+    <li><span class="hub">News feed building (read path)</span> <span class="why">— what the reader actually experiences</span>
+      <ul>
+        <li>GET /v1/me/feed with auth_token</li>
+        <li>News Feed Service reads post IDs from the news feed cache
+          <ul><li><span class="peripheral">then hydrates full post details from cache or DB</span></li></ul>
+        </li>
+        <li>Reverse chronological order</li>
+      </ul>
+    </li>
+    <li><span class="hub">Cache architecture &amp; scaling</span> <span class="why">— memory is what makes both paths fast</span>
+      <ul>
+        <li>Five cache layers: news feed, content, social graph, action, counters
+          <ul><li><span class="peripheral">hot cache for popular posts</span></li></ul>
+        </li>
+        <li>DB sharding and read replicas; stateless web tier</li>
+        <li><span class="peripheral">consistent hashing, monitoring QPS, latency and cache hit rate</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Publishing produces posts; building consumes them. The fanout service is the hinge between them, and its choice of push or pull decides how much work lands on each side. The cache layers underneath are what let either path run at 10 million users without crushing the database.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the causal chain from a user pressing "Post" to a friend seeing it. Each box hides its internals; focus on what goes in and what comes out.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Load balancer + web servers</h4>
+      <p><strong>Input:</strong> An API call: POST /v1/me/feed (content, auth_token) or GET /v1/me/feed (auth_token).</p>
+      <p><strong>Output:</strong> An authenticated, rate-checked request routed to the right service.</p>
+      <p class="io-story">The front gate. It checks your ticket (auth_token), stops anyone posting too much, and points you down the right corridor.</p>
+      <p class="io-arrow">&rarr; feeds into: Post Service and Fanout Service (write), or News Feed Service (read)</p>
+    </div>
+    <div class="io-block">
+      <h4>Post Service</h4>
+      <p><strong>Input:</strong> The new post.</p>
+      <p><strong>Output:</strong> The post saved in the post database and post cache, with a post ID.</p>
+      <p class="io-story">The archive clerk. The full content is stored exactly once here; everyone else will only pass around its ID.</p>
+      <p class="io-arrow">&rarr; feeds into: Content cache used by the read path</p>
+    </div>
+    <div class="io-block">
+      <h4>Fanout Service</h4>
+      <p><strong>Input:</strong> The new post ID and the author's user ID.</p>
+      <p><strong>Output:</strong> A filtered friend list plus the post ID, placed on a message queue.</p>
+      <p class="io-story">The mail-merge engine. It asks the graph database "who are this person's friends?", removes anyone who muted them, and queues up the delivery job.</p>
+      <p class="io-arrow">&rarr; feeds into: Fanout workers</p>
+    </div>
+    <div class="io-block">
+      <h4>Fanout workers</h4>
+      <p><strong>Input:</strong> Jobs from the queue (post ID plus friend IDs).</p>
+      <p><strong>Output:</strong> The post ID appended to each friend's list in the news feed cache.</p>
+      <p class="io-story">A team of postal workers slipping the same small index card (the post ID, not the whole post) into each friend's pigeonhole.</p>
+      <p class="io-arrow">&rarr; feeds into: News feed cache</p>
+    </div>
+    <div class="io-block">
+      <h4>News Feed Service</h4>
+      <p><strong>Input:</strong> A user's GET feed request.</p>
+      <p><strong>Output:</strong> A list of full posts in reverse chronological order.</p>
+      <p class="io-story">The reader's assistant. It grabs the stack of index cards from your pigeonhole, then fetches the actual posts, author details and like counts from the other caches.</p>
+      <p class="io-arrow">&rarr; feeds into: The user's screen</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one post</h4>
+    <ol class="journey-steps">
+      <li>Maya, who has 300 friends, posts "Hello" through POST /v1/me/feed with her auth_token.</li>
+      <li>The load balancer routes her to a web server, which authenticates the token and checks she is within her rate limit.</li>
+      <li>The Post Service stores the post in the post DB and post cache and assigns it a post ID.</li>
+      <li>The Fanout Service fetches Maya's 300 friend IDs from the graph DB, then checks the user cache: 2 friends have muted her, so 298 remain.</li>
+      <li>The post ID and the 298 friend IDs go onto the message queue. The Notification Service separately alerts her friends.</li>
+      <li>Fanout workers pick up the job and append Maya's post ID to each of the 298 friends' lists in the news feed cache. Old IDs beyond the configured limit fall off the end.</li>
+      <li>Her friend Raj opens the app: GET /v1/me/feed. The News Feed Service reads his list of post IDs from the news feed cache.</li>
+      <li>It hydrates each ID into a full post from the content cache, plus Maya's profile and the like counter, and returns them newest first. Maya's "Hello" is at the top.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A news feed system precomputes each user's timeline as a list of post IDs in cache, so reading is fast, and uses a hybrid fanout so that writing stays affordable even for users with huge audiences.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture an office building where every employee has a pigeonhole. When someone writes a memo, the original goes into the central filing room (Post Service and post DB). The mailroom (Fanout Service) looks up who should get it in the company directory (graph DB), crosses out anyone who asked not to receive that person's memos (user cache settings), and hands the list to a team of runners (fanout workers). The runners drop a small slip with the memo number into each pigeonhole (the news feed cache), not a full copy. When you check your pigeonhole (GET feed), your assistant (News Feed Service) reads the slips and fetches the actual memos from the filing room, newest first. For the CEO, whose memos would need thousands of slips, the runners skip the slips and readers go and fetch the CEO's latest memo themselves (pull for celebrities).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">10M DAU, up to 5,000 friends</span><span class="beacon-def">A single post can fan out to thousands of feeds, so writes are expensive.</span></div>
+    <div class="beacon"><span class="beacon-term">POST /v1/me/feed</span><span class="beacon-def">Publishing API; params are content and auth_token.</span></div>
+    <div class="beacon"><span class="beacon-term">GET /v1/me/feed</span><span class="beacon-def">Retrieval API; only the auth_token is needed.</span></div>
+    <div class="beacon"><span class="beacon-term">Reverse chronological</span><span class="beacon-def">Newest first; a simplifying choice that avoids ranking.</span></div>
+    <div class="beacon"><span class="beacon-term">Fanout on write (push)</span><span class="beacon-def">Precompute feeds at post time: fast reads, heavy writes.</span></div>
+    <div class="beacon"><span class="beacon-term">Fanout on read (pull)</span><span class="beacon-def">Build feeds at read time: cheap for inactive users, slow reads.</span></div>
+    <div class="beacon"><span class="beacon-term">Hybrid fanout</span><span class="beacon-def">Push for most, pull for celebrities; the standard answer.</span></div>
+    <div class="beacon"><span class="beacon-term">Graph DB</span><span class="beacon-def">Stores friendships; the source of "who should receive this?"</span></div>
+    <div class="beacon"><span class="beacon-term">&lt;post_id, user_id&gt; in cache</span><span class="beacon-def">Store IDs, not objects, to keep feed cache memory small.</span></div>
+    <div class="beacon"><span class="beacon-term">Configurable feed limit</span><span class="beacon-def">Only recent IDs are cached, because users mostly read the latest.</span></div>
+    <div class="beacon"><span class="beacon-term">Five cache layers</span><span class="beacon-def">News feed, content, social graph, action, counters; each tuned for its data.</span></div>
+    <div class="beacon"><span class="beacon-term">Stateless web tier</span><span class="beacon-def">Any server can handle any request, so you scale by adding servers.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Fanout strategy is the question every interviewer asks about this system, and the fanout pipeline and cache layers are how you back up your answer. Drill these three and you own the chapter.</p>
+
+  <div class="drill">
+    <h4>Push vs pull: choosing a fanout model</h4>
+    <p>There are two moments when you could assemble a feed. <strong>Fanout on write</strong> does the work at post time: the moment Maya posts, her post ID is pushed into every friend's feed. When a friend opens the app, their feed is already waiting, fully assembled. It feels real-time and reads are fast.</p>
+    <p>The catch appears with big audiences. If a user has thousands of friends, a single post triggers thousands of cache writes, which is resource-intensive. And much of that work is wasted on friends who will not log in for weeks.</p>
+    <p><strong>Fanout on read</strong> flips it: nothing is precomputed, and the feed is assembled when the reader asks for it. Inactive users cost nothing, but every read has to gather posts on the spot, so retrieval is slower.</p>
+    <table class="compare">
+      <thead><tr><th></th><th>Fanout on write (push)</th><th>Fanout on read (pull)</th></tr></thead>
+      <tbody>
+        <tr><td>When the work happens</td><td>When the post is published</td><td>When the feed is requested</td></tr>
+        <tr><td>Feed retrieval</td><td>Fast, precomputed</td><td>Slower, built on demand</td></tr>
+        <tr><td>Freshness</td><td>Real-time updates</td><td>Built fresh at each read</td></tr>
+        <tr><td>Weak spot</td><td>Users with many friends</td><td>Every read pays the cost</td></tr>
+        <tr><td>Good for</td><td>Most normal users</td><td>Inactive users, celebrities</td></tr>
+      </tbody>
+    </table>
+    <p>The <strong>hybrid approach</strong> takes the best of both: push for the vast majority of users, so their friends get fast feeds, and pull for high-connection accounts such as celebrities, whose posts are fetched at read time instead of being copied into millions of caches.</p>
+    <div class="anim" data-anim="fanout"></div>
+    <div class="pitfall"><strong>Common trap:</strong> Picking one model and defending it absolutely. The expected answer names the trade-off and lands on the hybrid, with celebrities as the reason.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Inside the fanout service</h4>
+    <p>The fanout service is a five-step pipeline. It pulls two kinds of data (who the friends are, and whether they want this post), then hands the heavy lifting to a queue and a pool of workers so the user's post request returns quickly.</p>
+    <figure class="guide-fig"><img src="11.%20News%20Feed%20System/images/fanout-service.png" alt="Fanout service fetching friend IDs from graph DB, friend data from user cache, then message queue, fanout workers and news feed cache"><figcaption>Read the circled numbers in order. Steps 1 and 2 are lookups (graph DB, then user cache backed by user DB). Steps 3 to 5 are the delivery conveyor: queue, workers, news feed cache.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>Fetch friend IDs</strong> from the graph database.</li>
+      <li><strong>Filter friends</strong> using settings in the user cache, removing muted friends or those excluded by selective sharing.</li>
+      <li><strong>Send to message queue:</strong> the filtered friend list plus the new post ID.</li>
+      <li><strong>Fanout workers</strong> pull from the queue.</li>
+      <li><strong>Store in news feed cache:</strong> append the post ID to each friend's list, respecting the configurable limit on how many recent IDs are kept.</li>
+    </ol>
+    <p>The memory trick is crucial: the cache stores &lt;post_id, user_id&gt; pairs, not full post and user objects. A post ID is tiny compared with a post containing text, image links and metadata, so thousands of feeds can reference the same post without thousands of copies.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>The queue decouples publishing from delivery, so posting stays fast; storing IDs keeps cache memory manageable; the size limit caps growth.</p></div>
+      <div class="con"><strong>Costs</strong><p>Reads need a second step to hydrate IDs into full posts; very old posts fall out of the cache and must come from the database.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>The five-layer cache</h4>
+    <p>A feed is not one piece of data. To draw a single card on screen you need the list of posts, the post itself, the author, whether you already liked it, and how many likes it has. Each of these has a different size, lifespan and access pattern, so the cache is split into five layers.</p>
+    <figure class="guide-fig"><img src="11.%20News%20Feed%20System/images/cache-architecture.png" alt="Five cache layers: news feed, content (hot cache, normal), social graph (follower, following), action (liked, replied, others), counters"><figcaption>Top to bottom: what to show (news feed), what it says (content, with a hot tier for popular posts), who is connected (social graph), what you did (action), and how many (counters).</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Layer</th><th>Holds</th><th>Used for</th></tr></thead>
+      <tbody>
+        <tr><td>News Feed</td><td>Post IDs per user</td><td>Which posts are in your feed</td></tr>
+        <tr><td>Content</td><td>Post details; hot cache for popular posts</td><td>Hydrating IDs into posts</td></tr>
+        <tr><td>Social Graph</td><td>Followers and following</td><td>Fanout and author info</td></tr>
+        <tr><td>Action</td><td>Liked, replied, other actions</td><td>Showing "you liked this"</td></tr>
+        <tr><td>Counters</td><td>Like, reply, follower and other counts</td><td>The numbers under each post</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall"><strong>Common trap:</strong> Describing "a cache" as one blob. Naming the layers shows you understand that a feed read is really several small lookups stitched together.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Scaling and keeping it healthy</h4>
+    <p>Around the core, the notes list the standard scaling toolkit. The database is scaled horizontally with sharding, and read replicas absorb high-traffic queries. The web tier is kept stateless so more servers can be added freely. Consistent hashing spreads requests evenly across servers, and message queues decouple components and buffer bursts of traffic.</p>
+    <p>Finally, you watch the system: QPS and latency tell you if users are waiting, and cache hit rate tells you whether the caches are doing their job. A falling hit rate is the cue to adjust cache configuration.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer beside each question with your stylus, then tap to compare.</p>
+  <details class="qa"><summary>Compare fanout on write and fanout on read.</summary><div class="qa-answer"><p>Fanout on write pushes the post into friends' feeds when it is published, giving real-time updates and fast retrieval but costing a lot for users with many friends. Fanout on read assembles feeds at request time, which is efficient for inactive users but makes retrieval slower.</p></div></details>
+  <details class="qa"><summary>Why does the hybrid model use pull for celebrities?</summary><div class="qa-answer"><p>A celebrity has an enormous number of connections, so pushing each post into every follower's cache would be extremely resource-intensive. Pulling their posts at read time avoids that write storm, while normal users keep the fast push model.</p></div></details>
+  <details class="qa"><summary>Why does the news feed cache store post IDs instead of full posts?</summary><div class="qa-answer"><p>To save memory. Storing &lt;post_id, user_id&gt; pairs means the full post lives once in the content cache and database, while each feed holds only small references. A configurable limit on recent IDs keeps memory usage bounded further.</p></div></details>
+  <details class="qa"><summary>What happens if a friend has muted the author?</summary><div class="qa-answer"><p>In step 2 of the fanout, the service checks user settings in the cache and filters that friend out. The post ID is never written to their news feed cache.</p></div></details>
+  <details class="qa"><summary>Walk through what the News Feed Service does on GET /v1/me/feed.</summary><div class="qa-answer"><p>It fetches the user's list of post IDs from the news feed cache, then retrieves the complete post details (and related user and counter data) from the caches or database, returning them in reverse chronological order.</p></div></details>
+  <details class="qa"><summary>Why put a message queue between the fanout service and the workers?</summary><div class="qa-answer"><p>It decouples publishing from delivery and buffers traffic. The user's post request does not have to wait for thousands of cache writes; workers process the jobs at their own pace and can be scaled independently.</p></div></details>
+</div>

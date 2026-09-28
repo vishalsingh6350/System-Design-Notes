@@ -1,0 +1,136 @@
+<h3>Introduction</h3>
+<p>System design interviews are a key part of the hiring process, simulating real-life problem-solving scenarios. These interviews evaluate not just technical skills but also collaboration, communication, and the ability to handle ambiguous requirements.</p>
+<p>This chapter introduces a <strong>4-step framework</strong> for navigating system design interviews effectively.</p>
+
+<h3>Step 1: Understand the Problem and Establish Design Scope</h3>
+
+<h4>Key Objectives</h4>
+<ul>
+<li>Clarify requirements and assumptions.</li>
+<li>Avoid jumping into solutions prematurely.</li>
+<li>Showcase critical thinking by asking good questions.</li>
+</ul>
+
+<h4>Approach</h4>
+<ul>
+<li><strong>Ask Clarifying Questions:</strong>
+  <ul>
+    <li>What are the most important features?</li>
+    <li>What scale does the system need to handle?</li>
+    <li>Are we building for web, mobile, or both?</li>
+    <li>Are there existing technologies or constraints?</li>
+  </ul>
+</li>
+<li><strong>Document Assumptions:</strong> Write assumptions on a whiteboard or paper for reference.</li>
+</ul>
+
+<h4>Example</h4>
+<p><strong>Problem:</strong> Design a news feed system.<br>
+<strong>Questions:</strong></p>
+<ul>
+<li>Is it a mobile app, web app, or both?</li>
+<li>How many friends can a user have?</li>
+<li>Should the feed include images and videos?</li>
+<li>Is the feed sorted by reverse chronological order?</li>
+</ul>
+
+<h3>Step 2: Propose High-Level Design and Get Buy-In</h3>
+
+<h4>Key Objectives</h4>
+<ul>
+<li>Develop a high-level architecture.</li>
+<li>Collaborate with the interviewer to refine the design.</li>
+</ul>
+
+<h4>Approach</h4>
+<ul>
+<li><strong>Draft a Blueprint:</strong>
+  <ul>
+    <li>Use box diagrams for key components (e.g., clients, APIs, databases, caches, CDNs).</li>
+    <li>Treat the interviewer as a teammate to refine the design.</li>
+  </ul>
+</li>
+<li><strong>Perform Back-of-the-Envelope Calculations:</strong>
+  <ul>
+    <li>Ensure the design can handle the scale constraints.</li>
+  </ul>
+</li>
+<li><strong>Walk Through Use Cases:</strong> Identify edge cases and validate design assumptions.</li>
+</ul>
+
+<h4>Example</h4>
+<p>For a news feed system, divide the design into:</p>
+<ol>
+<li><strong>Feed Publishing Flow:</strong> Writing posts into databases and populating friends' feeds.</li>
+<li><strong>Feed Retrieval Flow:</strong> Aggregating and displaying friends' posts in reverse chronological order.</li>
+</ol>
+
+<h3>Step 3: Design Deep Dive</h3>
+
+<h4>Key Objectives</h4>
+<ul>
+<li>Dive into critical components.</li>
+<li>Showcase depth of understanding and adaptability.</li>
+</ul>
+
+<h4>Approach</h4>
+<ul>
+<li><strong>Prioritize Key Components:</strong> Focus on areas most relevant to the problem.</li>
+<li><strong>Discuss Bottlenecks:</strong> Identify potential performance issues and propose solutions.</li>
+<li><strong>Balance Detail:</strong> Avoid over-engineering or unnecessary deep dives.</li>
+</ul>
+
+<h4>Example Topics</h4>
+<ul>
+<li><strong>URL Shortener:</strong> Focus on hash function design.</li>
+<li><strong>Chat System:</strong> Explore latency reduction and online/offline status handling.</li>
+<li><strong>News Feed System:</strong> Examine feed publishing and retrieval processes.</li>
+</ul>
+
+<h3>Step 4: Wrap-Up</h3>
+
+<h4>Key Objectives</h4>
+<ul>
+<li>Highlight areas for improvement.</li>
+<li>Recap the design and discuss follow-ups.</li>
+</ul>
+
+<h4>Approach</h4>
+<ul>
+<li><strong>Identify Bottlenecks:</strong> Discuss potential limitations and scaling strategies.</li>
+<li><strong>Summarize Design:</strong> Recap major design decisions and trade-offs.</li>
+<li><strong>Propose Enhancements:</strong>
+  <ul>
+    <li>How to scale from 1 million to 10 million users.</li>
+    <li>Error handling for server failures or network issues.</li>
+  </ul>
+</li>
+</ul>
+
+<h3>Best Practices</h3>
+
+<h4>Dos</h4>
+<ul>
+<li><strong>Ask Questions:</strong> Clarify ambiguities before diving into solutions.</li>
+<li><strong>Communicate:</strong> Share your thought process with the interviewer.</li>
+<li><strong>Iterate with the Interviewer:</strong> Treat them as a collaborator.</li>
+<li><strong>Show Flexibility:</strong> Suggest alternative approaches and refine your design.</li>
+<li><strong>Focus on Critical Components:</strong> Prioritize key parts of the system.</li>
+</ul>
+
+<h4>Don'ts</h4>
+<ul>
+<li><strong>Avoid Premature Solutions:</strong> Don't design before understanding the requirements.</li>
+<li><strong>Don't Go Silent:</strong> Communicate regularly during the process.</li>
+<li><strong>Avoid Over-Engineering:</strong> Focus on practical, scalable solutions.</li>
+</ul>
+
+<h3>Time Management</h3>
+
+<h4>Suggested Time Allocation (for 45-Minute Interviews):</h4>
+<ol>
+<li><strong>Understand Problem and Scope:</strong> 3&ndash;10 minutes</li>
+<li><strong>High-Level Design and Buy-In:</strong> 10&ndash;15 minutes</li>
+<li><strong>Deep Dive:</strong> 10&ndash;25 minutes</li>
+<li><strong>Wrap-Up:</strong> 3&ndash;5 minutes</li>
+</ol>

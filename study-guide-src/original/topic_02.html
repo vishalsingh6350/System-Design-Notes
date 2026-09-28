@@ -1,0 +1,99 @@
+<h3>Introduction</h3>
+<p>Back-of-the-envelope estimation is a crucial skill in system design interviews. It involves making quick, rough calculations to assess system capacity or performance. According to Jeff Dean, Google Senior Fellow, these estimates help evaluate whether designs meet requirements through thought experiments and common performance benchmarks.</p>
+<p>This chapter covers key concepts, methodologies, and examples to build proficiency in scalability and estimation.</p>
+
+<h3>Section 1: Key Concepts</h3>
+
+<h4>Power of Two</h4>
+<p>Understanding data volume in terms of powers of two is fundamental:</p>
+<img class="orig-img" src="02.%20Back%20Of%20the%20Envelope%20Estimation/images/power-of-two.png" alt="power-of-two">
+<p>This knowledge helps in performing accurate storage and bandwidth calculations.</p>
+
+<h4>Latency Numbers Every Programmer Should Know</h4>
+<p>Latency numbers represent the time taken for various operations in computing systems. These provide insights into relative performance:</p>
+<table>
+<thead>
+<tr><th>Operation</th><th>Latency (2020)</th></tr>
+</thead>
+<tbody>
+<tr><td>L1 Cache Access</td><td>0.5 ns</td></tr>
+<tr><td>L2 Cache Access</td><td>7 ns</td></tr>
+<tr><td>Main Memory Access</td><td>100 ns</td></tr>
+<tr><td>SSD Random Read</td><td>150 &micro;s</td></tr>
+<tr><td>HDD Random Seek</td><td>10 ms</td></tr>
+<tr><td>Round-Trip in Data Center</td><td>500 &micro;s</td></tr>
+<tr><td>Inter-Region Data Center</td><td>150 ms</td></tr>
+</tbody>
+</table>
+<p><strong>Key Insights:</strong></p>
+<ul>
+<li>Memory is fast, disk is slow.</li>
+<li>Avoid disk seeks whenever possible.</li>
+<li>Compress data before transmitting over the internet to save bandwidth.</li>
+</ul>
+
+<h4>Availability Numbers</h4>
+<p>High availability (HA) ensures minimal downtime. Availability is expressed in <strong>nines</strong>:</p>
+<ul>
+<li><strong>99% (Two Nines):</strong> ~3.65 days/year of downtime</li>
+<li><strong>99.9% (Three Nines):</strong> ~8.8 hours/year of downtime</li>
+<li><strong>99.99% (Four Nines):</strong> ~52 minutes/year of downtime</li>
+<li><strong>99.999% (Five Nines):</strong> ~5.3 minutes/year of downtime</li>
+<li><strong>99.9999% (Six Nines):</strong> ~31.56 seconds/year of downtime</li>
+</ul>
+<p>Cloud providers like Amazon, Google, and Microsoft aim for SLAs (Service Level Agreements) of <strong>99.9% or higher</strong>.</p>
+
+<h3>Section 2: Example Estimation - Twitter QPS and Storage Requirements</h3>
+
+<h4>Assumptions</h4>
+<ul>
+<li><strong>300 million monthly active users (MAU).</strong></li>
+<li><strong>50% daily active users (DAU).</strong></li>
+<li><strong>Average tweets/user/day:</strong> 2.</li>
+<li><strong>10% of tweets contain media.</strong></li>
+<li><strong>Data retention:</strong> 5 years.</li>
+</ul>
+
+<h4>Estimations</h4>
+<ol>
+<li><strong>Query Per Second (QPS):</strong>
+  <ul>
+    <li>DAU = 300M x 50% = 150M</li>
+    <li>Tweets QPS = 150M x 2 tweets / 24 hour / 3600 seconds = ~3500</li>
+    <li>Peak QPS = 2 x 3500 = ~7000</li>
+  </ul>
+</li>
+<li><strong>Media Storage:</strong>
+  <ul>
+    <li><strong>Tweet Size Components:</strong>
+      <ul>
+        <li><code>tweet_id</code>: 64 bytes</li>
+        <li><code>text</code>: 140 bytes</li>
+        <li><code>media</code>: 1 MB</li>
+      </ul>
+    </li>
+    <li><strong>Daily Media Storage:</strong> 150M x 2 x 10% x 1MB = 30TB per day</li>
+    <li><strong>5-Year Storage:</strong> 30TB x 365 x 5 = ~55PB</li>
+  </ul>
+</li>
+</ol>
+
+<h3>Section 3: Tips for Effective Estimation</h3>
+
+<h4>1. Rounding and Approximation</h4>
+<p>Precision is not critical; focus on the process. Simplify complex calculations using round numbers. For example: 99987 / 9.1 can be approximated as 100,000 / 10 = 10,000.</p>
+
+<h4>2. Write Down Assumptions</h4>
+<p>Document assumptions clearly for future reference.</p>
+
+<h4>3. Label Units</h4>
+<p>Avoid ambiguity by labeling units (e.g., <code>5 MB</code> instead of <code>5</code>).</p>
+
+<h4>4. Common Estimation Scenarios</h4>
+<ul>
+<li><strong>QPS (Queries Per Second):</strong> Measure traffic intensity.</li>
+<li><strong>Peak QPS:</strong> Account for traffic spikes.</li>
+<li><strong>Storage Requirements:</strong> Estimate total data needs.</li>
+<li><strong>Cache Requirements:</strong> Evaluate memory requirements for caching.</li>
+<li><strong>Number of Servers:</strong> Calculate hardware needs based on workload.</li>
+</ul>

@@ -1,0 +1,217 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>A million times a second, someone taps "Send" to move money from their in-app wallet to a friend's. Account A lives on one database shard, account C on another, and no single machine can see both. For a split second, one dollar has left A but not yet arrived at C &mdash; and during that split second a server might crash. Months later an auditor asks, "What was A's balance at 3:14 pm on the 9th, and can you prove it?" The digital wallet has to be fast enough for 1 million TPS, atomic across machines, and able to replay its entire history on demand.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">This chapter is an evolution story: each hub fixes the weakness of the one before it. Read the map top to bottom as a sequence of "yes, but..." moments.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Scale target &amp; sharded balances</span> <span class="why">&mdash; 1M TPS forces data across many nodes</span>
+      <ul>
+        <li>Each transfer has two legs, so the real load is 2M TPS
+          <ul><li><span class="peripheral">~1,000 TPS per cloud relational node; 10,000 TPS per node needs only 200 nodes</span></li></ul>
+        </li>
+        <li>map&lt;user_id, balance&gt; partitioned by accountID.hashCode() % partitionNumber
+          <ul><li><span class="peripheral">Zookeeper stores partition count and Redis node addresses</span></li></ul>
+        </li>
+        <li>Stateless wallet service scales horizontally
+          <ul><li><span class="peripheral">Weakness: in-memory Redis is not durable and cannot transfer atomically</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Distributed transactions</span> <span class="why">&mdash; making a two-shard transfer all-or-nothing</span>
+      <ul>
+        <li>2PC: prepare, then commit or abort
+          <ul><li><span class="peripheral">Lock contention; coordinator is a single point of failure</span></li></ul>
+        </li>
+        <li>TC/C: Try reserves, then Confirm or Cancel via compensation
+          <ul><li><span class="peripheral">Phase status table, deduct-before-add, out-of-order flag</span></li></ul>
+        </li>
+        <li>Saga: linear steps, roll back with compensating operations
+          <ul><li><span class="peripheral">Orchestration preferred over choreography</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Event sourcing</span> <span class="why">&mdash; reproducibility: replay history to prove every balance</span>
+      <ul>
+        <li>Command &rarr; state machine validates &rarr; events &rarr; state
+          <ul><li><span class="peripheral">State machine must be deterministic: no external IO, no randomness</span></li></ul>
+        </li>
+        <li>CQRS: one write state machine, many read-only state machines</li>
+      </ul>
+    </li>
+    <li><span class="hub">High-performance, reliable event sourcing</span> <span class="why">&mdash; making the event log fast and durable</span>
+      <ul>
+        <li>Local disk appends + in-memory cache via mmap
+          <ul><li><span class="peripheral">State in RocksDB (LSM tree, write-optimized); snapshots to HDFS</span></li></ul>
+        </li>
+        <li>Raft replicates the events list only
+          <ul><li><span class="peripheral">Runs while more than half of nodes are up</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Distributed event sourcing</span> <span class="why">&mdash; beyond one Raft group, and real-time responses</span>
+      <ul>
+        <li>Reverse proxy sends commands and waits on the user's behalf
+          <ul><li><span class="peripheral">Read state machines push results instead of being polled</span></li></ul>
+        </li>
+        <li>Shard into multiple Raft groups, coordinated by TC/C or Saga</li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Scale forces sharding; sharding breaks atomicity, which forces distributed transactions. Audit requirements force event sourcing, whose external storage is too slow, which forces local mmap/RocksDB, which makes nodes stateful, which forces Raft. Finally, one Raft group is not enough, so the design shards Raft groups and reuses the distributed-transaction hub on top &mdash; the story loops back on itself.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Here is the final architecture as sealed boxes, in the order a transfer touches them. Each box has one job; the coordinator and the event log carry the hard guarantees.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Reverse proxy</h4>
+      <p><strong>Input:</strong> POST /v1/wallet/balance_transfer with from_account, to_account, amount (as a string), currency, transaction_id.</p>
+      <p><strong>Output:</strong> Commands forwarded into the system; a final response to the user when results are pushed back.</p>
+      <p class="io-story">A concierge who takes your request, goes into the back office for you, and returns only when there is an answer &mdash; so you do not stand at the counter asking "is it done yet?"</p>
+      <p class="io-arrow">&rarr; feeds into: Saga / TC/C coordinator</p>
+    </div>
+    <div class="io-block">
+      <h4>Coordinator (Saga or TC/C) + phase status table</h4>
+      <p><strong>Input:</strong> A distributed transaction such as A-1 and C+1.</p>
+      <p><strong>Output:</strong> Per-partition commands and a durable record of each phase's status.</p>
+      <p class="io-story">The project manager with a checklist. It records every step before and after doing it, so if it crashes mid-flight it can read the checklist and resume.</p>
+      <p class="io-arrow">&rarr; feeds into: The Raft group owning each account</p>
+    </div>
+    <div class="io-block">
+      <h4>Raft leader's write state machine</h4>
+      <p><strong>Input:</strong> A command (e.g. A-1) from the command list, plus current balance state.</p>
+      <p><strong>Output:</strong> Validated, immutable events appended to the event list; updated state.</p>
+      <p class="io-story">The notary: it checks the request is legal (enough balance?), then writes an irreversible fact into the register.</p>
+      <p class="io-arrow">&rarr; feeds into: Raft followers, read state machines</p>
+    </div>
+    <div class="io-block">
+      <h4>Event list, replicated by Raft</h4>
+      <p><strong>Input:</strong> New events from the leader.</p>
+      <p><strong>Output:</strong> The same ordered event list on a majority of nodes; state rebuilt on each node from it.</p>
+      <p class="io-story">Carbon copies of the register kept in several vaults. As long as more than half the vaults survive, the history survives in the right order.</p>
+      <p class="io-arrow">&rarr; feeds into: State (RocksDB), snapshots, read state machines</p>
+    </div>
+    <div class="io-block">
+      <h4>Local storage: mmap + RocksDB + snapshots</h4>
+      <p><strong>Input:</strong> Commands and events (appends); state updates.</p>
+      <p><strong>Output:</strong> Fast local persistence, cached recent data, and periodic snapshots in HDFS.</p>
+      <p class="io-story">A notebook on the clerk's own desk instead of a filing room down the hall &mdash; with a bookmark (snapshot) so you never reread from page one.</p>
+      <p class="io-arrow">&rarr; feeds into: Fast replay and recovery</p>
+    </div>
+    <div class="io-block">
+      <h4>Read-only state machines (CQRS)</h4>
+      <p><strong>Input:</strong> The replicated event list.</p>
+      <p><strong>Output:</strong> Query views of balances and history; pushed completion results to the coordinator/proxy.</p>
+      <p class="io-story">Reporters who watch the register and answer questions about it, so the notary never has to stop writing to answer them.</p>
+      <p class="io-arrow">&rarr; feeds into: Coordinator, reverse proxy, user</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one transfer</h4>
+    <ol class="journey-steps">
+      <li>User A sends $1 to user C with transaction_id 01589980-2664-11ec-9621-0242ac130002 as the idempotency key. The reverse proxy forwards it as a distributed transaction with two operations: A-1 and C+1.</li>
+      <li>The Saga coordinator writes a row in the phase status table so the transaction can be traced and resumed after a crash.</li>
+      <li>It hashes each account to find its partition: A lives in Raft group 1, C in Raft group 2.</li>
+      <li>Partition 1's Raft leader receives A-1, validates it against A's balance, converts it to an event and replicates the event to its followers.</li>
+      <li>The event is applied to state and synchronized to the read state machine, which pushes a "done" response back to the coordinator.</li>
+      <li>The coordinator records operation 1 as successful. For a moment A is $1 lighter and C has not yet gained it &mdash; the safe direction, since nobody can spend money that has not arrived.</li>
+      <li>The coordinator sends C+1 to partition 2, which validates, logs, replicates and pushes back a response in the same way.</li>
+      <li>The coordinator records operation 2 as successful and informs the client: <code>"status": "success"</code>.</li>
+      <li>Months later, an auditor replays the event lists from a snapshot and recomputes A's balance at any moment &mdash; getting the identical answer every time.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">The digital wallet moves balances between accounts at 1 million TPS with transactional guarantees and full reproducibility: shard for scale, compensate for atomicity, and treat an immutable, replicated event log as the single source of truth.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a network of notary offices across a city, each responsible for a slice of residents (shards / Raft groups). Every office keeps a bound register in permanent ink &mdash; not a balance sheet, but a list of every change ever made (the event list), with carbon copies in neighbouring vaults (Raft replication). A transfer between two offices is handled by a courier with a clipboard (the Saga/TC/C coordinator and phase status table): first debit the sender's office, then credit the receiver's, and if the second fails, go back and refund the first (compensation). The office clerk must follow the rulebook exactly, with no guessing or phoning out (deterministic state machine), so anyone who rereads the register reaches the same balances. Reporters in the lobby (read-only state machines) answer customers' balance questions, and a concierge (reverse proxy) waits in line on your behalf.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">1M TPS &rarr; 2M TPS</span><span class="beacon-def">Every transfer has two legs; raising per-node TPS is how you cut node count.</span></div>
+    <div class="beacon"><span class="beacon-term">hashCode() % partitionNumber</span><span class="beacon-def">Account-to-partition mapping; config held in Zookeeper.</span></div>
+    <div class="beacon"><span class="beacon-term">2PC</span><span class="beacon-def">Prepare then commit/abort in one transaction; slow from locks and the coordinator is a single point of failure.</span></div>
+    <div class="beacon"><span class="beacon-term">TC/C</span><span class="beacon-def">Try, then Confirm or Cancel as independent local transactions; compensation, parallelizable.</span></div>
+    <div class="beacon"><span class="beacon-term">Deduct before add</span><span class="beacon-def">Try phase only debits (A-1, C NOP) so the in-flight inconsistency can never be spent.</span></div>
+    <div class="beacon"><span class="beacon-term">Out-of-order flag</span><span class="beacon-def">Cancel may arrive before Try; flag it so a late Try fails.</span></div>
+    <div class="beacon"><span class="beacon-term">Saga (orchestrated)</span><span class="beacon-def">Linear steps, compensating rollback; choose TC/C instead when latency matters.</span></div>
+    <div class="beacon"><span class="beacon-term">Command vs event</span><span class="beacon-def">Commands are intentions that can fail or be random; events are immutable facts.</span></div>
+    <div class="beacon"><span class="beacon-term">Deterministic state machine</span><span class="beacon-def">No external IO, no randomness; guarantees replay always reproduces the same state.</span></div>
+    <div class="beacon"><span class="beacon-term">CQRS</span><span class="beacon-def">One write path, many read-only state machines built from the same event list.</span></div>
+    <div class="beacon"><span class="beacon-term">mmap + RocksDB</span><span class="beacon-def">Local append-only disk with memory caching; LSM tree for write-heavy state.</span></div>
+    <div class="beacon"><span class="beacon-term">Raft on events only</span><span class="beacon-def">State and snapshots can be rebuilt from events; commands cannot, so only events need replication.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The payoff sections are the ones interviewers love to push on: how a cross-shard transfer stays correct (TC/C and Saga), why event sourcing proves correctness, and how that event log is made both fast and durable.</p>
+
+  <div class="drill">
+    <h4>TC/C: the two-phase dance by compensation</h4>
+    <p>2PC keeps one transaction open across databases, holding locks until every participant says yes &mdash; slow, and fragile if the coordinator dies. TC/C instead runs <strong>two independent local transactions</strong>. In the Try phase, the coordinator reserves resources; in phase two it either Confirms or Cancels. Because each phase commits on its own, undoing work means running a new, opposite transaction (compensation).</p>
+    <table class="compare"><thead><tr><th>Phase</th><th>Account A</th><th>Account C</th></tr></thead><tbody>
+      <tr><td>1. Try</td><td>Balance -$1</td><td>NOP (do nothing)</td></tr>
+      <tr><td>2a. Confirm (all said yes)</td><td>NOP</td><td>Balance +$1</td></tr>
+      <tr><td>2b. Cancel (any Try failed)</td><td>Balance +$1 (refund)</td><td>NOP</td></tr>
+    </tbody></table>
+    <p>Between phases the books are briefly unbalanced: $1 has left A but not reached C. That is acceptable only because the Try phase always does the deduction first. Crediting C first (choice 2) would let C spend money that might be cancelled, and doing both at once (choice 3) is impossible to make atomic across databases without 2PC.</p>
+    <figure class="guide-fig"><img src="27.%20%20Digital%20Wallet/images/unbalanced-state.png" alt="Account states briefly unbalanced during a TC/C transaction"><figcaption>Notice the gap: the total across A and C is temporarily $1 short. The design tolerates this window because money can only be missing, never duplicated.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>Coordinator crash:</strong> a phase status table, updated atomically in the shard databases, records transaction ID and content, Try status (not sent / sent / response received), second-phase name (confirm or cancel), its status, and an out-of-order flag.</li>
+      <li><strong>Out-of-order delivery:</strong> a database might receive Cancel before Try. It sets the out-of-order flag; when Try finally arrives it checks the flag and returns failure.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> Calling TC/C "just 2PC". In 2PC the first phase leaves transactions unfinished; in TC/C they are already committed or cancelled, and failure means reversing a committed transaction in business logic.</div>
+  </div>
+
+  <div class="drill">
+    <h4>TC/C vs Saga: choosing the coordinator style</h4>
+    <p>A Saga orders every operation in a line; each runs in its own database. If one fails, the process rolls back to the start with compensating operations. It can be coordinated by <strong>choreography</strong> (services react to each other's events) or <strong>orchestration</strong> (one coordinator directs everyone). Orchestration is preferred for wallets because choreography scatters business logic across services that talk asynchronously.</p>
+    <table class="compare"><thead><tr><th></th><th>TC/C</th><th>Saga</th></tr></thead><tbody>
+      <tr><td>Compensating action</td><td>In Cancel phase</td><td>In rollback phase</td></tr>
+      <tr><td>Central coordination</td><td>Yes</td><td>Yes (orchestration mode)</td></tr>
+      <tr><td>Execution order</td><td>Any</td><td>Linear</td></tr>
+      <tr><td>Parallel execution</td><td>Yes</td><td>No</td></tr>
+      <tr><td>Partial inconsistent state visible</td><td>Yes</td><td>Yes</td></tr>
+      <tr><td>Logic lives in</td><td>Application</td><td>Application</td></tr>
+    </tbody></table>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>TC/C can run steps in parallel, so it wins when low latency is required. Saga's linear flow is simpler to reason about.</p></div><div class="con"><strong>Costs</strong><p>Both expose a briefly inconsistent state and push the complexity of distributed transactions into application code.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Event sourcing: history as the source of truth</h4>
+    <p>Reconciliation can flag a discrepancy, but it cannot explain it. Auditors ask sharper questions: what was the balance at any given time, are historical and current balances correct, and does new code still produce the right answers? Event sourcing answers all three by storing every change instead of just the latest balance.</p>
+    <p>Four pieces work together. A <strong>command</strong> is an intention ("transfer $1 from A to C"), placed in a FIFO queue such as Kafka so there is a global order; it can fail and may involve randomness. The <strong>state machine</strong> validates the command against current <strong>state</strong> and, if valid, emits <strong>events</strong> &mdash; immutable facts, one per affected account &mdash; which are then applied to update balances.</p>
+    <div class="anim" data-anim="event-sourcing"></div>
+    <figure class="guide-fig"><img src="27.%20%20Digital%20Wallet/images/wallet-service-state-macghine.png" alt="Wallet state machine reading commands, validating against balances, emitting and applying events"><figcaption>Follow the loop: read a command, read balances, validate, emit two events, then apply the next event to update balances. The state machine is the only thing allowed to change state.</figcaption></figure>
+    <p>Because the event list is immutable and the state machine is deterministic, replaying events always reproduces the same intermediate states. That gives balance-at-any-time (replay up to that point), correctness checks (recompute from scratch), and code verification (run old and new versions over the same events and compare). Client queries are served through CQRS: multiple read-only state machines build their own views from the event list.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Letting the state machine call an external service or use randomness. The moment it does, replay stops being guaranteed to match, and the whole audit argument collapses.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Making the event log fast and durable</h4>
+    <p>External Kafka and databases add network hops the 1M TPS target cannot afford. The deep dive moves commands and events to local disk (append-only writes are fast even on HDDs), caches recent ones in memory, and uses mmap to get both at once. State moves into RocksDB, whose LSM tree is optimized for writes, with caching for reads. Periodic snapshots written to HDFS mean replay starts from a recent checkpoint instead of from the beginning.</p>
+    <p>That speed makes each node stateful, so it must be replicated. The key insight is <em>what</em> to replicate: state and snapshots can be regenerated from events, and events cannot be regenerated from commands because commands are non-deterministic. So only the event list needs high reliability, with no data loss and identical ordering across replicas &mdash; exactly what Raft provides. One leader is active, followers are passive, a follower takes over if the leader dies, and the group keeps running while more than half its nodes are up.</p>
+    <figure class="guide-fig"><img src="27.%20%20Digital%20Wallet/images/sharded-raft-groups.png" alt="Multiple Raft groups coordinated by a distributed transaction orchestrator"><figcaption>The final shape: each partition is its own Raft group; the coordinator on top runs TC/C or Saga across groups, and read state machines push results back to the reverse proxy.</figcaption></figure>
+    <p>Two limits remain. One Raft group has finite capacity, so data is sharded across groups and cross-group transfers use TC/C or Saga again. And CQRS clients would have to poll for results, which is slow and can overload query services &mdash; so a reverse proxy sends commands and waits on the user's behalf, and read-only state machines push responses to it, making updates feel real-time.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Replicating commands or state instead of events. Commands cannot deterministically reproduce events, and state is derivable &mdash; the event list is the one thing you cannot lose.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Jot your answer in the margin with your stylus, then tap to check.</p>
+  <details class="qa"><summary>Why does the in-memory Redis sharding solution fall short even though it scales?</summary><div class="qa-answer"><p>It spreads balances across nodes for throughput, but it cannot execute a transfer atomically across two nodes, and in-memory Redis is not durable storage. That pushes the design toward databases with distributed transactions.</p></div></details>
+  <details class="qa"><summary>In TC/C, why must the Try phase debit A rather than credit C?</summary><div class="qa-answer"><p>During the in-flight window the accounts are unbalanced. If C were credited first, C could spend money that might later be cancelled. Deducting first means the inconsistency is only "missing" money that nobody can use, and a Cancel simply refunds A.</p></div></details>
+  <details class="qa"><summary>What happens if a shard receives Cancel before Try?</summary><div class="qa-answer"><p>It records the out-of-order flag in the phase status table. When the delayed Try arrives, the shard checks the flag and returns a failure rather than executing it.</p></div></details>
+  <details class="qa"><summary>Compare TC/C and Saga. When would you pick each?</summary><div class="qa-answer"><p>Both use compensation, central coordination (Saga in orchestration mode) and application-level logic, and both can expose partial inconsistency. TC/C can execute in any order and in parallel, so choose it for low latency; Saga executes linearly, which is simpler but slower.</p></div></details>
+  <details class="qa"><summary>Why must the event-sourcing state machine be deterministic?</summary><div class="qa-answer"><p>Replaying the immutable event list must always produce the same states, otherwise historical balances and code-change verification cannot be trusted. External IO or randomness would break that guarantee.</p></div></details>
+  <details class="qa"><summary>Why does Raft replicate only the event list, not commands or state?</summary><div class="qa-answer"><p>State and snapshots can always be rebuilt by replaying events. Commands are non-deterministic, so replaying them would not reliably regenerate the same events. The event list is therefore the only data that needs high reliability.</p></div></details>
+  <details class="qa"><summary>What problem does the reverse proxy with push-based read state machines solve?</summary><div class="qa-answer"><p>In CQRS, clients would otherwise poll to learn when their transfer completed, which is not real-time and can overload query services. The proxy sends commands and waits on the user's behalf, and read state machines push results to it, so users see updates promptly.</p></div></details>
+</div>

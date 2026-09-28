@@ -1,0 +1,233 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is the last evening of the monthly tournament. Five million daily players are grinding out matches, and every win nudges someone up the ladder. Mary, currently sitting in position 361, finishes a game, taps "Leaderboard", and expects to see herself climb right now, not after a nightly batch job. Behind that single tap sits a hard question: how do you keep tens of millions of scores permanently sorted, let thousands of them change every second, and still answer "what is my exact rank?" in milliseconds?</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet, this system is a pipe that carries trusted wins into one always-sorted data structure, plus a few side tables that give names to the numbers. Read the map top-down: each hub is a decision the others lean on.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Trusted score ingestion</span> <span class="why">&mdash; if scores can be forged, every rank downstream is meaningless</span>
+      <ul>
+        <li>Game service validates the win, then calls the leaderboard service
+          <ul><li><span class="peripheral">POST /v1/scores takes user_id and points; only game servers may call it</span></li></ul>
+        </li>
+        <li>Rejected alternative: client writes its own score
+          <ul><li><span class="peripheral">Open to man-in-the-middle; a player with a proxy edits their score</span></li></ul>
+        </li>
+        <li>Optional message queue between game and leaderboard services
+          <ul><li><span class="peripheral">Only worth it if other services consume game results; not required here</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Redis sorted set</span> <span class="why">&mdash; the always-sorted core that makes rank queries cheap</span>
+      <ul>
+        <li>Hash map (user_id &rarr; score) + skip list (scores in order)
+          <ul><li><span class="peripheral">Skip list = sorted linked list with multi-level express indexes</span></li></ul>
+        </li>
+        <li>Four commands: ZADD, ZINCRBY, ZREVRANGE, ZREVRANK
+          <ul><li><span class="peripheral">O(log N) updates and rank; O(log N + M) range fetch</span></li></ul>
+        </li>
+        <li>One key per monthly tournament, e.g. leaderboard_feb_2021
+          <ul><li><span class="peripheral">Old months move to historical storage</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Supporting relational storage</span> <span class="why">&mdash; turns user IDs into names and provides the rebuild source</span>
+      <ul>
+        <li>MySQL user profile table (username, display name)
+          <ul><li><span class="peripheral">Cache the top 10 players' details; they are read constantly</span></li></ul>
+        </li>
+        <li>MySQL game-result table (who won, when)
+          <ul><li><span class="peripheral">Used to reconstruct the leaderboard after an infrastructure failure</span></li></ul>
+        </li>
+        <li>Redis replica + Redis persistence for crash safety</li>
+      </ul>
+    </li>
+    <li><span class="hub">Scaling strategy</span> <span class="why">&mdash; what happens when one Redis node is no longer enough</span>
+      <ul>
+        <li>Range (fixed) partitioning by score &mdash; author's preference
+          <ul><li><span class="peripheral">user_id &rarr; shard mapping kept in application code (MySQL or a cache)</span></li></ul>
+        </li>
+        <li>Hash partitioning via Redis Cluster
+          <ul><li><span class="peripheral">Top 10 needs scatter-gather; rank has no easy answer</span></li></ul>
+        </li>
+        <li>NoSQL alternative (DynamoDB) with write sharding
+          <ul><li><span class="peripheral">Exact rank is hard; fall back to percentiles computed by a cron job</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Hosting model</span> <span class="why">&mdash; who runs the boxes</span>
+      <ul>
+        <li>Self-managed: Redis + MySQL (+ optional profile cache)</li>
+        <li>Serverless: AWS API Gateway routing to AWS Lambda
+          <ul><li><span class="peripheral">Recommended by the author for a game built from the ground up</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The sorted set is the gravitational center: the API shape, the storage estimate, the scaling debate and even the NoSQL comparison all orbit around "how do we keep scores sorted and rankable?" Trusted ingestion sits upstream because a fast leaderboard of fake scores is worthless. Relational storage and hosting are supporting cast: they name the players and keep the lights on, but they never answer a rank query themselves.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each component as a sealed box: something goes in, something comes out. Two flows share the same core &mdash; the write path (a win becomes a score) and the read path (a tap becomes a ranked list).</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Game client</h4>
+      <p><strong>Input:</strong> A finished match on the player's device.</p>
+      <p><strong>Output:</strong> A "match finished" signal to the game service (or nothing at all, if the server runs the game logic itself).</p>
+      <p class="io-story">The client is the witness, not the judge. It reports that something happened but never gets to write the verdict.</p>
+      <p class="io-arrow">&rarr; feeds into: Game service</p>
+    </div>
+    <div class="io-block">
+      <h4>Game service</h4>
+      <p><strong>Input:</strong> Match result from the client or from its own game logic.</p>
+      <p><strong>Output:</strong> A validated POST /v1/scores call with user_id and points.</p>
+      <p class="io-story">This is the referee who checks the scoreboard before announcing a winner. Because only game servers may hit the score API, a player with a proxy cannot inflate their own number.</p>
+      <p class="io-arrow">&rarr; feeds into: Leaderboard service</p>
+    </div>
+    <div class="io-block">
+      <h4>Leaderboard service</h4>
+      <p><strong>Input:</strong> Score updates from game servers; read requests (GET /v1/scores, GET /v1/scores/{user_id}) from players.</p>
+      <p><strong>Output:</strong> ZINCRBY writes to Redis; JSON responses with user_id, user_name, rank and score.</p>
+      <p class="io-story">A thin translator: it turns HTTP calls into sorted-set commands and stitches the returned IDs together with human-readable names.</p>
+      <p class="io-arrow">&rarr; feeds into: Redis sorted set (scores) and MySQL / cache (names)</p>
+    </div>
+    <div class="io-block">
+      <h4>Redis sorted set (leaderboard_&lt;month&gt;)</h4>
+      <p><strong>Input:</strong> ZINCRBY for wins; ZREVRANGE and ZREVRANK for reads.</p>
+      <p><strong>Output:</strong> Updated score, ordered slices of (user, score), or a user's position.</p>
+      <p class="io-story">A self-sorting shelf. Every time a book (player) gets thicker (more points), it slides into its correct slot automatically in O(log N) steps, so reading the top shelf is always instant.</p>
+      <p class="io-arrow">&rarr; feeds into: Leaderboard service response</p>
+    </div>
+    <div class="io-block">
+      <h4>MySQL tables + top-10 cache</h4>
+      <p><strong>Input:</strong> User IDs to resolve; win records to persist.</p>
+      <p><strong>Output:</strong> Usernames and display names; a durable history of wins.</p>
+      <p class="io-story">The filing cabinet next to the scoreboard: it knows who "mary1934" really is, and it keeps receipts so the board can be rebuilt if Redis burns down.</p>
+      <p class="io-arrow">&rarr; feeds into: Leaderboard response; recovery script after outages</p>
+    </div>
+    <div class="io-block">
+      <h4>Recovery path (MySQL WAL / game-result table)</h4>
+      <p><strong>Input:</strong> A large-scale Redis outage.</p>
+      <p><strong>Output:</strong> A rebuilt sorted set, replayed by an ad-hoc script.</p>
+      <p class="io-story">If the scoreboard is wiped, you replay every stored win in order and the board redraws itself.</p>
+      <p class="io-arrow">&rarr; feeds into: Redis sorted set</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one score update</h4>
+    <ol class="journey-steps">
+      <li>Mary (user_id mary1934) wins a match in February 2021. Her client tells the game service the match ended.</li>
+      <li>The game service checks the win is legitimate, then calls POST /v1/scores with user_id=mary1934 and points=1.</li>
+      <li>The leaderboard service runs <code>ZINCRBY leaderboard_feb_2021 1 'mary1934'</code>. If she had no entry, her score starts from zero and becomes 1; otherwise it grows by one. Cost: O(log N).</li>
+      <li>The win is also recorded in MySQL, giving a durable trail the leaderboard can be reconstructed from later.</li>
+      <li>Mary taps "Leaderboard". The service runs <code>ZREVRANGE leaderboard_feb_2021 0 9 WITHSCORES</code> and gets back the top 10 (user, score) pairs in descending order.</li>
+      <li>The service resolves those 10 IDs to names &mdash; ideally from a cache, since the top 10 are the hottest profiles in the game.</li>
+      <li>For Mary's own row, <code>ZREVRANK</code> returns her position, say 361.</li>
+      <li>For the bonus "four above, four below" view, the service runs <code>ZREVRANGE leaderboard_feb_2021 357 365</code> and returns her neighbourhood.</li>
+      <li>At month's end a new key (leaderboard_mar_2021) starts fresh, and February's board moves to historical storage.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A real-time leaderboard is fundamentally a "keep it sorted on every write" problem: pay a small O(log N) cost per update so that top-K and rank queries never have to scan or re-sort millions of rows.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a giant stadium scoreboard with an army of ushers. The referees on the field (game service) are the only people allowed to radio in a point; a fan shouting from the stands (the client) is ignored. The scoreboard itself (the Redis sorted set) is a magical ladder where every player's plaque slides to its correct rung the instant a point arrives, guided by express elevators that skip whole floors (the skip-list indexes). A clerk's office under the stands (MySQL) holds everyone's real name and the paper receipts for every point, so if lightning fries the board, the clerks can replay the receipts and rebuild it. When the stadium outgrows one board, you split it into sections by score range (range partitioning), so the VIP section with the top scores can still be read in one glance.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Sorted set</span><span class="beacon-def">Redis structure = hash map + skip list; signals "rank and top-K are cheap, reads never re-sort".</span></div>
+    <div class="beacon"><span class="beacon-term">Skip list</span><span class="beacon-def">Sorted linked list with layered indexes; 64 nodes take 11 hops instead of 62 &mdash; logarithmic search.</span></div>
+    <div class="beacon"><span class="beacon-term">ZINCRBY</span><span class="beacon-def">Increment a user's score (starts at 0 if new), O(log N); the whole write path in one command.</span></div>
+    <div class="beacon"><span class="beacon-term">ZREVRANGE 0 9</span><span class="beacon-def">Top 10 in descending order, O(log N + M); the leaderboard page.</span></div>
+    <div class="beacon"><span class="beacon-term">ZREVRANK</span><span class="beacon-def">A user's position, O(log N); the query SQL struggles with.</span></div>
+    <div class="beacon"><span class="beacon-term">500 QPS / 2,500 peak</span><span class="beacon-def">Score-update load at 5M DAU &times; 10 games; comfortably within one Redis server.</span></div>
+    <div class="beacon"><span class="beacon-term">~650 MB</span><span class="beacon-def">26 bytes &times; 25M MAU; even doubled for skip-list overhead, it fits in memory easily.</span></div>
+    <div class="beacon"><span class="beacon-term">Server-authoritative scoring</span><span class="beacon-def">Only game servers call POST /v1/scores; defeats proxy-based score tampering.</span></div>
+    <div class="beacon"><span class="beacon-term">Range partitioning</span><span class="beacon-def">Shard by score band; top 10 lives in one shard, rank = local rank + counts of higher shards.</span></div>
+    <div class="beacon"><span class="beacon-term">Scatter-gather</span><span class="beacon-def">Query every shard, merge in the app; the price of hash partitioning and write sharding.</span></div>
+    <div class="beacon"><span class="beacon-term">Write sharding</span><span class="beacon-def">Append user_id % num_partitions to the partition key to cool a hot DynamoDB month partition.</span></div>
+    <div class="beacon"><span class="beacon-term">Percentile rank</span><span class="beacon-def">When exact rank is too costly (sharded NoSQL), tell users "top 10%" from a periodic cron job.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Three ideas carry most of the interview weight: why the sorted set beats SQL, how to shard it when it outgrows one box, and what the NoSQL alternative gives up. Master those and the rest is detail.</p>
+
+  <div class="drill">
+    <h4>Why a sorted set beats a relational table</h4>
+    <p>In MySQL, a leaderboard is a table of (user_id, score). A win is an easy <code>UPDATE ... SET score = score + 1</code>, and the top 10 can be made tolerable with an index on score plus <code>LIMIT 10</code>. The trouble starts when Mary, deep in the middle of the pack, asks "what is my rank?" The relational answer is a nested query that counts every row with a score greater than or equal to hers &mdash; effectively a scan that grows with the player base.</p>
+    <p>The Redis sorted set sidesteps this by paying the sorting cost up front. It keeps two structures in lockstep: a hash map for "what is mary1934's score?" and a skip list that keeps everyone in score order. A skip list is a sorted linked list with extra "express lane" levels on top; searching starts on the fastest lane and drops down level by level, like taking an express train to the right neighbourhood and then walking the last block.</p>
+    <div class="anim" data-anim="sorted-set"></div>
+    <figure class="guide-fig"><img src="25.%20Real-time%20Gaming%20Leaderboard/images/sorted-set.png" alt="Redis sorted set internals: hash map beside a skip list"><figcaption>Notice the two halves: the hash table answers "score of this user" directly, while the skip list keeps the ordering. Every update touches both, which is why writes are O(log N) rather than O(1).</figcaption></figure>
+    <figure class="guide-fig"><img src="25.%20Real-time%20Gaming%20Leaderboard/images/skip-list-performance.png" alt="Skip list search path compared with a plain linked list over 64 nodes"><figcaption>Trace the highlighted path: in a 64-node list, finding the target costs 62 hops on the base list but only 11 with the index levels. That gap widens as the list grows.</figcaption></figure>
+    <table class="compare"><thead><tr><th>Operation</th><th>Relational DB</th><th>Redis sorted set</th></tr></thead><tbody>
+      <tr><td>Add a point</td><td>UPDATE score = score + 1</td><td>ZINCRBY, O(log N)</td></tr>
+      <tr><td>Top 10</td><td>Index on score + ORDER BY ... LIMIT 10</td><td>ZREVRANGE 0 9, O(log N + M)</td></tr>
+      <tr><td>A given user's rank</td><td>Nested COUNT(*) over higher scores &mdash; does not scale</td><td>ZREVRANK, O(log N)</td></tr>
+      <tr><td>Durability</td><td>Built in</td><td>Needs replica + persistence, MySQL as rebuild source</td></tr>
+    </tbody></table>
+    <div class="pitfall"><strong>Common trap:</strong> Treating Redis as the only copy of truth. The notes pair it with a MySQL table of wins precisely so the board can be rebuilt (via the MySQL WAL and an ad-hoc script) after a large outage.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Sizing: why one Redis node is enough &mdash; until it is not</h4>
+    <p>Start with the arithmetic. 5 million daily users spread over 24 hours is about 50 users per second on average; uneven traffic pushes peak online users to about 250 per second. Each player averages 10 matches a day, so score updates run at about 500 QPS, peaking at 2,500. Top-10 reads, assuming one look per user per day, are only about 50 QPS.</p>
+    <p>Storage is equally modest. Worst case, all 25 million monthly users play: a 24-character ID plus a 16-bit score is 26 bytes, so about 650 MB. Double it for skip-list overhead and it still fits comfortably. 2,500 writes per second is well within a single Redis server's capability.</p>
+    <p>The picture changes if the game explodes. At 500 million DAU the notes estimate 65 GB of storage and 250,000 QPS &mdash; now sharding is mandatory, and the interesting design debate begins.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Jumping to sharding before doing the math. The strongest answer states that the baseline fits on one node, then explains exactly which growth figures force a change.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Sharding the leaderboard: range vs hash partitioning</h4>
+    <p>With <strong>range (fixed) partitioning</strong>, each shard owns a band of scores &mdash; for example [900&ndash;1000] on one node, lower bands on others. The application keeps a user_id &rarr; shard mapping (in MySQL or a cache). The top 10 is simply the top of the highest band. A user's rank is their rank within their own shard plus the number of users in every higher shard, and that count is an O(1) lookup via the info keyspace command.</p>
+    <figure class="guide-fig"><img src="25.%20Real-time%20Gaming%20Leaderboard/images/range-partition.png" alt="Redis shards partitioned by score range"><figcaption>Each shard is a score band. Notice that the top 10 always lives in one place, and that a user moving up enough points has to migrate to a new shard &mdash; which is why the app must track the user-to-shard mapping.</figcaption></figure>
+    <p>With <strong>hash partitioning</strong> via Redis Cluster, users are spread across nodes by a hash of their key (similar to, but not exactly, consistent hashing). Writes spread nicely, but every leaderboard read becomes a scatter-gather: ask every shard for its top 10, then merge in the application.</p>
+    <table class="compare"><thead><tr><th>Concern</th><th>Range partitioning</th><th>Hash partitioning (Redis Cluster)</th></tr></thead><tbody>
+      <tr><td>Top 10</td><td>Read one shard (the highest band)</td><td>Scatter-gather across all shards, merge in app</td></tr>
+      <tr><td>User rank</td><td>Local rank + O(1) counts of higher shards</td><td>No straightforward approach</td></tr>
+      <tr><td>Large top-K</td><td>Mostly local</td><td>Latency rises: lots of data from every shard</td></tr>
+      <tr><td>More partitions</td><td>Manageable</td><td>Latency grows with partition count</td></tr>
+      <tr><td>Extra bookkeeping</td><td>user_id &rarr; shard mapping in app</td><td>Handled by the cluster</td></tr>
+    </tbody></table>
+    <p>The author therefore leans toward fixed range partitions. Two operational tips round it out: give write-heavy Redis nodes twice the memory they need so snapshots have room, and use Redis-benchmark to make data-driven sizing decisions.</p>
+  </div>
+
+  <div class="drill">
+    <h4>The NoSQL alternative and the percentile escape hatch</h4>
+    <p>A NoSQL store optimized for heavy writes and for sorting within a partition &mdash; DynamoDB, Cassandra or MongoDB &mdash; is a valid alternative. The notes walk through DynamoDB. A first chess-leaderboard table works but cannot query by score, so score becomes the sort key. That creates a new problem: partitioning by month makes the current month a hotspot, hammered while older months sit idle.</p>
+    <p>The fix is <strong>write sharding</strong>: append a partition number, computed as user_id % num_partitions, to the key. Writes now spread out, but reads must scatter-gather across every sub-partition. That is the core tradeoff.</p>
+    <figure class="guide-fig"><img src="25.%20Real-time%20Gaming%20Leaderboard/images/chess-game-leaderboard-table-3.png" alt="DynamoDB table with write-sharded partition keys"><figcaption>Look at the partition key: month plus a shard suffix. That suffix is what breaks up the hot "current month" partition.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>More partitions means higher write scalability, and a fully managed database with global secondary indexes for fields outside the primary key.</p></div><div class="con"><strong>Costs</strong><p>More partitions means reads must hit more of them to aggregate results, and exact rank becomes hard to compute. The right partition count needs benchmarking.</p></div></div>
+    <p>When exact rank is impractical at that scale, reframe the product: tell users their percentile. A cron job periodically analyses the score distribution (e.g. 10th percentile = score &lt; 100, 90th percentile = score &lt; 6500) and each user is placed in a bucket.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Forgetting that write sharding and hash partitioning share the same weakness &mdash; scatter-gather reads that slow down as you add partitions.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Security, hosting and the finishing touches</h4>
+    <p>The design rejects letting clients post their own scores because a player can put a proxy in the middle and rewrite the number. Only game servers call POST /v1/scores, and for server-run games the server records wins automatically. A message queue between game and leaderboard services is a reasonable extension only if other consumers need game results.</p>
+    <p>For hosting, you can run Redis and MySQL yourself, or put AWS API Gateway in front of AWS Lambda functions that run only when called and scale automatically. The author recommends the serverless route for a game built from scratch.</p>
+    <ol class="steps">
+      <li><strong>Faster retrieval:</strong> cache user objects in a Redis hash (user_id &rarr; user object).</li>
+      <li><strong>Breaking ties:</strong> equal scores share a rank by default; to break ties, order by the last played game.</li>
+      <li><strong>Failure recovery:</strong> replay MySQL WAL entries with an ad-hoc script to rebuild the board.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin with your stylus first, then tap to reveal.</p>
+  <details class="qa"><summary>Why must the score update go through the game service instead of the client?</summary><div class="qa-answer"><p>A client-side update is vulnerable to man-in-the-middle tampering: a player can proxy the request and set any score they like. Making POST /v1/scores callable only by game servers, which validate the win first, keeps the leaderboard trustworthy.</p></div></details>
+  <details class="qa"><summary>What two internal structures make up a Redis sorted set, and what does each contribute?</summary><div class="qa-answer"><p>A hash map from user_id to score gives direct score lookups, and a skip list keeps members ordered by score. Together they allow O(log N) updates and rank lookups and O(log N + M) range fetches.</p></div></details>
+  <details class="qa"><summary>What happens to rank queries if you stay on MySQL as the player base grows?</summary><div class="qa-answer"><p>Top 10 stays manageable with an index and LIMIT, but finding a mid-table user's rank requires a nested COUNT over all higher scores, which effectively scans the table. It does not scale to millions of players, which is why the design moves to Redis.</p></div></details>
+  <details class="qa"><summary>Compare range partitioning and hash partitioning for computing the top 10 and a user's rank.</summary><div class="qa-answer"><p>Range partitioning puts the top 10 in the highest-score shard, and a rank is the local rank plus O(1) counts from higher shards. Hash partitioning requires scatter-gather across every shard for the top 10 and has no straightforward way to compute rank, and its latency grows with more partitions.</p></div></details>
+  <details class="qa"><summary>Why does partitioning a DynamoDB leaderboard by month cause trouble, and how is it fixed?</summary><div class="qa-answer"><p>The current month receives almost all traffic, creating a hot partition. Write sharding appends user_id % num_partitions to the key to spread writes, at the cost of scatter-gather reads across those partitions.</p></div></details>
+  <details class="qa"><summary>If Redis suffers a large-scale outage, how do you get the leaderboard back?</summary><div class="qa-answer"><p>Redis replicas and persistence reduce the risk, but the durable source is MySQL, which records each win. An ad-hoc script can replay the MySQL WAL entries to recreate the sorted set.</p></div></details>
+  <details class="qa"><summary>Why is a single Redis node enough at 5M DAU?</summary><div class="qa-answer"><p>Peak writes are about 2,500 QPS and storage is about 650 MB (26 bytes &times; 25M users), still small even doubled for skip-list overhead. Both are well within one Redis server; sharding only becomes necessary at figures like 65 GB and 250k QPS.</p></div></details>
+</div>

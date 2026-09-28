@@ -1,0 +1,205 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>Ten minutes into a design interview, the interviewer leans back and asks: "So how much storage will this need in five years?" There is no calculator, no spreadsheet, just a marker and a whiteboard. A candidate who freezes, or who spends five minutes dividing 99,987 by 9.1 to four decimal places, loses the room. A candidate who says "about 150 million daily users, two posts each, 10% with a 1 MB photo, so roughly 30 TB a day and about 55 PB over five years" wins it. Back-of-the-envelope estimation is that second candidate's skill: fast, rough, clearly reasoned numbers that tell you whether a design can survive reality.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The chapter has three reference tables you memorize and one method you practice. Read the map as "facts on the left, technique on the right": the facts feed the technique.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Powers of two (data volume)</span> <span class="why">— every storage and bandwidth number is expressed in these units</span>
+      <ul>
+        <li>2^10 is about a thousand (KB), 2^20 a million (MB), 2^30 a billion (GB), 2^40 a trillion (TB), 2^50 a quadrillion (PB)
+          <ul><li><span class="peripheral">Exact byte counts (1,024 vs 1,000) rarely matter at this precision</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Latency numbers</span> <span class="why">— they tell you which operations are cheap and which will dominate response time</span>
+      <ul>
+        <li>Memory is fast (100 ns), disk is slow (HDD seek 10 ms)
+          <ul><li><span class="peripheral">L1 0.5 ns, L2 7 ns, SSD random read 150 µs</span></li></ul>
+        </li>
+        <li>Network: round trip in a data center 500 µs, inter-region 150 ms
+          <ul><li><span class="peripheral">Compress data before sending it over the internet</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Availability in nines</span> <span class="why">— the language of SLAs and downtime budgets</span>
+      <ul>
+        <li>99% about 3.65 days/year; 99.9% about 8.8 hours; 99.99% about 52 minutes
+          <ul><li><span class="peripheral">99.999% about 5.3 minutes; 99.9999% about 31.56 seconds</span></li></ul>
+        </li>
+        <li><span class="peripheral">Amazon, Google, Microsoft target SLAs of 99.9% or higher</span></li>
+      </ul>
+    </li>
+    <li><span class="hub">The estimation method</span> <span class="why">— assumptions in, QPS and storage out; this is what the interviewer actually scores</span>
+      <ul>
+        <li>Worked example: Twitter QPS and media storage</li>
+        <li>Tips: round aggressively, write assumptions down, label units
+          <ul><li><span class="peripheral">Common targets: QPS, peak QPS, storage, cache, number of servers</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The first three hubs are reference facts; the fourth is the skill that uses them. Powers of two let you convert "150 million times 1 MB" into terabytes without panicking, latency numbers tell you whether a design's hot path can hit memory or must hit disk, and nines translate a vague "highly available" into minutes of downtime. The method stitches them together, and it is the process, not the precision, that is being evaluated.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">An estimate is a small pipeline: each stage takes the previous stage's number, multiplies or divides by one assumption, and passes a new number on. Keep every box simple and every unit labeled.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Assumptions</h4>
+      <p><strong>Input:</strong> The problem statement plus answers to your clarifying questions.</p>
+      <p><strong>Output:</strong> A short written list: 300M MAU, 50% daily active, 2 tweets/user/day, 10% with media, 5-year retention.</p>
+      <p class="io-story">The ingredients list on a recipe card; if it is not written down, nobody can check your cooking.</p>
+      <p class="io-arrow">&rarr; feeds into: DAU calculation</p>
+    </div>
+    <div class="io-block">
+      <h4>Daily active users</h4>
+      <p><strong>Input:</strong> MAU and the daily-active percentage.</p>
+      <p><strong>Output:</strong> DAU = 300M x 50% = 150M.</p>
+      <p class="io-story">Of everyone with a gym membership, how many actually walk through the door today.</p>
+      <p class="io-arrow">&rarr; feeds into: QPS and storage</p>
+    </div>
+    <div class="io-block">
+      <h4>Average QPS</h4>
+      <p><strong>Input:</strong> DAU x actions per user per day, divided by 24 hours x 3,600 seconds.</p>
+      <p><strong>Output:</strong> 150M x 2 / 86,400 is about 3,500 tweets per second.</p>
+      <p class="io-story">Spreading a day's worth of traffic evenly across every second, like pouring a bucket through a funnel at a constant rate.</p>
+      <p class="io-arrow">&rarr; feeds into: peak QPS</p>
+    </div>
+    <div class="io-block">
+      <h4>Peak QPS</h4>
+      <p><strong>Input:</strong> Average QPS and a peak multiplier (2x in the notes).</p>
+      <p><strong>Output:</strong> 2 x 3,500 is about 7,000 QPS.</p>
+      <p class="io-story">Traffic is never flat; the funnel must be wide enough for the evening rush, not just the average.</p>
+      <p class="io-arrow">&rarr; feeds into: number of servers, cache sizing</p>
+    </div>
+    <div class="io-block">
+      <h4>Daily storage</h4>
+      <p><strong>Input:</strong> DAU x tweets/day x media fraction x media size.</p>
+      <p><strong>Output:</strong> 150M x 2 x 10% x 1 MB = 30 TB per day.</p>
+      <p class="io-story">How many boxes the moving truck must carry every single day.</p>
+      <p class="io-arrow">&rarr; feeds into: long-term storage</p>
+    </div>
+    <div class="io-block">
+      <h4>Retention storage</h4>
+      <p><strong>Input:</strong> Daily storage x 365 x retention years.</p>
+      <p><strong>Output:</strong> 30 TB x 365 x 5 is about 55 PB.</p>
+      <p class="io-story">The size of the warehouse you need once five years of daily deliveries have piled up.</p>
+      <p class="io-arrow">&rarr; feeds into: design decisions (sharding, object storage, cost)</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one estimate</h4>
+    <ol class="journey-steps">
+      <li>Write the assumptions on the board: 300 million MAU, 50% use it daily, 2 tweets per user per day, 10% of tweets contain media, keep data for 5 years.</li>
+      <li>DAU: 300M x 0.5 = 150M. Say it out loud and write the unit: "150 million users per day".</li>
+      <li>Tweets per day: 150M x 2 = 300M tweets/day.</li>
+      <li>Average QPS: 300M / 86,400 seconds. Round 86,400 to about 100,000 for a sanity check (3,000), then state the notes' figure of about 3,500 tweets/s.</li>
+      <li>Peak QPS: double it, about 7,000 tweets/s. This is the number the write path must survive.</li>
+      <li>Note the per-tweet sizes: tweet_id 64 bytes, text 140 bytes, media 1 MB. The media dwarfs the rest, so it drives storage.</li>
+      <li>Media per day: 300M tweets x 10% = 30M media tweets x 1 MB = 30M MB = 30 TB/day.</li>
+      <li>Five years: 30 TB x 365 is about 11 PB per year; x 5 is about 55 PB. Circle it and tell the interviewer what it implies for the storage design.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Estimation is a thought experiment that checks whether a design can meet its requirements, using a handful of memorized benchmarks. In Jeff Dean's framing, the goal is judgment, not arithmetic precision.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of an architect sketching a bridge on a napkin before any engineer runs a simulation. The <strong>assumptions</strong> are the expected cars per hour and their weight; the <strong>powers of two</strong> are the ruler markings that let the architect write tons instead of counting kilograms. The <strong>latency table</strong> is the knowledge that steel is strong and wood is weak, telling the architect which material belongs on the load-bearing span, just as memory belongs on a hot path and disk seeks do not. The <strong>nines</strong> are the promise of how many days a year the bridge may close for repairs. The napkin number will not be exact, but it instantly tells you whether you need a footbridge or a suspension bridge.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">2^10 / 2^20 / 2^30 / 2^40 / 2^50</span><span class="beacon-def">KB, MB, GB, TB, PB: roughly thousand, million, billion, trillion, quadrillion bytes.</span></div>
+    <div class="beacon"><span class="beacon-term">Main memory 100 ns</span><span class="beacon-def">Memory access is the cheap path; anything hot should live here (caches).</span></div>
+    <div class="beacon"><span class="beacon-term">HDD seek 10 ms</span><span class="beacon-def">About 100,000 times slower than memory: avoid disk seeks whenever possible.</span></div>
+    <div class="beacon"><span class="beacon-term">SSD random read 150 µs</span><span class="beacon-def">Much faster than HDD, still far slower than memory.</span></div>
+    <div class="beacon"><span class="beacon-term">DC round trip 500 µs vs inter-region 150 ms</span><span class="beacon-def">Crossing regions costs about 300 times a local round trip; keep chatty calls local and compress what travels.</span></div>
+    <div class="beacon"><span class="beacon-term">99.9% (three nines)</span><span class="beacon-def">About 8.8 hours of downtime a year; the typical cloud SLA floor.</span></div>
+    <div class="beacon"><span class="beacon-term">99.99% (four nines)</span><span class="beacon-def">About 52 minutes a year; each extra nine cuts downtime roughly tenfold.</span></div>
+    <div class="beacon"><span class="beacon-term">QPS = DAU x actions / 86,400</span><span class="beacon-def">Turns daily behavior into per-second load; the first number most designs need.</span></div>
+    <div class="beacon"><span class="beacon-term">Peak QPS = 2 x QPS</span><span class="beacon-def">Size for spikes, not averages.</span></div>
+    <div class="beacon"><span class="beacon-term">Storage = DAU x items x fraction x size</span><span class="beacon-def">Multiply by 365 x years for retention; the biggest object (media) usually dominates.</span></div>
+    <div class="beacon"><span class="beacon-term">Round, write, label</span><span class="beacon-def">Approximate freely, document assumptions, always attach units.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The worked Twitter estimate, the latency ladder and the nines are what interviewers probe most. Drill them until you can reproduce each from memory in under a minute.</p>
+
+  <div class="drill">
+    <h4>Powers of two: the units that make big numbers tame</h4>
+    <p>Storage math is multiplication of big numbers, and big numbers are only manageable if you can map them onto units instantly. Each step of 2^10 is roughly a factor of a thousand, and each has a name: kilobyte, megabyte, gigabyte, terabyte, petabyte.</p>
+    <p>That lets you think "30 million megabytes" and immediately say "30 terabytes", because a million MB is a TB. The 1,024-versus-1,000 difference is noise at this level of precision.</p>
+    <figure class="guide-fig"><img src="02.%20Back%20Of%20the%20Envelope%20Estimation/images/power-of-two.png" alt="Table of powers of two with approximate values and unit names"><figcaption>Read each row as a rung on a ladder: every rung is about a thousand times the one below, and the unit name tells you which rung you are on.</figcaption></figure>
+  </div>
+
+  <div class="drill">
+    <h4>The latency ladder: where time actually goes</h4>
+    <p>The absolute numbers matter less than the ratios. Memory is measured in nanoseconds, SSDs in microseconds, spinning disks in milliseconds, and cross-region networks in hundreds of milliseconds. Each jump is orders of magnitude, not percentages.</p>
+    <table class="compare">
+      <thead><tr><th>Operation</th><th>Latency (2020)</th><th>What it tells you</th></tr></thead>
+      <tbody>
+        <tr><td>L1 cache</td><td>0.5 ns</td><td>Effectively free</td></tr>
+        <tr><td>L2 cache</td><td>7 ns</td><td>Still trivially fast</td></tr>
+        <tr><td>Main memory</td><td>100 ns</td><td>The target for hot data</td></tr>
+        <tr><td>SSD random read</td><td>150 µs</td><td>About 1,500x memory</td></tr>
+        <tr><td>Round trip in data center</td><td>500 µs</td><td>Every internal service call costs this</td></tr>
+        <tr><td>HDD random seek</td><td>10 ms</td><td>About 100,000x memory; avoid</td></tr>
+        <tr><td>Inter-region round trip</td><td>150 ms</td><td>Users feel this; route them nearby</td></tr>
+      </tbody>
+    </table>
+    <p>Three design rules fall out: memory is fast and disk is slow, so cache; avoid disk seeks; and compress data before sending it over the internet, since bandwidth and distance are expensive.</p>
+    <div class="pitfall"><strong>Common trap:</strong> mixing up µs and ms. A 150 µs SSD read and a 150 ms inter-region hop differ by a factor of a thousand; label units every time.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Availability in nines: turning promises into minutes</h4>
+    <p>"Highly available" means nothing until you put a number on it. Each added nine divides allowed downtime by about ten: two nines allow about 3.65 days a year, three nines about 8.8 hours, four about 52 minutes, five about 5.3 minutes, six about 31.56 seconds.</p>
+    <p>An SLA (Service Level Agreement) is the formal promise. Major cloud providers such as Amazon, Google and Microsoft set theirs at 99.9% or higher, so a design built on them inherits roughly that ceiling unless it adds its own redundancy.</p>
+    <table class="compare">
+      <thead><tr><th>Availability</th><th>Downtime per year</th></tr></thead>
+      <tbody>
+        <tr><td>99%</td><td>~3.65 days</td></tr>
+        <tr><td>99.9%</td><td>~8.8 hours</td></tr>
+        <tr><td>99.99%</td><td>~52 minutes</td></tr>
+        <tr><td>99.999%</td><td>~5.3 minutes</td></tr>
+        <tr><td>99.9999%</td><td>~31.56 seconds</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>The Twitter estimate: the template for every estimate</h4>
+    <p>Almost every estimation question follows the same skeleton: users to active users, active users to actions per second, actions to bytes, bytes to total storage over time. Memorize this one example and you can re-skin it for any product.</p>
+    <ol class="steps">
+      <li>DAU = 300M MAU x 50% = 150M.</li>
+      <li>Tweet QPS = 150M x 2 / 24 h / 3,600 s, about 3,500.</li>
+      <li>Peak QPS = 2 x 3,500, about 7,000.</li>
+      <li>Media per day = 150M x 2 x 10% x 1 MB = 30 TB.</li>
+      <li>Five-year media = 30 TB x 365 x 5, about 55 PB.</li>
+    </ol>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Rounding (e.g. 99,987 / 9.1 becomes 100,000 / 10 = 10,000) keeps you fast and keeps the interviewer following your reasoning.</p></div>
+      <div class="con"><strong>Costs</strong><p>The answer is only as good as the written assumptions; an unstated assumption makes a correct calculation look wrong.</p></div>
+    </div>
+    <div class="pitfall"><strong>Common trap:</strong> chasing precision. The interviewer is scoring the process: clear assumptions, labeled units, sensible rounding, and a conclusion about what the number means for the design.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Work each one in the margin with your stylus before you peek.</p>
+  <details class="qa"><summary>With 300M MAU, 50% DAU and 2 tweets per user per day, what are average and peak tweet QPS?</summary><div class="qa-answer"><p>DAU is 150M, so 300M tweets per day. Dividing by 86,400 seconds gives about 3,500 QPS on average, and doubling for peak gives about 7,000 QPS.</p></div></details>
+  <details class="qa"><summary>How did the notes reach about 55 PB of media storage over five years?</summary><div class="qa-answer"><p>150M DAU x 2 tweets x 10% with media x 1 MB = 30 TB per day. Then 30 TB x 365 days x 5 years is about 55 PB.</p></div></details>
+  <details class="qa"><summary>Why does the latency table push designs toward caching?</summary><div class="qa-answer"><p>Main memory access is about 100 ns while an HDD seek is about 10 ms, roughly 100,000 times slower. Keeping hot data in memory and avoiding disk seeks is therefore the biggest single lever on response time.</p></div></details>
+  <details class="qa"><summary>Compare 99.9% and 99.99% availability in yearly downtime.</summary><div class="qa-answer"><p>99.9% allows about 8.8 hours of downtime per year; 99.99% allows about 52 minutes. One extra nine cuts permitted downtime by roughly a factor of ten.</p></div></details>
+  <details class="qa"><summary>What happens if you forget to write down your assumptions?</summary><div class="qa-answer"><p>Neither you nor the interviewer can trace where a number came from, so errors are hard to catch and a correct calculation can look arbitrary. Written assumptions also let you revisit the estimate later when requirements change.</p></div></details>
+  <details class="qa"><summary>Why compress data before sending it over the internet?</summary><div class="qa-answer"><p>Network transfer, especially across regions at about 150 ms per round trip, is slow and bandwidth is limited. Compressing reduces the bytes on the wire, saving bandwidth and transfer time.</p></div></details>
+  <details class="qa"><summary>Name the five common estimation scenarios the notes list.</summary><div class="qa-answer"><p>QPS (traffic intensity), peak QPS (spikes), storage requirements, cache requirements (memory needed for caching), and number of servers (hardware based on workload).</p></div></details>
+</div>

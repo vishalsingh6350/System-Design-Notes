@@ -1,0 +1,199 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You type two letters, <em>t</em> and <em>w</em>, and before your finger has even left the glass a neat list slides down: twitter, twitch, twilight, twin peak, twitch prime. It feels like the search box read your mind. Behind that list is a promise to answer in under 100 ms, for 10 million people a day, at peaks of 48,000 requests every second, where every single keystroke is a fresh request. The hard part is not finding matching words; it is finding the <em>five most popular</em> ones, instantly, while the world keeps searching and the popularity scores keep shifting underneath you.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">At 10,000 feet the system is two rivers that never cross in real time: a slow river that learns what people search (data gathering) and a fast river that answers keystrokes (query service). A trie sits in the middle as the shared artifact they both depend on.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">The Trie (prefix tree)</span> <span class="why">— the single data structure the whole design is built to create, store, shard and read</span>
+      <ul>
+        <li>Nodes = prefixes, each storing query popularity
+          <ul><li><span class="peripheral">Compact storage: shared prefixes stored once</span></li></ul>
+        </li>
+        <li>Top-k cached at every node
+          <ul><li><span class="peripheral">Cap prefix length (e.g. 50 chars)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Query Service</span> <span class="why">— the hot path; every keystroke lands here and must return 5 results in &lt;100 ms</span>
+      <ul>
+        <li>Prefix lookup &rarr; read cached top-k &rarr; respond</li>
+        <li>Client-side speedups
+          <ul><li><span class="peripheral">AJAX (lightweight async requests)</span></li><li><span class="peripheral">Browser caching of results</span></li></ul>
+        </li>
+        <li>Filter layer
+          <ul><li><span class="peripheral">Strips hate speech etc.; physical delete happens later, asynchronously</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Data Gathering Pipeline</span> <span class="why">— the offline factory that turns raw searches into a fresh trie</span>
+      <ul>
+        <li>Analytics logs (append-only, unindexed)</li>
+        <li>Aggregators &rarr; frequency table
+          <ul><li><span class="peripheral">Weekly for most apps; shorter windows for Twitter-like real-time needs</span></li></ul>
+        </li>
+        <li>Workers rebuild the trie asynchronously</li>
+      </ul>
+    </li>
+    <li><span class="hub">Trie Storage &amp; Scaling</span> <span class="why">— where the built trie lives and how it is split when one machine is not enough</span>
+      <ul>
+        <li>Trie Cache (distributed, in memory) in front of Trie DB</li>
+        <li>Trie DB options
+          <ul><li><span class="peripheral">Document store (MongoDB snapshot of serialized trie)</span></li><li><span class="peripheral">Key-value store: prefix &rarr; node data</span></li></ul>
+        </li>
+        <li>Sharding by prefix range + shard map manager
+          <ul><li><span class="peripheral">Unicode and country-specific tries; trending-query weighting</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The trie is the hub because every other box either produces it (gathering pipeline), stores it (cache, DB, shards) or reads it (query service). The key architectural insight is the split: writes are batched and slow, reads are cached and instant. If you remember only one thing, remember that the trie is <em>rebuilt</em> offline, not <em>edited</em> live.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each component as a sealed box: what goes in, what comes out. Read the first four boxes as the weekly factory line, and the last three as the per-keystroke fast lane.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Analytics Logs</h4>
+      <p><strong>Input:</strong> Every raw query users submit, with a timestamp.</p>
+      <p><strong>Output:</strong> An append-only, unindexed stream of query records.</p>
+      <p class="io-story">A giant receipt roll: it only ever gets longer, nobody sorts it, and it is cheap to write because nothing is looked up.</p>
+      <p class="io-arrow">&rarr; feeds into: Aggregators</p>
+    </div>
+    <div class="io-block">
+      <h4>Aggregators</h4>
+      <p><strong>Input:</strong> A window of raw log records (usually a week; shorter for real-time products like Twitter).</p>
+      <p><strong>Output:</strong> A frequency table: query &rarr; how many times it was searched.</p>
+      <p class="io-story">The tally clerk who reads the receipt roll and writes "best: 35, bet: 29, bee: 20" on a clean ledger.</p>
+      <p class="io-arrow">&rarr; feeds into: Workers</p>
+    </div>
+    <div class="io-block">
+      <h4>Workers</h4>
+      <p><strong>Input:</strong> The aggregated frequency table.</p>
+      <p><strong>Output:</strong> A freshly built trie, with top-k lists cached at every node, written to Trie DB.</p>
+      <p class="io-story">Asynchronous builders who construct next week's trie in the back room while the old one keeps serving customers.</p>
+      <p class="io-arrow">&rarr; feeds into: Trie DB and Trie Cache</p>
+    </div>
+    <div class="io-block">
+      <h4>Trie DB + Trie Cache</h4>
+      <p><strong>Input:</strong> The built trie (as a MongoDB snapshot, or as prefix &rarr; node key-value pairs).</p>
+      <p><strong>Output:</strong> Fast in-memory reads from the distributed cache, backed by durable storage.</p>
+      <p class="io-story">The DB is the warehouse; the cache is the shop shelf holding everything customers reach for.</p>
+      <p class="io-arrow">&rarr; feeds into: Query Service</p>
+    </div>
+    <div class="io-block">
+      <h4>Shard Map Manager</h4>
+      <p><strong>Input:</strong> A prefix, e.g. "tw".</p>
+      <p><strong>Output:</strong> The identity of the server that owns that prefix range.</p>
+      <p class="io-story">A receptionist with a floor plan: "Words starting with t? Third floor, room n-z."</p>
+      <p class="io-arrow">&rarr; feeds into: the correct Query Service shard</p>
+    </div>
+    <div class="io-block">
+      <h4>Query Service</h4>
+      <p><strong>Input:</strong> The prefix the user has typed so far.</p>
+      <p><strong>Output:</strong> Up to 5 suggestions sorted by popularity, after the filter layer removes unwanted ones.</p>
+      <p class="io-story">Walks to the prefix node and simply reads the pre-written top-5 list pinned to it; no searching, no sorting.</p>
+      <p class="io-arrow">&rarr; feeds into: the browser dropdown (and browser cache)</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one keystroke</h4>
+    <ol class="journey-steps">
+      <li>You have already typed "b" and now add "e". The browser fires a lightweight AJAX request for prefix "be" without reloading anything.</li>
+      <li>The browser first checks its own cache. If you searched "be" earlier today, the answer is already on your device and no network trip happens at all.</li>
+      <li>Cache miss: the request reaches the backend, where the shard map manager sees the prefix begins with "b" and routes it to the server owning the <code>a-m</code> range.</li>
+      <li>That server looks up prefix "be" in the Trie Cache (in memory). In a key-value layout this is a single hash lookup: key "be" &rarr; node data.</li>
+      <li>The node for "be" already carries its cached top-k list: best: 35, bet: 29, bee: 20, be: 15, beer: 10. No subtree walk, no sort.</li>
+      <li>The filter layer scans the five results against its rules and drops anything harmful before it leaves the building.</li>
+      <li>The list returns to your browser, is rendered in the dropdown, and is saved in the browser cache for next time. Total budget: under 100 ms.</li>
+      <li>Meanwhile your finished search is appended to the analytics log. It will not change any suggestion until the next aggregation and trie rebuild.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Autocomplete trades freshness for speed: it precomputes the answer for every possible prefix once a week so that each keystroke becomes a lookup rather than a search.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a library of signposts arranged as a branching road. Each fork in the road is a letter, so walking t &rarr; w puts you at the "tw" fork: that is a trie node. Nailed to every fork is a small board listing the five most-visited destinations beyond it: that board is the cached top-k list. Once a week a survey crew counts foot traffic from the visitor logbook (analytics logs and aggregators) and repaints every board overnight (workers rebuilding the trie). Travellers never wait for a survey; they just read the board where they stand (query service reading the cache).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Trie (prefix tree)</span><span class="beacon-def">Tree where each node is a prefix; tells you lookups cost O(prefix length), not O(number of queries).</span></div>
+    <div class="beacon"><span class="beacon-term">Top-k = 5</span><span class="beacon-def">Only five suggestions are ever returned, so caching them per node is small and cheap.</span></div>
+    <div class="beacon"><span class="beacon-term">&lt;100 ms</span><span class="beacon-def">The latency budget that forces precomputation and in-memory caching.</span></div>
+    <div class="beacon"><span class="beacon-term">48,000 peak QPS</span><span class="beacon-def">Every keystroke is a request; reads dwarf writes, so optimise the read path.</span></div>
+    <div class="beacon"><span class="beacon-term">Cache top-k at each node</span><span class="beacon-def">Trades memory for time: no subtree traversal or sorting at query time.</span></div>
+    <div class="beacon"><span class="beacon-term">Prefix cap (~50 chars)</span><span class="beacon-def">Users rarely type long queries; bounding depth bounds the cost of finding a node.</span></div>
+    <div class="beacon"><span class="beacon-term">Append-only analytics log</span><span class="beacon-def">Cheap, unindexed writes; the raw material for batch aggregation.</span></div>
+    <div class="beacon"><span class="beacon-term">Weekly rebuild</span><span class="beacon-def">The trie is replaced, not patched; suggestions are slightly stale by design.</span></div>
+    <div class="beacon"><span class="beacon-term">Prefix &rarr; node KV store</span><span class="beacon-def">Flattens the tree into a hash table, so any prefix is one key lookup away.</span></div>
+    <div class="beacon"><span class="beacon-term">Shard by prefix range</span><span class="beacon-def">a-m / n-z, then finer (aa-ag, ah-an) to even out skewed letters; a shard map manager routes.</span></div>
+    <div class="beacon"><span class="beacon-term">Filter layer</span><span class="beacon-def">Removes harmful suggestions instantly at read time; physical deletion happens asynchronously.</span></div>
+    <div class="beacon"><span class="beacon-term">0.4 GB/day</span><span class="beacon-def">New query data per day: modest growth, well suited to periodic batch processing.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Three ideas carry most of the marks: how the trie answers in constant-ish time, why data gathering is batched instead of live, and how storage and sharding keep it all in memory. Drill these; skim the rest.</p>
+
+  <div class="drill">
+    <h4>The trie and the cached top-k trick</h4>
+    <p>A plain trie answers "what are the top 5 for prefix <em>be</em>?" in three steps: find the prefix node, traverse its entire subtree collecting every complete query, then sort those by frequency and keep the top k. The first step is fast. The second and third are the problem: a popular prefix like "b" may have millions of descendants, and you would be walking and sorting them on every keystroke.</p>
+    <p>The fix is to do that work once, at build time, and pin the answer to the node. Every node stores its own top-k list. Now a query is: find the node, read its list, done. Combined with a cap on prefix length (around 50 characters), finding the node is bounded too, so the whole query is effectively constant time.</p>
+    <div class="anim" data-anim="trie-topk"></div>
+    <figure class="guide-fig"><img src="13.%20Search%20Autocomplete/images/cached-trie.png" alt="Trie with top-k lists cached at each node"><figcaption>Notice the dashed boxes: each node carries its own ranked list. Node "b" already knows [best: 35, bet: 29, bee: 20, be: 15, buy: 14], so typing "b" never touches the leaves below.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Query time no longer depends on how many queries share the prefix. No sorting on the hot path. Easily meets the 100 ms budget.</p></div><div class="con"><strong>Costs</strong><p>Extra memory at every node (the same popular query is copied into many ancestors' lists). Updating one frequency means touching every ancestor, which is why updates are batched.</p></div></div>
+    <div class="pitfall"><strong>Common trap:</strong> saying "we sort the children at query time". That is the naive version. The interview answer is "we precompute and cache top-k at each node, so the query is a lookup".</div>
+  </div>
+
+  <div class="drill">
+    <h4>Why data gathering is batched, not real time</h4>
+    <p>The first high-level sketch updates frequencies the moment someone searches. It looks tidy but collapses at scale: users can enter billions of queries a day, and each update would ripple through every ancestor's cached top-k list. Worse, the payoff is tiny, because top suggestions barely move once the trie is built.</p>
+    <p>So the design turns a firehose into a weekly delivery. Raw queries go to append-only analytics logs. Aggregators condense a window of logs into a frequency table. Workers rebuild a brand new trie asynchronously and write it to storage. The old trie keeps serving until the new one is ready.</p>
+    <figure class="guide-fig"><img src="13.%20Search%20Autocomplete/images/data-gathering-flow.png" alt="Analytics logs to aggregators to workers to Trie DB and Trie Cache"><figcaption>Read it left to right as a factory line: logs &rarr; aggregators &rarr; aggregated data &rarr; workers &rarr; Trie DB, with a weekly snapshot pushed into the Trie Cache.</figcaption></figure>
+    <table class="compare"><thead><tr><th>Aspect</th><th>Real-time updates</th><th>Batched pipeline</th></tr></thead><tbody>
+      <tr><td>Write cost</td><td>Update trie on every query</td><td>Append to log; rebuild weekly</td></tr>
+      <tr><td>Freshness</td><td>Instant</td><td>Up to a week stale (shorter window for Twitter-like apps)</td></tr>
+      <tr><td>Read path impact</td><td>Constant locking/rewriting of hot nodes</td><td>Read-only trie, easy to cache</td></tr>
+      <tr><td>Fit</td><td>Impractical at billions/day</td><td>Chosen design</td></tr>
+    </tbody></table>
+    <div class="pitfall"><strong>Common trap:</strong> forgetting that the aggregation window is a dial. For trending, real-time products you shorten it or weight recent queries more heavily; for most products, once a week is enough.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Storing, deleting and sharding the trie</h4>
+    <p>Where does the finished trie live? Reads go to the <strong>Trie Cache</strong>, a distributed in-memory cache. Behind it sits the <strong>Trie DB</strong>, with two options. A document store such as MongoDB can hold a serialized snapshot of the whole weekly trie. A key-value store flattens the tree: every prefix becomes a key and that node's data (including its top-k list) becomes the value, so any prefix is a single hash lookup.</p>
+    <p>Deletion is handled in two speeds. A filter layer sits in front of the cache and removes unwanted results (such as hate speech) on the way out, immediately and by flexible rules. The physical removal from the database happens later, asynchronously.</p>
+    <p>When the trie outgrows one machine, shard by prefix range: <code>a-m</code> on one server, <code>n-z</code> on another. Letters are not evenly popular, so split further inside busy ranges (<code>aa-ag</code>, <code>ah-an</code>). A shard map manager holds the routing table and tells the web tier which server owns which range.</p>
+    <figure class="guide-fig"><img src="13.%20Search%20Autocomplete/images/sharding.png" alt="Web servers consult a shard map manager to route to trie shards"><figcaption>The web servers do not guess: they ask the shard map manager where a prefix lives, then query that shard. This is what lets you rebalance skewed letter ranges without changing clients.</figcaption></figure>
+    <ol class="steps">
+      <li>Coarse split by first letter range (a-m, n-z).</li>
+      <li>Measure load; split hot ranges more finely (aa-ag, ah-an).</li>
+      <li>Record the mapping in the shard map manager.</li>
+      <li>Route every request through the map to the owning shard.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> sharding naively by 26 letters. Far more words start with "s" or "c" than with "x", so fixed letter shards end up badly unbalanced.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Squeezing the last milliseconds and going global</h4>
+    <p>Two client-side tricks shave latency before the server is even involved. AJAX requests send just the prefix and receive just the list, with no page refresh. Browser caching keeps recent results locally, so retyping a common prefix costs zero network time.</p>
+    <p>Scaling beyond English means storing Unicode characters in the trie and building separate tries per country or region, since what is popular in one market is noise in another. Trending events are handled by dynamically updating trie nodes or weighting recent queries more heavily.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin with your stylus first, then tap to reveal.</p>
+  <details class="qa"><summary>Why is the top-k list cached at every trie node instead of computed on demand?</summary><div class="qa-answer"><p>Computing on demand means traversing the whole subtree below the prefix and sorting all matches, which is huge for short prefixes like "b". Caching turns the query into "find node, read list", keeping it within the 100 ms budget at 48,000 peak QPS. The cost is extra memory and harder updates.</p></div></details>
+  <details class="qa"><summary>What would happen if the trie were updated on every search query?</summary><div class="qa-answer"><p>With billions of queries a day, each update would ripple through the cached top-k lists of every ancestor node, creating constant write contention on the hottest nodes. The benefit would be negligible because top suggestions rarely change. That is why queries go to logs and the trie is rebuilt in batches.</p></div></details>
+  <details class="qa"><summary>Compare storing the trie in a document store versus a key-value store.</summary><div class="qa-answer"><p>A document store like MongoDB holds a serialized snapshot of the weekly trie, which is simple to write and restore. A key-value store maps every prefix to its node data, so any prefix is a single hash lookup, which suits fast serving and fine-grained access.</p></div></details>
+  <details class="qa"><summary>A harmful suggestion is discovered on Tuesday; the next rebuild is Sunday. What happens?</summary><div class="qa-answer"><p>The filter layer in front of the trie cache blocks it immediately at read time using its filter rules. The physical removal from the database happens asynchronously, and the next rebuild will not include it.</p></div></details>
+  <details class="qa"><summary>Why shard by prefix range with a shard map manager rather than one shard per letter?</summary><div class="qa-answer"><p>Letter popularity is very uneven, so fixed letter shards would be imbalanced. Prefix ranges can be split further where traffic is heavy (aa-ag, ah-an), and the shard map manager records the mapping so requests are routed correctly as ranges change.</p></div></details>
+  <details class="qa"><summary>How would you adapt this design for a Twitter-like product where trends matter within hours?</summary><div class="qa-answer"><p>Shorten the aggregation window so the trie is rebuilt more often, and weight recent queries more heavily or update trending nodes dynamically. The weekly cadence is a default for products where popularity is stable.</p></div></details>
+</div>

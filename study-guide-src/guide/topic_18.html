@@ -1,0 +1,208 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You are in a rental car at an unfamiliar airport, phone on the dashboard, and you type "Disneyland." Within a second the screen fills with streets, a blue line snakes across the city, and a voice says "42 minutes." Behind that second, the app has turned your words into coordinates, stitched together a route across a road graph built from terabytes of raw data, asked a traffic model how long it will take, and streamed you only the few map squares you can actually see. Now multiply by a billion daily users, all of them also sending their GPS positions back in, and one accident on a freeway that should reroute thousands of drivers at once. That is the problem: a planet-sized map, served as if it were a local file.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The design stands on three services &mdash; location, navigation, map rendering &mdash; all resting on one idea: chop the world into tiles. Read the tree top-down; the tiling hub comes first because both rendering and routing borrow it.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Tiling the world (geohash, zoom levels)</span> <span class="why">— the core trick that turns a petabyte-scale planet into small, cacheable, addressable squares</span>
+      <ul>
+        <li>Map projection: 3D sphere to 2D plane (Google uses Web Mercator)
+          <ul><li><span class="peripheral">Every projection distorts geometry somewhat</span></li></ul>
+        </li>
+        <li>Geohash: recursive quadrant subdivision encoded as a string
+          <ul><li><span class="peripheral">Latitude/longitude as the underlying positioning system</span></li></ul>
+        </li>
+        <li>Zoom levels: level 0 = one 256x256 tile; each level quadruples tile count</li>
+      </ul>
+    </li>
+    <li><span class="hub">Map rendering service</span> <span class="why">— what the user sees; must be smooth and cheap on data and battery</span>
+      <ul>
+        <li>Precomputed static tiles served from a CDN (closest POP)
+          <ul><li><span class="peripheral">World map estimated at ~70PB, after compressing near-identical tiles (e.g. desert)</span></li></ul>
+        </li>
+        <li>Tile URL from geohash: client-computed or via a small URL API</li>
+        <li>Vector tiles (paths &amp; polygons) rendered on the client
+          <ul><li><span class="peripheral">Substantial bandwidth savings vs raster images</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Navigation service</span> <span class="why">— turns "A to B" into an accurate route + ETA; the most algorithmically rich part</span>
+      <ul>
+        <li>Geocoding service (address &rarr; lat/long), backed by Redis</li>
+        <li>Route planner &rarr; shortest-path (A* variant on routing tiles) + ETA (ML on traffic) + ranker (filters)
+          <ul><li><span class="peripheral">Updater services asynchronously refresh traffic and other DBs</span></li></ul>
+        </li>
+        <li>Routing tiles: graph of intersections (nodes) and roads (edges), hierarchical levels of detail
+          <ul><li><span class="peripheral">Built by an offline pipeline, stored as binary adjacency lists in S3</span></li></ul>
+        </li>
+        <li>Adaptive ETA and rerouting over WebSocket</li>
+      </ul>
+    </li>
+    <li><span class="hub">Location service</span> <span class="why">— the feedback loop: user GPS streams feed traffic, ETAs, and road-data improvements</span>
+      <ul>
+        <li>Client batches GPS points; <code>POST /v1/locations</code></li>
+        <li>Cassandra: partition key <code>user_id</code>, clustering key <code>timestamp</code></li>
+        <li>Kafka streams updates to traffic, ML, routing-tile and analytics consumers
+          <ul><li><span class="peripheral">~200k QPS, ~1M QPS at peak (1B DAU x 35 min/week)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Tiling is the root hub: rendering uses image tiles by zoom level, and navigation uses routing tiles with levels of detail &mdash; the same "divide into squares, load only what you need" strategy applied twice. The location service is the loop that keeps navigation honest: without live GPS data there is no traffic, and without traffic the ETA is a guess.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Three parallel flows share the same client: tiles flow down, locations flow up, and route requests go round-trip. Here they are as sealed boxes in causal order.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Client tile resolver</h4>
+      <p><strong>Input:</strong> Current viewport position and zoom level.</p>
+      <p><strong>Output:</strong> A list of tile URLs (derived from geohash + zoom).</p>
+      <p class="io-story">Like knowing a book's shelf number: once you know the geohash and zoom, you know exactly which file to fetch, no server thinking required.</p>
+      <p class="io-arrow">&rarr; feeds into: CDN</p>
+    </div>
+    <div class="io-block">
+      <h4>CDN with precomputed tiles</h4>
+      <p><strong>Input:</strong> Tile URL request.</p>
+      <p><strong>Output:</strong> A static 256x256 tile (image or vector) from the nearest point of presence.</p>
+      <p class="io-story">A chain of neighborhood newsstands that each carry the same printed pages, so nobody has to travel to the printing press.</p>
+      <p class="io-arrow">&rarr; feeds into: Client mosaic rendering</p>
+    </div>
+    <div class="io-block">
+      <h4>Location service</h4>
+      <p><strong>Input:</strong> Batched array of (lat, long, timestamp) tuples.</p>
+      <p><strong>Output:</strong> Rows in Cassandra and events on Kafka.</p>
+      <p class="io-story">A mail slot that accepts a bundle of postcards at once instead of one knock per postcard.</p>
+      <p class="io-arrow">&rarr; feeds into: Traffic update service, ML, routing-tile processing, analytics</p>
+    </div>
+    <div class="io-block">
+      <h4>Geocoding service</h4>
+      <p><strong>Input:</strong> Address text, e.g. "1600 Amphitheatre Parkway, Mountain View, CA".</p>
+      <p><strong>Output:</strong> Coordinates (37.4224764, -122.0842499) and a place ID.</p>
+      <p class="io-story">The translator between how humans name places and how machines locate them.</p>
+      <p class="io-arrow">&rarr; feeds into: Route planner</p>
+    </div>
+    <div class="io-block">
+      <h4>Shortest-path service</h4>
+      <p><strong>Input:</strong> Origin and destination lat/long.</p>
+      <p><strong>Output:</strong> Candidate paths computed with an A* variant over routing tiles.</p>
+      <p class="io-story">A hiker who only unfolds the map sections she needs, switching to a coarser regional map for long distances.</p>
+      <p class="io-arrow">&rarr; feeds into: ETA service, Ranker</p>
+    </div>
+    <div class="io-block">
+      <h4>ETA service + Ranker</h4>
+      <p><strong>Input:</strong> Candidate paths, live traffic data, user filters (avoid tolls, freeways).</p>
+      <p><strong>Output:</strong> ML-predicted travel time per path and a ranked best route.</p>
+      <p class="io-story">A seasoned taxi driver who knows rush-hour patterns, combined with your preference to skip toll booths.</p>
+      <p class="io-arrow">&rarr; feeds into: Navigation response to client</p>
+    </div>
+    <div class="io-block">
+      <h4>Adaptive rerouting</h4>
+      <p><strong>Input:</strong> A traffic incident on some routing tile + stored in-flight routes.</p>
+      <p><strong>Output:</strong> Affected users identified and pushed new routes/ETAs over WebSocket.</p>
+      <p class="io-story">A dispatcher who knows every driver's planned roads and radios the ones heading toward the crash.</p>
+      <p class="io-arrow">&rarr; feeds into: Client (live updates)</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one route request</h4>
+    <ol class="journey-steps">
+      <li>You type "Disneyland" while at 1355 Market Street, SF; the client sends <code>GET /v1/nav?origin=1355+market+street,SF&amp;destination=Disneyland</code>.</li>
+      <li>The navigation service calls the geocoding service, which looks up both addresses in the Redis-backed geocoding DB and returns lat/long pairs.</li>
+      <li>The route planner hands the pairs to the shortest-path service, which derives geohashes and thus the origin and destination routing tiles.</li>
+      <li>Because this trip is hundreds of miles, the algorithm quickly climbs from detailed local tiles to coarser, wide-area tiles, loading them from S3 (heavily cached) and traversing with A*.</li>
+      <li>The ETA service scores each candidate path with an ML model fed by the traffic DB, which the update-traffic service keeps fresh from location data.</li>
+      <li>The ranker applies your filters (say, "avoid tolls") and picks the top route; the response includes distance, duration, polyline, and turn-by-turn HTML instructions.</li>
+      <li>Meanwhile, your phone fetches only the visible map tiles from the nearest CDN POP, and every few seconds uploads a batch of GPS points to the location service.</li>
+      <li>Twenty minutes in, an accident blocks a tile on your path. The rerouting check sees your stored tile chain covers it and pushes a faster route over your WebSocket.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Serve a planet-scale map and accurate, traffic-aware directions to a billion users while spending as little of each phone's data and battery as possible &mdash; by precomputing and tiling everything that does not change, and streaming only what does.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of the world as a giant atlas cut into numbered pages at many magnifications. The printed pages are the precomputed map tiles, and the newsstands on every corner that stock them are the CDN's points of presence. A second, hidden atlas shows only roads as dots and lines: those are the routing tiles, with a detailed city edition and a coarse highway edition, stored in the library basement (S3). A librarian who converts street addresses to page coordinates is the geocoding service, and the navigator who plans a trip by flipping between editions is the shortest-path service. Finally, millions of travelers mailing back postcards of where they are is the location service, and the analyst reading those postcards to mark jams in red is the traffic update pipeline feeding the ETA service.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Map tile (256x256)</span><span class="beacon-def">The unit of rendering; the whole world at zoom 0 is one tile.</span></div>
+    <div class="beacon"><span class="beacon-term">Zoom +1 = 4x tiles</span><span class="beacon-def">Tile count quadruples per level; explains the ~70PB storage estimate.</span></div>
+    <div class="beacon"><span class="beacon-term">Geohash</span><span class="beacon-def">String encoding of a recursive quadrant; lets a client name the tile it needs.</span></div>
+    <div class="beacon"><span class="beacon-term">Web Mercator</span><span class="beacon-def">Google's chosen map projection; a distortion trade-off for a flat display.</span></div>
+    <div class="beacon"><span class="beacon-term">Static tiles + CDN</span><span class="beacon-def">Precompute once, cache everywhere; dynamic tile generation would crush servers and defeat caching.</span></div>
+    <div class="beacon"><span class="beacon-term">Vector tiles</span><span class="beacon-def">Send paths and polygons, render on the device; big bandwidth savings.</span></div>
+    <div class="beacon"><span class="beacon-term">Nodes = intersections, edges = roads</span><span class="beacon-def">Road network as a graph so Dijkstra / A* variants can run on it.</span></div>
+    <div class="beacon"><span class="beacon-term">Routing tile</span><span class="beacon-def">A small subgraph with references to neighbors; load only the tiles your trip touches.</span></div>
+    <div class="beacon"><span class="beacon-term">Hierarchical routing tiles</span><span class="beacon-def">Several levels of detail (fine local to coarse long-distance); long trips use coarse tiles.</span></div>
+    <div class="beacon"><span class="beacon-term">Client-side batching</span><span class="beacon-def">GPS points sent in groups; cuts request count, still ~200k QPS (1M peak).</span></div>
+    <div class="beacon"><span class="beacon-term">Cassandra (user_id, timestamp)</span><span class="beacon-def">Write-heavy, availability over consistency; partition by user, sort by time.</span></div>
+    <div class="beacon"><span class="beacon-term">Kafka fan-out</span><span class="beacon-def">One location stream feeds traffic, ML, routing-tile and analytics consumers independently.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The payoff lies in four places: how routing scales with hierarchical tiles, how the navigation pipeline decomposes, why tiles are static on a CDN, and how adaptive rerouting avoids scanning every driver.</p>
+
+  <div class="drill">
+    <h4>Routing tiles and hierarchy: making A* work on a planet</h4>
+    <p>Pathfinding cost grows with the size of the graph, so running A* on the entire world's road network is hopeless. The fix mirrors map rendering: cut the road graph into routing tiles, each a small subgraph that holds references to its neighbors. The algorithm starts at the origin tile and pulls in adjacent tiles only as it explores, stitching together a bigger graph on the fly.</p>
+    <p>For a cross-country drive, even stitching small tiles is too slow and memory hungry. So there are tiles at several levels of detail, from fine-grained local streets up to coarse tiles that span wide areas. The algorithm uses the appropriately detailed tiles based on where you are headed.</p>
+    <figure class="guide-fig"><img src="18.%20Google%20Maps/images/map-routing-hierarchical.png" alt="Hierarchical routing tiles over New York"><figcaption>Three nested grids: the small green squares are detailed local tiles, the teal ones are mid-level, and the large blue squares cover wide areas for long-distance routing.</figcaption></figure>
+    <p>These tiles are produced by a periodic offline pipeline that converts unstructured raw road data (TBs from many sources, improved by user location data) into graphs. They need no database features, so they live in S3 as compressed binary adjacency lists, cached aggressively.</p>
+    <div class="pitfall"><strong>Common trap:</strong> putting routing tiles in a relational or NoSQL database. Nothing queries inside them; the service just loads a whole tile by its geohash, which is exactly what object storage plus caching does best.</div>
+  </div>
+
+  <div class="drill">
+    <h4>The navigation pipeline, box by box</h4>
+    <p>Navigation is not one service but a small assembly line. Knowing the order and what each station reads is what interviewers probe.</p>
+    <figure class="guide-fig"><img src="18.%20Google%20Maps/images/navigation-service.png" alt="Navigation service component diagram"><figcaption>The route planner is the conductor. Shortest-path reads routing tiles from object storage; the ETA service reads the traffic DB, which an update-traffic service fills from the location DB; the ranker consults filters like "avoid tolls."</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Station</th><th>Reads</th><th>Produces</th></tr></thead>
+      <tbody>
+        <tr><td>Geocoding</td><td>Geocoding DB (Redis: frequent reads, rare writes)</td><td>Lat/long for each address</td></tr>
+        <tr><td>Shortest path</td><td>Routing tiles in S3</td><td>Candidate paths (A* variant)</td></tr>
+        <tr><td>ETA</td><td>Traffic DB</td><td>ML-predicted travel time</td></tr>
+        <tr><td>Ranker</td><td>User filters</td><td>Ordered best routes</td></tr>
+        <tr><td>Updaters</td><td>Location stream (Kafka)</td><td>Fresh traffic and road data, asynchronously</td></tr>
+      </tbody>
+    </table>
+    <p>Note the requirement shape: a little latency is fine, but accuracy matters. The route need not be the mathematically fastest, but it must never send you the wrong way.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Rendering: static tiles, CDN, and the geohash URL</h4>
+    <p>Generating tiles on demand for a billion users would put enormous load on servers and make caching nearly impossible, since every response would be unique. Instead, all tiles are precomputed for every zoom level, stored at an origin, and served from CDN points of presence closest to the user.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Client computes tile URL from geohash</strong><p>No extra API hop; tiles fetched straight from the CDN.</p></div>
+      <div class="con"><strong>But you are locked in</strong><p>The tile-naming scheme lives in shipped app code; forcing clients to update is hard. A small server API that returns tile URLs keeps flexibility at the cost of one extra call.</p></div>
+    </div>
+    <p>New tiles are fetched when the user zooms or pans, or while navigating into a new tile. Sending vector data instead of raster images lets the client draw the map itself, which the notes call a substantial bandwidth saving &mdash; directly serving the data-and-battery requirement.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Adaptive ETA and rerouting without scanning everyone</h4>
+    <p>To reroute drivers when an accident occurs, the system stores each navigating user's route as the list of routing tiles they will pass through. When a tile has an incident, find every user whose list contains it and recompute. The naive list, however, can be very long.</p>
+    <p>The clever compression: store only the origin tile and then its successively coarser "super" tiles until one contains the destination: <code>user_1, r_1, super(r_1), super(super(r_1)), ...</code>. Now the question "is this user affected?" becomes "does the user's final, largest tile contain the accident tile?"</p>
+    <figure class="guide-fig"><img src="18.%20Google%20Maps/images/adaptive-eta-data-storage.png" alt="Origin tile expanded to coarser levels until destination is included"><figcaption>Starting from the origin's small tile, each level zooms out one step; the Level 2 tile is the first to contain both origin and destination, so it bounds the whole trip.</figcaption></figure>
+    <p>Updates are delivered over WebSocket: mobile push notifications have tiny payloads and do not work for web apps, long-polling costs more server compute, and SSE is one-way, while WebSocket's two-way channel also suits future features like last-mile delivery.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch or jot your answer in the margin first, then tap to check.</p>
+  <details class="qa"><summary>Why are map tiles precomputed and served from a CDN rather than generated per request?</summary><div class="qa-answer"><p>Dynamic generation would put a huge load on servers and make caching hard. Static tiles keyed by geohash and zoom can be cached at CDN points of presence near users, minimizing latency and server work.</p></div></details>
+  <details class="qa"><summary>How does the number of tiles change as you zoom in, and what does the lowest zoom level look like?</summary><div class="qa-answer"><p>At the lowest zoom the whole world is one 256x256 tile. Each additional zoom level quadruples the number of tiles, which is why total storage reaches roughly 70PB even after compressing near-identical tiles.</p></div></details>
+  <details class="qa"><summary>What problem do hierarchical routing tiles solve?</summary><div class="qa-answer"><p>For long routes, stitching together many small, detailed tiles is slow and memory hungry. Coarser tiles (e.g. highway level) let the algorithm cover long distances with far fewer nodes, using detailed tiles only near origin and destination.</p></div></details>
+  <details class="qa"><summary>Compare client-side tile URL calculation with a tile URL API.</summary><div class="qa-answer"><p>Client-side calculation avoids an extra network call but locks the tiling scheme into app code that is hard to force-update. A URL API adds a hop but lets the server change the scheme freely.</p></div></details>
+  <details class="qa"><summary>Why Cassandra for user location data, and what are its keys?</summary><div class="qa-answer"><p>The workload is extremely write-heavy and prefers availability over consistency, since locations go stale quickly anyway. <code>user_id</code> is the partition key to fetch all of a user's updates, and <code>timestamp</code> is the clustering key to keep them time-sorted.</p></div></details>
+  <details class="qa"><summary>What happens when an accident occurs on a routing tile?</summary><div class="qa-answer"><p>The system checks stored in-flight routes; with the compressed representation, it tests whether each user's largest super-tile contains the accident tile. Affected users get a recalculated route and ETA pushed over WebSocket.</p></div></details>
+  <details class="qa"><summary>Why is Kafka placed after the location service?</summary><div class="qa-answer"><p>Many consumers need the same location stream &mdash; traffic updates, ML, routing-tile improvements, analytics. Kafka decouples them so each can process the stream independently without adding load to the write path.</p></div></details>
+</div>

@@ -1,0 +1,207 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 9 p.m. on a Friday and a billion people are scrolling. Every few microseconds, somewhere on the planet, a thumb taps an ad, and each of those taps is a tiny invoice: an advertiser now owes money. Your job is to count those taps, per ad and per minute, while they pour in at up to 50,000 per second, arrive late, arrive twice, and hit machines that occasionally die mid-count. Miscount by even a fraction of a percent and someone is billed millions of dollars wrong. This is ad click event aggregation: a cash register for an unbounded river of events, where accuracy matters more than speed but a few minutes is the most you can be late.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet this is a streaming pipeline: raw clicks in, per-minute counts out, with a safety net underneath. Read the map top to bottom: each hub is a problem that must be solved before the details beneath it make sense.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Decoupled streaming pipeline (Kafka &rarr; aggregation &rarr; Kafka &rarr; DB)</span> <span class="why">— the skeleton; every other decision plugs into one of its stages</span>
+      <ul>
+        <li>Message queue 1: raw click events (ad_id, click_timestamp, user_id, ip, country)
+          <ul><li><span class="peripheral">Enough partitions created up front; consumer rebalancing done off-peak</span></li></ul>
+        </li>
+        <li>Message queue 2: per-minute counts and top-N lists
+          <ul><li><span class="peripheral">Exists so results and offsets can be committed atomically (exactly-once)</span></li></ul>
+        </li>
+        <li>Storage: Cassandra for both raw and aggregated data
+          <ul><li><span class="peripheral">Raw data can move to cold storage; S3 + Parquet/ORC/AVRO was an alternative</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Aggregation service as a MapReduce DAG</span> <span class="why">— where counting actually happens, in memory, every minute</span>
+      <ul>
+        <li>Map node: filter, sanitize, route by ad_id</li>
+        <li>Aggregate node: count per ad_id per minute; heap for top N</li>
+        <li>Reduce node: merge partial results into the final answer
+          <ul><li><span class="peripheral">Star schema: pre-aggregate by dimensions like country (filter_id)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Time &amp; windows</span> <span class="why">— you cannot count "per minute" until you decide whose clock defines the minute</span>
+      <ul>
+        <li>Event time (chosen) vs processing time</li>
+        <li>Watermark: extend the window to catch stragglers</li>
+        <li>Tumbling window for counts, sliding window for top N in M minutes
+          <ul><li><span class="peripheral">Hopping and session windows exist but are not used</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Correctness guarantees</span> <span class="why">— the bill must be right, so duplicates and losses are not tolerated</span>
+      <ul>
+        <li>Exactly-once delivery via atomic commit of offset + downstream write</li>
+        <li>Fault tolerance: Kafka offsets + periodic snapshots of in-memory state</li>
+        <li>End-of-day reconciliation batch job against raw data
+          <ul><li><span class="peripheral">Monitoring: latency, Kafka records-lag, CPU/disk/JVM</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Scaling</span> <span class="why">— 30% year-over-year growth and viral ads that attract a flood</span>
+      <ul>
+        <li>Queue, aggregation service and DB scale independently</li>
+        <li>Hotspot handling: borrow extra nodes from the resource manager
+          <ul><li><span class="peripheral">Global-local aggregation, split distinct aggregation</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The pipeline is the trunk: without the two queues there is nowhere to hang exactly-once, recovery or independent scaling. The aggregation DAG is the engine sitting on that trunk, and it cannot produce a number until the time hub defines what "this minute" means. The correctness hub then wraps the whole thing, because the output is money.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each stage as a sealed box: know what goes in, what comes out, and why the next box depends on it. The internals come later.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Message queue 1 (raw clicks)</h4>
+      <p><strong>Input:</strong> An unbounded stream of click events, ~10,000/sec average, 50,000/sec peak, ~0.1 KB each.</p>
+      <p><strong>Output:</strong> A durable, replayable log with offsets that consumers read at their own pace.</p>
+      <p class="io-story">A giant conveyor belt with numbered slots. If a worker downstream faints, the belt keeps moving and nothing falls off; the worker picks up at its last slot number.</p>
+      <p class="io-arrow">&rarr; feeds into: raw data writer (Cassandra) and the aggregation service</p>
+    </div>
+    <div class="io-block">
+      <h4>Map node</h4>
+      <p><strong>Input:</strong> Raw events from the queue.</p>
+      <p><strong>Output:</strong> Cleaned events, routed so every event for the same ad_id reaches the same aggregate node (e.g. ad_id % 3).</p>
+      <p class="io-story">A mail sorter. It throws out junk and drops each letter in the pigeonhole for its ad, so no ad's clicks are split across counters.</p>
+      <p class="io-arrow">&rarr; feeds into: aggregate nodes</p>
+    </div>
+    <div class="io-block">
+      <h4>Aggregate node</h4>
+      <p><strong>Input:</strong> Events for its slice of ads, bucketed by event time into one-minute windows (plus a watermark).</p>
+      <p><strong>Output:</strong> Per-minute counts per ad_id and a local top-N heap.</p>
+      <p class="io-story">A tally clerk with a clicker for each ad, resetting every minute and keeping a short "leaderboard" of the busiest ads on the side.</p>
+      <p class="io-arrow">&rarr; feeds into: reduce node</p>
+    </div>
+    <div class="io-block">
+      <h4>Reduce node</h4>
+      <p><strong>Input:</strong> Partial counts and partial top-N lists from all aggregate nodes.</p>
+      <p><strong>Output:</strong> Final per-minute counts and the global top N most clicked ads.</p>
+      <p class="io-story">The head accountant who adds up every clerk's sheet. Each clerk's top 3 is merged into one true top 3.</p>
+      <p class="io-arrow">&rarr; feeds into: message queue 2</p>
+    </div>
+    <div class="io-block">
+      <h4>Message queue 2 + atomic commit</h4>
+      <p><strong>Input:</strong> Aggregated results plus the upstream consumer offset they came from.</p>
+      <p><strong>Output:</strong> Results published and the offset committed together, or neither.</p>
+      <p class="io-story">A sealed envelope: "these counts" and "I am done up to slot 100" are mailed as one package, so a crash can never send one without the other.</p>
+      <p class="io-arrow">&rarr; feeds into: aggregation database writer</p>
+    </div>
+    <div class="io-block">
+      <h4>Aggregation DB (Cassandra) + query API</h4>
+      <p><strong>Input:</strong> Rows like (ad001, 202101010000, filter 0012, count 2) and most_clicked_ads lists.</p>
+      <p><strong>Output:</strong> Fast answers to GET /v1/ads/{ad_id}/aggregated_count and GET /v1/ads/popular_ads.</p>
+      <p class="io-story">The scoreboard in the lobby. Nobody recounts clicks when they look at it; they read a number that was pre-computed a minute ago.</p>
+      <p class="io-arrow">&rarr; feeds into: dashboards, billing, RTB decisions, and the nightly reconciliation check</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one click</h4>
+    <ol class="journey-steps">
+      <li>At 2021-01-01 00:00:01, user1 in the USA (IP 207.148.22.22) taps ad001. An event with that event time is produced into message queue 1.</li>
+      <li>Two consumers read it: the raw data writer stores the untouched row in Cassandra (for debugging and backfill), and the aggregation service picks it up at, say, offset 100.</li>
+      <li>The map node checks the event is well-formed and routes it by ad_id, so it lands on the one aggregate node responsible for ad001.</li>
+      <li>The aggregate node places it in the tumbling window for minute 202101010000 based on its event time, not the time it arrived. The window is held open a little longer (the watermark) in case stragglers from 00:00:59 show up late.</li>
+      <li>When the window closes, the node emits "ad001, 202101010000, count 2" (user1 clicked twice) and updates its top-N heap.</li>
+      <li>The reduce node merges this with other nodes' partial results and produces the final count and the global top 100 for that minute.</li>
+      <li>The result is written to message queue 2 and offset 100 is committed in the same atomic step, so a crash cannot double-count or lose it.</li>
+      <li>The database writer stores the row in the aggregation DB, including pre-aggregated filter rows such as filter_id 0012 (US clicks).</li>
+      <li>An advertiser's dashboard calls GET /v1/ads/ad001/aggregated_count?from=...&amp;to=...&amp;filter=0012 and sees the number a few minutes after the tap. That night, reconciliation recounts from raw data and confirms it matches.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Turn an infinite, messy stream of billable clicks into correct per-minute counts and top-N rankings within a few minutes, surviving late events, duplicates and crashes.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a vast vote-counting hall on election night. Ballots stream in through a mail chute that never closes (Kafka queue 1), and every ballot is also photocopied into an archive in the basement (raw data store). Sorters at the door route each ballot to the table for its candidate (map nodes), clerks tally each table minute by minute (aggregate nodes), and a head counter combines the tables and posts the leaderboard (reduce node) onto a public board (aggregation DB). The official results are only posted in sealed envelopes that also record which ballots were counted (atomic commit via queue 2). And at dawn an auditor recounts from the basement photocopies to prove the board was right (reconciliation).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">1 bil clicks/day &rarr; 10k QPS, 50k peak</span><span class="beacon-def">Write-heavy firehose; signals a message queue and a write-friendly DB like Cassandra.</span></div>
+    <div class="beacon"><span class="beacon-term">0.1 KB/click &rarr; 100 GB/day, 3 TB/month</span><span class="beacon-def">Raw data is big but cheap to keep in cold storage; aggregates are small and hot.</span></div>
+    <div class="beacon"><span class="beacon-term">Raw + aggregated data</span><span class="beacon-def">Keep both: raw for recalculation and debugging, aggregated for fast queries.</span></div>
+    <div class="beacon"><span class="beacon-term">filter_id / star schema</span><span class="beacon-def">Pre-aggregate by dimensions (country, IP, user) so filtered queries are lookups, at the cost of more rows.</span></div>
+    <div class="beacon"><span class="beacon-term">Event time</span><span class="beacon-def">Count by when the click happened; more accurate, but forces you to handle late events.</span></div>
+    <div class="beacon"><span class="beacon-term">Watermark</span><span class="beacon-def">An extension of the window to catch late events; longer = fewer misses but more latency.</span></div>
+    <div class="beacon"><span class="beacon-term">Tumbling vs sliding window</span><span class="beacon-def">Tumbling (non-overlapping minutes) for counts; sliding for "top N in the last M minutes".</span></div>
+    <div class="beacon"><span class="beacon-term">Exactly-once</span><span class="beacon-def">Required because small errors mean millions of dollars; achieved with an atomic offset + output commit.</span></div>
+    <div class="beacon"><span class="beacon-term">Kappa architecture</span><span class="beacon-def">One stream engine handles both live and historical reprocessing, unlike Lambda's two codebases.</span></div>
+    <div class="beacon"><span class="beacon-term">Snapshot + offset</span><span class="beacon-def">In-memory state is periodically saved so a replacement node can resume mid-window.</span></div>
+    <div class="beacon"><span class="beacon-term">Reconciliation</span><span class="beacon-def">End-of-day batch that recomputes from raw data and compares; the final correctness safety net.</span></div>
+    <div class="beacon"><span class="beacon-term">Records-lag</span><span class="beacon-def">The Kafka metric to watch; growing lag means add aggregation nodes.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers probe where money can leak: duplicates, late clicks, crashes and hot ads. These four drills cover the questions most likely to decide the round.</p>
+
+  <div class="drill">
+    <h4>Exactly-once: why the second queue exists</h4>
+    <p>A duplicate can come from the client resending, or from a server outage: an aggregation node processes offset 100, sends its result downstream, then dies before acknowledging. The upstream thinks offset 100 was never handled and it is processed again. Now ad001 has been billed twice for one click.</p>
+    <p>The naive fix is to save "last seen offset" to HDFS/S3 before sending the result. But if the node dies after saving and before sending, the result never reaches downstream: you traded a duplicate for a loss. The only safe option is to make "send result" and "commit offset" a single atomic step, which is a distributed transaction. That is the job of the atomic commit around message queue 2.</p>
+    <figure class="guide-fig"><img src="21.%20Ad%20Click%20Event%20Aggregation/images/data-duplication-example-3.png" alt="Offset storage and downstream write committed atomically"><figcaption>Notice that the offset save and the downstream send sit inside one transaction boundary: either both happen or neither does.</figcaption></figure>
+    <table class="compare"><thead><tr><th>Approach</th><th>Failure mode</th><th>Verdict</th></tr></thead><tbody>
+      <tr><td>Ack after sending result</td><td>Crash before ack &rarr; reprocess &rarr; duplicate</td><td>At-least-once; fine elsewhere, not for billing</td></tr>
+      <tr><td>Save offset first, then send</td><td>Crash between the two &rarr; result lost</td><td>At-most-once; unacceptable</td></tr>
+      <tr><td>Atomic offset + send (distributed transaction)</td><td>None of the above</td><td>Exactly-once; chosen</td></tr>
+    </tbody></table>
+    <div class="pitfall"><strong>Common trap:</strong> Saying "Kafka gives us exactly-once" and stopping. The guarantee must cover the whole path to the downstream sink. As the notes point out, if the downstream writes are idempotent you can skip the distributed transaction entirely.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Time, watermarks and windows</h4>
+    <p>Because of queues and network delays, the moment a click happened (event time) can be far from the moment a server sees it (processing time). Processing time is reliable but mis-buckets late clicks; event time is accurate but can be wrong or malicious on the client. Since billing needs accuracy, the design uses event time and then fights the lateness problem.</p>
+    <p>The weapon is the watermark. Picture a train that officially departs at 00:01 but holds its doors open for a few extra seconds so running passengers can jump on. Those extra seconds are the watermark. A short one lets the train leave on time but strands more passengers; a long one catches almost everyone but delays the whole schedule.</p>
+    <div class="anim" data-anim="watermark"></div>
+    <figure class="guide-fig"><img src="21.%20Ad%20Click%20Event%20Aggregation/images/watermark-2.png" alt="Aggregation window extended by a watermark"><figcaption>The extended tail of each window is the watermark; the late event that missed the plain window is now counted in the right minute.</figcaption></figure>
+    <p>No watermark catches everything, and chasing the last rare straggler is not worth the latency. Those leftovers are fixed by end-of-day reconciliation. For the windows themselves: a tumbling (fixed, non-overlapping) window drives the per-minute counts, and a sliding window drives "top N in the last M minutes".</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Event time + watermark puts clicks in the minute they really happened, which is what advertisers pay for.</p></div><div class="con"><strong>Costs</strong><p>Every window closes later than real time, and a small tail of very late events still needs a batch correction.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>The MapReduce DAG, scaling and hotspots</h4>
+    <p>Inside the aggregation service each node does one job and passes results downstream over TCP or shared memory, with intermediate data kept in memory. Map routes by ad_id, aggregate counts per minute, reduce merges. For top N, every aggregate node keeps a heap of its local leaders and the reduce node merges those heaps, which is why "top 3" extends easily to "top 100".</p>
+    <p>Why have a map node at all, instead of letting Kafka partition by ad_id? Because you may not control how producers partition data, so clicks for one ad can land on different partitions, and the map step also lets you sanitize data first.</p>
+    <p>The three big pieces (queue, aggregation service, DB) are decoupled, so each scales on its own: more partitions and consumers for Kafka (possibly topics by region like topic_na, topic_eu), more nodes or multi-processing via Apache YARN for aggregation, and Cassandra's consistent hashing for the DB, which rebalances automatically when nodes join.</p>
+    <figure class="guide-fig"><img src="21.%20Ad%20Click%20Event%20Aggregation/images/hotspot-issue.png" alt="Hot ad split across extra aggregation nodes"><figcaption>A viral ad overwhelms one node; it borrows extra nodes from the resource manager, splits its events into groups of 100, and gathers the partial counts back.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> Forgetting that consumer rebalancing across thousands of consumers is slow. Pre-create enough partitions and scale consumers off-peak.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Surviving crashes and proving the numbers</h4>
+    <p>Aggregate nodes count in memory, so a crash wipes the tally. Kafka offsets tell a replacement node where to resume reading, but they do not restore the half-finished "top N in M minutes" state. So nodes periodically snapshot that state; recovery reads the latest snapshot plus the latest committed offset and replays only the events after it.</p>
+    <ol class="steps">
+      <li>Node takes snapshots of its ongoing aggregation at a given minute.</li>
+      <li>Node dies; a new node is assigned its partitions.</li>
+      <li>New node loads the last snapshot and last committed offset.</li>
+      <li>It replays events from that offset forward and continues as if nothing happened.</li>
+    </ol>
+    <p>Two more safety nets sit on top. If the aggregation logic itself had a bug, a recalculation service reads raw data in batch and feeds it to a dedicated aggregation service (so live traffic is untouched), then writes through queue 2. That reuse of the same stream engine is what makes this Kappa rather than Lambda. And every night, reconciliation recomputes from raw data and compares against the aggregation DB.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin with your stylus, then tap to reveal.</p>
+  <details class="qa"><summary>Why keep raw click data if queries only ever read aggregated data?</summary><div class="qa-answer"><p>Aggregated data is derived and loses information. Raw data lets you debug, recalculate after a logic bug (backfill), and run end-of-day reconciliation. It can sit in cold storage to keep costs down.</p></div></details>
+  <details class="qa"><summary>What happens if an aggregation node saves its offset before sending results, then crashes in between?</summary><div class="qa-answer"><p>On restart the offset says the events were handled, so they are skipped, but the results never reached downstream. The clicks are lost. That is why offset commit and output must be atomic.</p></div></details>
+  <details class="qa"><summary>Compare event time and processing time for this system.</summary><div class="qa-answer"><p>Event time is more accurate but client clocks can be wrong or malicious, and late events must be handled. Processing time is reliable but places late events in the wrong minute. Accuracy drives billing, so event time plus watermarks is chosen.</p></div></details>
+  <details class="qa"><summary>What happens if you make the watermark very long?</summary><div class="qa-answer"><p>Fewer events are missed, but every window closes later, raising end-to-end latency. Since some events will always be late, it is better to keep the watermark moderate and rely on reconciliation.</p></div></details>
+  <details class="qa"><summary>Why is at-least-once delivery not good enough here, when it is fine for most systems?</summary><div class="qa-answer"><p>The counts are used for billing and RTB. A small percentage of duplicates can mean millions of dollars of discrepancy, so exactly-once is required.</p></div></details>
+  <details class="qa"><summary>Lambda vs Kappa: which does this design use and why?</summary><div class="qa-answer"><p>Kappa. Historical recalculation goes through the same stream aggregation engine rather than a separate batch codebase, avoiding Lambda's two processing paths to maintain.</p></div></details>
+  <details class="qa"><summary>How does a replacement node recover the top-N state of a crashed node?</summary><div class="qa-answer"><p>It loads the latest snapshot of the in-memory aggregation and the latest committed Kafka offset, then replays events from that offset forward.</p></div></details>
+</div>

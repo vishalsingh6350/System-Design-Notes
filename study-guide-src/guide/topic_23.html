@@ -1,0 +1,196 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>Monday, 8:59 a.m. A billion inboxes wake up at once. Every second, 100,000 new emails leave the building, some carrying 20 MB slide decks, while strangers' mail servers knock on your door with messages that must land in the right inbox, pass spam checks, appear on screen instantly, and be searchable the moment they arrive. Nothing can ever be lost, because a missing email might be a job offer or a contract. That is a distributed email service like Gmail: a planet-scale post office that never closes, never loses a letter, and remembers every word you have ever received.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">At a distance the system is two conveyor belts (sending and receiving) feeding a set of specialized stores, all partitioned by user. Read each hub as a question the design must answer.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Protocols &amp; the mail ecosystem</span> <span class="why">— you must speak the outside world's language before you can build anything</span>
+      <ul>
+        <li>SMTP between servers; HTTP/REST for our webmail clients</li>
+        <li>DNS MX records tell senders which server accepts mail for a domain
+          <ul><li><span class="peripheral">POP downloads and deletes; IMAP keeps mail on the server</span></li><li><span class="peripheral">Attachments base64-encoded, ~25 MB limit</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Async send &amp; receive pipelines</span> <span class="why">— queues absorb 100k emails/sec and slow remote servers</span>
+      <ul>
+        <li>Send: load balancer &rarr; web servers &rarr; outgoing queue &rarr; SMTP outgoing workers</li>
+        <li>Receive: SMTP load balancer &rarr; SMTP servers &rarr; incoming queue &rarr; mail processing workers
+          <ul><li><span class="peripheral">Error queue; exponential backoff when recipient server is down</span></li></ul>
+        </li>
+        <li>Real-time servers push new mail via WebSockets
+          <ul><li><span class="peripheral">Long-polling fallback for older browsers</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Metadata DB partitioned by user_id</span> <span class="why">— almost every operation touches one user's mailbox only</span>
+      <ul>
+        <li>Tables: folders, emails (timeuuid email_id), attachments</li>
+        <li>Denormalized read / unread email tables
+          <ul><li><span class="peripheral">Thread reconstruction via Message-Id, In-Reply-To, References headers</span></li></ul>
+        </li>
+        <li>Consistency chosen over availability
+          <ul><li><span class="peripheral">Custom DB at Gmail scale (BigTable); multi-DC leader-follower failover</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Supporting stores</span> <span class="why">— each data shape gets a store suited to it</span>
+      <ul>
+        <li>Attachment store: object storage (e.g. S3)</li>
+        <li>Distributed cache: recent emails in Redis</li>
+        <li>Search store: Elasticsearch partitioned by user_id, updated async via Kafka
+          <ul><li><span class="peripheral">Custom engine built on LSM trees as an alternative</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Deliverability</span> <span class="why">— sending is easy; landing in the inbox, not spam, is hard</span>
+      <ul>
+        <li>Dedicated IPs, separate marketing mail, IP warm-up over 2-6 weeks</li>
+        <li><span class="peripheral">Ban spammers fast, ISP feedback loops, SPF / DKIM authentication</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Protocols set the boundary with the outside world, and the pipelines are how mail crosses that boundary without overwhelming anything. Once mail is inside, the user_id partitioning of the metadata DB is the organizing idea that lets search, cache and storage scale by user. Deliverability is the one hub that depends on reputation rather than engineering alone.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the boxes along the send path and then the receive path. Each takes a message in one state and hands it on in a safer or more useful state.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Load balancer + web servers</h4>
+      <p><strong>Input:</strong> POST /v1/messages from the webmail client (To, Cc, Bcc, body, attachment references).</p>
+      <p><strong>Output:</strong> A validated email on the outgoing queue, or on the error queue if validation fails.</p>
+      <p class="io-story">The post office counter: it rate-limits people mailing in bulk, weighs the parcel (size check), runs a spam check, and hand-delivers mail addressed to someone in the same domain without sending it out.</p>
+      <p class="io-arrow">&rarr; feeds into: outgoing message queue</p>
+    </div>
+    <div class="io-block">
+      <h4>Outgoing queue + SMTP outgoing workers</h4>
+      <p><strong>Input:</strong> Queued emails; attachments are references into the object store.</p>
+      <p><strong>Output:</strong> Mail delivered via SMTP to the recipient's server (found through its MX record); a copy in the Sent folder.</p>
+      <p class="io-story">Couriers who take parcels off the loading dock, scan them for viruses, and drive them to the right town. If the town's post office is closed, they come back later, waiting longer each time.</p>
+      <p class="io-arrow">&rarr; feeds into: the remote mail server (or our own receive path)</p>
+    </div>
+    <div class="io-block">
+      <h4>SMTP load balancer + SMTP servers</h4>
+      <p><strong>Input:</strong> Inbound SMTP connections from other mail servers.</p>
+      <p><strong>Output:</strong> Accepted mail on the incoming queue; invalid mail discarded; large attachments placed in the object store.</p>
+      <p class="io-story">The receiving dock with a bouncer: obviously bad deliveries are turned away at the gate before they take up any space inside.</p>
+      <p class="io-arrow">&rarr; feeds into: mail processing workers</p>
+    </div>
+    <div class="io-block">
+      <h4>Mail processing workers</h4>
+      <p><strong>Input:</strong> Accepted incoming mail.</p>
+      <p><strong>Output:</strong> Mail written to the metadata DB, cache and object store, and handed to real-time servers.</p>
+      <p class="io-story">Sorters who stamp each letter, file a copy in the right mailbox, put recent ones on the "just arrived" shelf, and ring the recipient's doorbell.</p>
+      <p class="io-arrow">&rarr; feeds into: storage layer and real-time servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Storage layer (metadata DB, attachment store, cache, search)</h4>
+      <p><strong>Input:</strong> Email metadata, bodies, attachments and indexing events.</p>
+      <p><strong>Output:</strong> Durable, user-partitioned mailboxes; fast recent reads; full-text search.</p>
+      <p class="io-story">A filing room where each user's drawer lives on one cabinet (one shard), heavy parcels go to the warehouse (S3), and a card catalogue (Elasticsearch) indexes every word.</p>
+      <p class="io-arrow">&rarr; feeds into: GET /v1/folders, GET /v1/folders/{id}/messages, search</p>
+    </div>
+    <div class="io-block">
+      <h4>Real-time servers</h4>
+      <p><strong>Input:</strong> New-mail notifications for online users.</p>
+      <p><strong>Output:</strong> Pushes over WebSockets (long-polling for old browsers); offline users fetch via HTTP later.</p>
+      <p class="io-story">The doorbell. If you are home, it rings instantly; if you are away, the mail simply waits in your box.</p>
+      <p class="io-arrow">&rarr; feeds into: the user's open webmail tab</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one email</h4>
+    <ol class="journey-steps">
+      <li>Alice, a user of our service, writes to Carol at another provider, attaches a 2 MB PDF, and presses Send. The attachment is uploaded to the object store and the email references it.</li>
+      <li>The load balancer checks Alice is not sending excessively and routes the request to a web server.</li>
+      <li>The web server runs a spam check and basic validation (size well under the ~25 MB limit). Carol's domain differs from Alice's, so there is no internal short-circuit. The email goes onto the outgoing queue.</li>
+      <li>An SMTP outgoing worker pulls it, runs spam and virus checks, looks up the MX record for Carol's domain in DNS, and delivers via SMTP. A copy is stored in Alice's Sent folder.</li>
+      <li>Suppose Carol's server is down: the email stays queued and is retried with exponential backoff. A growing outgoing queue is a monitoring signal to investigate or add consumers.</li>
+      <li>Carol replies. Her server resolves our MX record and connects to our SMTP load balancer; an SMTP server applies the acceptance policy and places the mail on the incoming queue.</li>
+      <li>A mail processing worker checks it, then writes metadata to the emails and unread tables in Alice's partition (keyed by user_id, with a timeuuid email_id), caches it in Redis, and stores any large attachment in the object store.</li>
+      <li>An indexing event is published to Kafka, and Elasticsearch updates Alice's index asynchronously.</li>
+      <li>Alice has webmail open, so a real-time server pushes the reply over her WebSocket and it appears in her inbox, grouped into the thread via its In-Reply-To header.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Reliably move and store email for a billion users, with no data loss, instant delivery and per-user search, by decoupling everything with queues and partitioning everything by user.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a national postal service for a country of a billion people. Counters in every town accept outgoing letters and weigh them (web servers with validation), then drop them on a loading dock (outgoing queue) where couriers drive them to other countries' post offices listed in a global directory (SMTP workers using DNS MX records). Incoming trucks arrive at a guarded receiving dock (SMTP servers with acceptance policy), and sorters file each letter into one private drawer per citizen (metadata DB partitioned by user_id), sending bulky parcels to a warehouse (S3 attachment store). A doorbell rings when you are home (WebSocket push), and each citizen has a personal card catalogue of every letter they have ever received (per-user Elasticsearch index).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">1 bil users x 10 sent/day &rarr; 100k emails/sec</span><span class="beacon-def">A write firehose; signals queues and horizontally scaled workers.</span></div>
+    <div class="beacon"><span class="beacon-term">730 PB/yr metadata, 1,460 PB/yr attachments</span><span class="beacon-def">Attachments dominate storage; put them in an object store, not the metadata DB.</span></div>
+    <div class="beacon"><span class="beacon-term">MX record</span><span class="beacon-def">DNS entry naming a domain's mail server; how any sender finds where to deliver.</span></div>
+    <div class="beacon"><span class="beacon-term">SMTP vs HTTP</span><span class="beacon-def">SMTP between mail servers; HTTP/REST for our own clients because it is flexible and extensible.</span></div>
+    <div class="beacon"><span class="beacon-term">Outgoing queue size</span><span class="beacon-def">A growing queue means a dead recipient server (retry with backoff) or too few consumers.</span></div>
+    <div class="beacon"><span class="beacon-term">Partition key = user_id</span><span class="beacon-def">All of one user's mail on one shard; operations rarely cross users.</span></div>
+    <div class="beacon"><span class="beacon-term">timeuuid email_id</span><span class="beacon-def">Clustering key that sorts emails by creation time for free.</span></div>
+    <div class="beacon"><span class="beacon-term">read / unread tables</span><span class="beacon-def">Denormalization because Cassandra-style stores cannot filter on non-key columns.</span></div>
+    <div class="beacon"><span class="beacon-term">Consistency over availability</span><span class="beacon-def">During failover, affected users briefly cannot sync rather than see wrong mailbox state.</span></div>
+    <div class="beacon"><span class="beacon-term">Email search is write-heavy</span><span class="beacon-def">Every email reindexes, but users rarely search; optimize the write path.</span></div>
+    <div class="beacon"><span class="beacon-term">LSM tree</span><span class="beacon-def">Buffer writes in memory, flush and merge to disk sequentially; used by Cassandra, BigTable, RocksDB.</span></div>
+    <div class="beacon"><span class="beacon-term">IP warm-up (2-6 weeks)</span><span class="beacon-def">New sending IPs must build reputation slowly or mail goes to spam.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The pipelines and the metadata data model carry most of the interview weight; search and deliverability are where you show depth. Drill these four.</p>
+
+  <div class="drill">
+    <h4>Why traditional mail servers break, and the queue-based pipelines that replace them</h4>
+    <p>Classic mail servers stored each email as a separate file in a local directory per user. That is fine for one server and a few users, but at scale disk I/O becomes the bottleneck, and a single damaged disk or dead server loses mail, violating reliability and availability.</p>
+    <figure class="guide-fig"><img src="23.%20Distributed%20Email%20Service/images/email-sending-flow.png" alt="Email sending flow through load balancer, web servers, queues and SMTP workers"><figcaption>Notice the fork after the web servers: valid mail goes to the outgoing queue, invalid mail to an error queue. The SMTP workers never talk to users directly.</figcaption></figure>
+    <p>The distributed design puts a queue in the middle of both directions. On the send side, the web server only validates and enqueues, so a slow or unreachable recipient server never blocks the user's click. On the receive side, SMTP servers only accept or reject and enqueue, and mail processing workers do the heavy lifting of storing, caching and notifying.</p>
+    <figure class="guide-fig"><img src="23.%20Distributed%20Email%20Service/images/email-receiving-flkow.png" alt="Email receiving flow from SMTP load balancer to storage and real-time servers"><figcaption>After the incoming queue, one worker fans the email out to four places: metadata storage, cache, object store and real-time servers.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> Forgetting to monitor the outgoing queue. If it grows, either the recipient server is unavailable (retry with exponential backoff) or you need more consumers.</div>
+  </div>
+
+  <div class="drill">
+    <h4>The metadata database: partition by user, denormalize for queries</h4>
+    <p>Email metadata has a telling shape: headers are small and read often, bodies can be large but are usually read once, nearly every operation is scoped to one user, recent mail is read far more than old mail, and loss is unacceptable. Relational DBs are tuned for small rows, object stores cannot efficiently support "mark as read" or search, and Gmail's BigTable is not open source. So the notes describe the characteristics of the ideal store instead: single-digit MB columns, strong consistency, low disk I/O, high availability and easy incremental backups.</p>
+    <p>The primary key has two halves. The partition key (user_id) decides which shard holds the data, so one user's mailbox lives in one place. The clustering key (such as a timeuuid email_id) decides the sort order inside that partition, so "newest first" is free.</p>
+    <p>The catch: in a Cassandra-style store you cannot filter on a column that is not part of the key, so "show unread emails" cannot be a simple WHERE is_read = false. Fetching all and filtering in memory does not scale. The answer is to denormalize into separate read and unread tables, and move a row between them when its state changes.</p>
+    <figure class="guide-fig"><img src="23.%20Distributed%20Email%20Service/images/read-unread-emails.png" alt="Separate read_emails and unread_emails tables"><figcaption>Two tables with the same shape; marking an email read means deleting it from one and inserting it into the other.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Every common query is a single-partition key lookup; users never contend with each other; strong consistency keeps mailbox state correct.</p></div><div class="con"><strong>Costs</strong><p>Sharing one email across multiple users is not supported; denormalized tables duplicate writes; during failover or partition, affected users briefly cannot sync.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Search: Elasticsearch or a custom LSM-based engine</h4>
+    <p>Email search is not web search. Its scope is one mailbox, results are sorted by attributes like date rather than relevance, and indexing must be quick and accurate. It is also write-heavy: every arriving, moved or deleted email triggers reindexing, yet users rarely open the search box.</p>
+    <table class="compare"><thead><tr><th></th><th>Google search</th><th>Email search</th></tr></thead><tbody>
+      <tr><td>Scope</td><td>The whole internet</td><td>User's own mailbox</td></tr>
+      <tr><td>Sorting</td><td>Relevance</td><td>Attributes (time, date, etc.)</td></tr>
+      <tr><td>Accuracy</td><td>Indexing takes time; not instant</td><td>Indexing quick, results accurate</td></tr>
+    </tbody></table>
+    <p>The off-the-shelf option is Elasticsearch partitioned by user_id so a user's documents sit on one node. Writes (reindexing) flow asynchronously through Kafka; searches are synchronous. The custom option builds the index on an LSM tree: writes accumulate in memory and, past a threshold, are merged into the next layer on disk, so the disk only sees fast sequential writes.</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Elasticsearch is ready-made and handles full-text email search well. A custom engine can be tuned for email, scale further, and can be the datastore itself.</p></div><div class="con"><strong>Costs</strong><p>Elasticsearch is another cluster to run and keep in sync with the metadata store, and scales only so far. A custom engine needs significant engineering effort.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Deliverability and availability</h4>
+    <p>Spinning up a server that sends mail is trivial; getting that mail into inboxes instead of spam folders is not. Recipient providers judge you by reputation. Use dedicated sending IPs, keep marketing mail on separate servers so it does not taint important mail, warm up new IPs gradually over 2 to 6 weeks, ban spammers quickly, process ISP feedback on complaint rates, and authenticate mail with SPF and DKIM.</p>
+    <p>For availability, most components scale independently because users rarely interact at the data level. A multi-data-center setup with leader-follower failover keeps the service alive when a whole DC fails.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Answer in the margin with your stylus before you peek.</p>
+  <details class="qa"><summary>Why does the send path put a queue between web servers and SMTP workers?</summary><div class="qa-answer"><p>It decouples the user's request from delivery to remote servers, which may be slow or down. Users get a fast response, workers scale independently, and failed deliveries are retried with exponential backoff.</p></div></details>
+  <details class="qa"><summary>What happens if the outgoing queue keeps growing?</summary><div class="qa-answer"><p>Either a recipient server is unavailable, so mail is waiting on retries, or there are not enough consumers. Investigate the remote server or scale out SMTP workers.</p></div></details>
+  <details class="qa"><summary>Why partition the metadata DB by user_id, and what does it cost?</summary><div class="qa-answer"><p>Almost every operation touches only one user's mailbox, so each query hits one shard and users do not interfere. The cost is that an email cannot be shared across users in this model, which is not required here.</p></div></details>
+  <details class="qa"><summary>How do you fetch unread emails when the store cannot filter on is_read?</summary><div class="qa-answer"><p>Denormalize into separate read and unread tables, keyed the same way, and move rows between them when the state changes. Filtering all emails in memory does not scale.</p></div></details>
+  <details class="qa"><summary>Compare email search with web search.</summary><div class="qa-answer"><p>Email search covers one mailbox, sorts by attributes like date, and needs fast, accurate indexing. Web search covers the whole internet, sorts by relevance, and tolerates indexing delay. Email search is also write-heavy.</p></div></details>
+  <details class="qa"><summary>Why does an LSM tree suit a write-heavy search index?</summary><div class="qa-answer"><p>It buffers writes in memory and flushes them to disk as sequential merges, avoiding slow random writes. The same idea powers Cassandra, BigTable and RocksDB.</p></div></details>
+  <details class="qa"><summary>Why might mail from a brand-new server land in spam, and how do you fix it?</summary><div class="qa-answer"><p>Recipient providers do not trust unknown IPs. Use dedicated IPs, warm them up over 2 to 6 weeks, separate marketing mail, ban spammers fast, process ISP feedback, and authenticate with SPF and DKIM.</p></div></details>
+</div>

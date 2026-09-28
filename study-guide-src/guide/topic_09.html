@@ -1,0 +1,216 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You are handed a short list of famous websites and told: "Starting from these, find the rest of the internet. Every page. Every month." Each page you open is a doorway to dozens more, many of them copies of pages you have already seen, some of them endless mazes built by accident or on purpose. Meanwhile, every website owner is watching their server logs, and if your robot hammers their small blog with hundreds of requests a second, you are the villain. The web crawler has to be greedy enough to swallow 1 billion pages a month, yet polite, careful and tireless enough never to trip, loop, or knock anyone over.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet, a crawler is a loop: take a URL, download it, pull out new URLs, feed them back in. Read the map below as four hubs; everything else is a guard rail or tuning knob attached to one of them.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">The crawl loop (BFS over the web graph)</span> <span class="why">— the engine; every other component is a station on this circular conveyor belt</span>
+      <ul>
+        <li>Seed URLs start the loop
+          <ul><li><span class="peripheral">chosen by locality or topic (sports, healthcare)</span></li></ul>
+        </li>
+        <li>HTML Downloader + DNS Resolver fetch pages
+          <ul><li><span class="peripheral">DNS cache, short timeouts, geo-distributed servers, robots.txt</span></li></ul>
+        </li>
+        <li>Content Parser validates pages
+          <ul><li><span class="peripheral">malformed pages are discarded</span></li></ul>
+        </li>
+        <li>URL Extractor harvests new links</li>
+      </ul>
+    </li>
+    <li><span class="hub">URL Frontier</span> <span class="why">— the "to-do list" that decides what is fetched next, in what order, and how gently</span>
+      <ul>
+        <li>Front queues = priority
+          <ul><li><span class="peripheral">Prioritizer scores by PageRank or update frequency</span></li></ul>
+        </li>
+        <li>Back queues = politeness
+          <ul><li><span class="peripheral">one host per queue, one worker per queue, delay between downloads</span></li></ul>
+        </li>
+        <li>Freshness
+          <ul><li><span class="peripheral">recrawl based on update history or importance</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Deduplication ("Seen?" checks)</span> <span class="why">— without it the loop drowns in repeats and never finishes</span>
+      <ul>
+        <li>Content Seen? compares page hashes</li>
+        <li>URL Filter drops blacklisted or erroneous links</li>
+        <li>URL Seen? + URL Storage remember visited URLs
+          <ul><li><span class="peripheral">spider traps handled with URL length limits</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Scale &amp; robustness envelope</span> <span class="why">— what lets the loop survive 1 billion pages a month and 30 PB of data</span>
+      <ul>
+        <li>Distributed crawl servers + consistent hashing</li>
+        <li>Error handling and data validation</li>
+        <li>Extensibility via plug-in modules
+          <ul><li><span class="peripheral">PNG downloader, web monitor for copyright</span></li></ul>
+        </li>
+        <li><span class="peripheral">Content Storage: disk, with popular content in memory</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The crawl loop is the heartbeat; nothing exists without it. The URL Frontier sits at the top of the loop and controls its rhythm (priority and politeness). Deduplication sits at the bottom of the loop, deciding what is allowed back in. The scale envelope wraps the whole thing so it can run on many machines without falling over.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each station as a sealed box: something goes in, something comes out. Follow the arrows and you have walked the whole architecture.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Seed URLs</h4>
+      <p><strong>Input:</strong> A hand-picked list of starting pages, grouped by locality or topic.</p>
+      <p><strong>Output:</strong> The first entries in the URL Frontier.</p>
+      <p class="io-story">The kindling for the fire. Good seeds are well-connected pages, so following their links reaches as much of the web as possible.</p>
+      <p class="io-arrow">&rarr; feeds into: URL Frontier</p>
+    </div>
+    <div class="io-block">
+      <h4>URL Frontier</h4>
+      <p><strong>Input:</strong> New, unseen URLs (from seeds and from the extractor).</p>
+      <p><strong>Output:</strong> The next URL to download, chosen by priority and paced by politeness.</p>
+      <p class="io-story">An air-traffic controller. It holds every URL waiting for takeoff and releases them in an order that favours important pages and never crowds one host's runway.</p>
+      <p class="io-arrow">&rarr; feeds into: HTML Downloader</p>
+    </div>
+    <div class="io-block">
+      <h4>HTML Downloader + DNS Resolver</h4>
+      <p><strong>Input:</strong> A URL.</p>
+      <p><strong>Output:</strong> Raw HTML of the page (after resolving the hostname to an IP and checking robots.txt).</p>
+      <p class="io-story">The courier. It looks up the street address (DNS), checks the "no entry" signs (robots.txt), then fetches the parcel, giving up quickly on slow servers.</p>
+      <p class="io-arrow">&rarr; feeds into: Content Parser</p>
+    </div>
+    <div class="io-block">
+      <h4>Content Parser + Content Seen?</h4>
+      <p><strong>Input:</strong> Raw HTML.</p>
+      <p><strong>Output:</strong> A valid, never-before-seen page, stored in Content Storage; malformed or duplicate pages are dropped.</p>
+      <p class="io-story">The quality inspector and the "haven't we seen this already?" clerk. The page is hashed and the hash compared with stored hashes, so duplicates are caught without comparing text character by character.</p>
+      <p class="io-arrow">&rarr; feeds into: Content Storage and URL Extractor</p>
+    </div>
+    <div class="io-block">
+      <h4>URL Extractor + URL Filter</h4>
+      <p><strong>Input:</strong> A parsed, new page.</p>
+      <p><strong>Output:</strong> A clean list of candidate links, minus blacklisted or erroneous ones.</p>
+      <p class="io-story">A prospector panning the page for links, then tossing out the fool's gold.</p>
+      <p class="io-arrow">&rarr; feeds into: URL Seen?</p>
+    </div>
+    <div class="io-block">
+      <h4>URL Seen? + URL Storage</h4>
+      <p><strong>Input:</strong> Candidate URLs.</p>
+      <p><strong>Output:</strong> Only URLs never visited or queued before, which are added to the Frontier and recorded.</p>
+      <p class="io-story">The bouncer with a guest list. If your name is on the "already been here" list, you do not get back in, which is what stops the loop from circling forever.</p>
+      <p class="io-arrow">&rarr; feeds into: URL Frontier (loop closes)</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one URL</h4>
+    <ol class="journey-steps">
+      <li>A sports-news homepage is placed in the Frontier as a seed URL (topic strategy: sports).</li>
+      <li>The Prioritizer scores it highly (high PageRank, frequently updated), so it lands in a high-priority front queue.</li>
+      <li>The biased queue selector picks that front queue; the queue router drops the URL into the back queue mapped to that host.</li>
+      <li>The worker thread owning that back queue takes it. The DNS Resolver finds the IP (cached, since the host was hit before), robots.txt allows the path, and the page downloads within the short timeout.</li>
+      <li>The Content Parser confirms the HTML is well-formed. Its hash does not match any stored hash, so the page is written to Content Storage.</li>
+      <li>The URL Extractor finds, say, 120 links. The URL Filter removes blacklisted ad-tracker URLs and broken links.</li>
+      <li>URL Seen? discovers most of the remaining links were already visited; only the handful of brand-new article URLs pass.</li>
+      <li>Those new URLs enter the Frontier and are recorded in URL Storage. The loop begins again, roughly 400 times a second on average, up to 800 at peak.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A web crawler is a breadth-first traversal of the web graph, disciplined by a Frontier that enforces priority and politeness, and by "Seen?" filters that stop it from repeating itself.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a vast library expedition. The seed URLs are the first few shelves you are told to start from. The URL Frontier is the expedition's master to-do board, sorted so rare manuscripts (high-priority pages) are fetched first, and split into one lane per library building (host) so no single librarian is overwhelmed. The downloader couriers carry the books back; the Content Parser is the conservator who rejects crumbling volumes; Content Seen? is the archivist who stamps each book's fingerprint (hash) and refuses a second copy. The URL Extractor reads each book's bibliography for new titles, and URL Seen? is the catalogue that says "we already have that one."</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">1B pages/month = 400 QPS (peak 800)</span><span class="beacon-def">The volume demands many parallel downloaders on distributed servers.</span></div>
+    <div class="beacon"><span class="beacon-term">30 PB over 5 years</span><span class="beacon-def">Storage is disk-first; only popular content stays in memory.</span></div>
+    <div class="beacon"><span class="beacon-term">BFS, not DFS</span><span class="beacon-def">The web is too deep for depth-first; BFS explores level by level.</span></div>
+    <div class="beacon"><span class="beacon-term">Plain BFS ignores importance</span><span class="beacon-def">Signals that a prioritizer is needed on top of the FIFO queue.</span></div>
+    <div class="beacon"><span class="beacon-term">URL Frontier</span><span class="beacon-def">The scheduling brain: priority, politeness and freshness all live here.</span></div>
+    <div class="beacon"><span class="beacon-term">Front queues (f1..fn)</span><span class="beacon-def">Priority lanes; the selector picks high-priority lanes more often.</span></div>
+    <div class="beacon"><span class="beacon-term">Back queues (b1..bn)</span><span class="beacon-def">Politeness lanes; one host per queue, one worker per queue.</span></div>
+    <div class="beacon"><span class="beacon-term">Hash comparison</span><span class="beacon-def">Duplicate content is caught by comparing page fingerprints, not full text.</span></div>
+    <div class="beacon"><span class="beacon-term">URL Seen?</span><span class="beacon-def">Visited-URL memory; prevents re-downloading and infinite loops.</span></div>
+    <div class="beacon"><span class="beacon-term">robots.txt</span><span class="beacon-def">The site owner's rules; the downloader must obey them.</span></div>
+    <div class="beacon"><span class="beacon-term">Spider trap</span><span class="beacon-def">An infinite URL maze; defended with limits such as maximum URL length.</span></div>
+    <div class="beacon"><span class="beacon-term">Consistent hashing</span><span class="beacon-def">Spreads crawl load across servers so they can be added or removed smoothly.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">If you only have time for a few deep dives, spend them here: the Frontier's two queue layers are the signature idea of this chapter, and deduplication plus robustness are what interviewers probe next.</p>
+
+  <div class="drill">
+    <h4>Politeness: the back queues</h4>
+    <p>A naive crawler pulls URLs off one big FIFO queue. Because pages link heavily to their own site, that queue fills with long runs of URLs from the same host, and a fleet of workers would fire them all at once. To the website, that looks like a denial-of-service attack.</p>
+    <p>The fix is to guarantee <strong>one request per host at a time</strong>, with a delay between downloads. The trick is structural: give each host its own FIFO queue, and give each queue exactly one worker thread. A single worker is naturally sequential, so the host can never receive two parallel requests from you.</p>
+    <figure class="guide-fig"><img src="09.%20Web%20Crawler/images/politeness.png" alt="Politeness design with queue router, mapping table, back queues b1 to bn, queue selector and worker threads"><figcaption>Follow a URL left to right: the queue router consults the mapping table to find its host's queue (b1..bn), and the queue selector ties each queue to one worker thread. One host, one lane, one worker.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>Queue router</strong> looks at the URL's hostname.</li>
+      <li><strong>Mapping table</strong> answers "which queue owns this host?"</li>
+      <li>The URL is appended to that host's <strong>back queue</strong>, so each queue holds one host only.</li>
+      <li><strong>Queue selector</strong> hands each queue to its assigned <strong>worker thread</strong>.</li>
+      <li>The worker downloads sequentially, pausing between tasks.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> Saying "add a rate limiter" without structure. The point is that politeness comes for free from the host-to-queue-to-single-worker mapping; you do not need global coordination to stop two workers hitting the same host.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Priority: the front queues</h4>
+    <p>Not every page is equal. A forum post with no inbound links is far less valuable than a major news homepage. Plain BFS treats them the same, so the crawler would waste its 400 pages a second on junk.</p>
+    <p>The Prioritizer takes each URL and computes a priority (for example from PageRank or how often the page changes). URLs are then dropped into front queues f1..fn, each with an assigned priority. A queue selector randomly chooses a front queue, but with a bias towards high-priority ones, so important pages move faster while low-priority pages still trickle through.</p>
+    <figure class="guide-fig"><img src="09.%20Web%20Crawler/images/prioritizer.png" alt="Prioritizer feeding front queues f1 to fn with a biased queue selector"><figcaption>The prioritizer sorts URLs into priority lanes. Notice the selector is biased random, not strict order, so low lanes are not starved forever.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Layer</th><th>Job</th><th>Organised by</th><th>Selector behaviour</th></tr></thead>
+      <tbody>
+        <tr><td>Front queues</td><td>Prioritization</td><td>Importance score</td><td>Random, biased towards high priority</td></tr>
+        <tr><td>Back queues</td><td>Politeness</td><td>Hostname</td><td>Each queue bound to one worker</td></tr>
+      </tbody>
+    </table>
+    <p>Layered together, URLs flow front (what matters most) then back (who can safely be asked). A third concern, <strong>freshness</strong>, feeds URLs back in for recrawl based on update history or importance, which covers the "track new and updated pages" requirement.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Mixing up the two layers. Front = priority, back = politeness. A memorable hook: you decide <strong>what</strong> first (front), then <strong>where</strong> it can be sent (back).</div>
+  </div>
+
+  <div class="drill">
+    <h4>Deduplication and problematic content</h4>
+    <p>The web repeats itself constantly: mirrored pages, the same article under several URLs, and links pointing back to pages you already have. There are two separate guards, and they catch different things.</p>
+    <table class="compare">
+      <thead><tr><th>Guard</th><th>Question it answers</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Content Seen?</td><td>Have I already stored this exact content, maybe under a different URL?</td><td>Hash the page and compare with stored hashes</td></tr>
+        <tr><td>URL Seen?</td><td>Have I already visited or queued this URL?</td><td>Look it up in URL Storage</td></tr>
+      </tbody>
+    </table>
+    <p>A hash turns a whole page into a short fingerprint. Comparing fingerprints is fast, whereas comparing two full HTML documents character by character across billions of pages would be hopeless.</p>
+    <p>Beyond duplicates, watch for <strong>spider traps</strong> (infinitely deep URL structures, defended with URL length limits) and <strong>data noise</strong> such as ads or spam, which is filtered out as irrelevant.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Assuming URL Seen? makes Content Seen? redundant. Two different URLs can serve identical content; only the content hash catches that.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Downloader performance, robustness and extensibility</h4>
+    <p>At 800 QPS peak, small inefficiencies multiply. The downloader relies on four optimizations: distribute crawling across many servers; keep a <strong>DNS cache</strong> so every URL on a known host does not trigger a fresh lookup; place crawl servers close to the sites they crawl; and use a <strong>short timeout</strong> so one slow server cannot stall a worker.</p>
+    <p>Robustness comes from consistent hashing to spread load across downloaders, careful error handling so one bad page cannot crash the system, and data validation to protect content integrity.</p>
+    <figure class="guide-fig"><img src="09.%20Web%20Crawler/images/extensibility.png" alt="Crawler architecture with plug-in modules such as PNG downloader and web monitor"><figcaption>Extensibility: new modules (a PNG downloader, a web monitor for copyright) plug into the pipeline beside the existing stations rather than forcing a rewrite.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>DNS caching and short timeouts keep workers busy; geo-distribution cuts download latency; plug-in modules add new content types cheaply.</p></div>
+      <div class="con"><strong>Costs</strong><p>A short timeout may abandon slow but legitimate pages; many distributed servers mean more coordination and more places for failures to hide.</p></div>
+    </div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Cover the answer, write your own in the margin with your stylus, then tap to check.</p>
+  <details class="qa"><summary>Why does the crawler use BFS rather than DFS, and what is BFS still missing?</summary><div class="qa-answer"><p>The web graph can be extremely deep, so DFS could disappear down one site for a very long time. BFS explores level by level. But plain BFS treats every URL as equally important, which is why the Frontier adds a prioritizer.</p></div></details>
+  <details class="qa"><summary>How does the back-queue design guarantee only one request per host at a time?</summary><div class="qa-answer"><p>The mapping table assigns each host to a single back queue, and each queue is served by exactly one worker thread. Because one worker downloads sequentially, and can pause between tasks, a host never receives parallel requests from the crawler.</p></div></details>
+  <details class="qa"><summary>Compare front queues and back queues.</summary><div class="qa-answer"><p>Front queues handle priority: URLs are sorted by importance and a biased random selector favours higher-priority lanes. Back queues handle politeness: URLs are sorted by host and each lane is bound to one worker.</p></div></details>
+  <details class="qa"><summary>What happens if you remove the Content Seen? check but keep URL Seen?</summary><div class="qa-answer"><p>The crawler would still avoid revisiting the same URL, but it would store identical pages reached through different URLs. That wastes storage in a system already budgeting about 30 PB over five years, and pollutes the index with duplicates.</p></div></details>
+  <details class="qa"><summary>What is a spider trap and how do you defend against it?</summary><div class="qa-answer"><p>A spider trap is a URL structure that generates effectively infinite new links, keeping the crawler looping forever. One defence from the notes is a maximum URL length, cutting off absurdly long, auto-generated paths.</p></div></details>
+  <details class="qa"><summary>Name the four downloader performance optimizations and what each protects.</summary><div class="qa-answer"><p>Distributed crawling (throughput), a DNS cache (avoids repeated slow lookups), geographically distributed crawl servers (lower latency to target sites), and short timeouts (stops unresponsive servers from tying up workers).</p></div></details>
+</div>

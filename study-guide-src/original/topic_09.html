@@ -1,0 +1,164 @@
+<h3>Introduction</h3>
+<p>A <strong>web crawler</strong>, also known as a spider or robot, is used to discover and collect web content, such as web pages, images, and videos. This chapter focuses on designing a scalable web crawler for <strong>search engine indexing</strong>.</p>
+
+<h4>Applications of Web Crawlers</h4>
+<ol>
+  <li><strong>Search Engine Indexing:</strong> Collect web pages to create searchable indexes (e.g., Googlebot).</li>
+  <li><strong>Web Archiving:</strong> Preserve web data for future use (e.g., US Library of Congress).</li>
+  <li><strong>Web Mining:</strong> Extract knowledge from web data (e.g., financial analysis of shareholder reports).</li>
+  <li><strong>Web Monitoring:</strong> Detect copyright or trademark infringements.</li>
+</ol>
+
+<h4>Design Challenges</h4>
+<p>A good web crawler must address:</p>
+<ul>
+  <li><strong>Scalability:</strong> Handle billions of pages using parallelization.</li>
+  <li><strong>Robustness:</strong> Manage bad HTML, crashes, and malicious links.</li>
+  <li><strong>Politeness:</strong> Avoid overwhelming servers with too many requests.</li>
+  <li><strong>Extensibility:</strong> Support new content types with minimal changes.</li>
+</ul>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Requirements</h4>
+<ol>
+  <li>Crawl <strong>1 billion web pages per month</strong> (400 pages/second, peak 800 QPS).</li>
+  <li>Collect <strong>HTML-only content</strong>.</li>
+  <li>Track new and updated pages.</li>
+  <li>Ignore duplicate content.</li>
+  <li>Store crawled data for <strong>5 years</strong>, requiring ~30 PB of storage.</li>
+</ol>
+
+<h3>Step 2: High-Level Design</h3>
+<h4>Components</h4>
+<img class="orig-img" src="09.%20Web%20Crawler/images/web-crawler-architecture.png" alt="Web Crawler Architecture">
+<ol>
+  <li><strong>Seed URLs:</strong> Starting points for the crawler.
+    <ul>
+      <li>Need to selective as a good starting point that a crawler can utilize to traverse as many links as possible.</li>
+      <li>Can be based on locality based on different popular website or based on topics.</li>
+      <li>Strategies: Categorize by locality or topic (e.g., sports, healthcare).</li>
+    </ul>
+  </li>
+  <li><strong>URL Frontier:</strong> Stores URLs to be downloaded.
+    <ul><li>Implemented as a <strong>FIFO queue</strong>.</li></ul>
+  </li>
+  <li><strong>HTML Downloader:</strong> Downloads web pages from URLs provided by the URL Frontier.</li>
+  <li><strong>DNS Resolver:</strong> Converts URLs to IP addresses.</li>
+  <li><strong>Content Parser:</strong> Validates and parses web pages.
+    <ul><li>Discards malformed pages.</li></ul>
+  </li>
+  <li><strong>Content Seen?:</strong> Checks for duplicate content using hash comparisons (compare the hash values of the two web pages).</li>
+  <li><strong>Content Storage:</strong> Stores HTML pages on disk (popular content in memory to reduce latency).</li>
+  <li><strong>URL Extractor:</strong> Extracts new links from parsed pages.</li>
+  <li><strong>URL Filter:</strong> Excludes blacklisted or erroneous URLs.</li>
+  <li><strong>URL Seen?</strong> Tracks visited URLs to avoid duplication.</li>
+  <li><strong>URL Storage:</strong> Stores already visited URLs.</li>
+</ol>
+
+<h4>Workflow</h4>
+<ol>
+  <li>Add <strong>Seed URLs</strong> to the URL Frontier.</li>
+  <li><strong>HTML Downloader</strong> fetches URLs and resolves their IPs via the DNS Resolver.</li>
+  <li><strong>Content Parser</strong> validates and passes content to the "Content Seen?" component.</li>
+  <li>If the content is new, extract links via the <strong>URL Extractor</strong>.</li>
+  <li>Filter and add unique links to the URL Frontier.</li>
+</ol>
+
+<h3>Step 3: Deep Dive into Key Components</h3>
+<h4>DFS/BFS</h4>
+<ul>
+  <li>The web can be though of as a directed graph where web pages are nodes and hyperlinks (URLs) as edges.</li>
+  <li>BFS is usually used for graph traversal as the depth can be be very deep thus DFS is not ideal.</li>
+  <li>Standard BFS does not take the priority of a URL into consideration, not every page has the same level of quality and importance.</li>
+</ul>
+
+<h4>URL Frontier</h4>
+<ul>
+  <li><strong>Politeness:</strong>
+    <ul>
+      <li>Ensure only one request per host at a time. Add a dealy b/w two download tasks.</li>
+      <li>Use a mapping from hostnames to queues and worker (download) threads.</li>
+      <li>Each downloader thread has a separate FIFO queue and only downloads URLs from that queue.</li>
+    </ul>
+  </li>
+</ul>
+<img class="orig-img" src="09.%20Web%20Crawler/images/politeness.png" alt="Politeness">
+<ul>
+  <li>
+    <ul>
+      <li><strong>Queue router:</strong> Ensures that each queue (b1, b2, &hellip; bn) only contains URLs from the same host.</li>
+      <li><strong>Mapping table:</strong> It maps each host to a queue.</li>
+      <li><strong>Queue selector:</strong> Each worker thread is mapped to a FIFO queue, and it only downloads URLs from that queue. The queue selection logic is done by the Queue selector.</li>
+      <li><strong>Worker thread 1 to N.</strong> A worker thread downloads web pages sequentially from the same host. A delay can be added between two download tasks.</li>
+    </ul>
+  </li>
+  <li><strong>Priority:</strong>
+    <ul>
+      <li>Assign higher priority to important pages (e.g., by PageRank or update frequency).</li>
+    </ul>
+  </li>
+</ul>
+<img class="orig-img" src="09.%20Web%20Crawler/images/prioritizer.png" alt="Politeness">
+<ul>
+  <li>
+    <ul>
+      <li><strong>Prioritizer:</strong> It takes URLs as input and computes the priorities.</li>
+      <li><strong>Queue f1 to fn:</strong> Each queue has an assigned priority. Queues with high priority are selected with higher probability.</li>
+      <li><strong>Queue selector:</strong> Randomly choose a queue with a bias towards queues with higher priority.</li>
+      <li><strong>Front queues:</strong> manage prioritization</li>
+      <li><strong>Back queues:</strong> manage politeness</li>
+    </ul>
+  </li>
+  <li><strong>Freshness:</strong> Recrawl based on update history or importance.</li>
+</ul>
+
+<h4>HTML Downloader</h4>
+<ul>
+  <li><strong>Robots.txt Compliance:</strong> Respect rules in robots.txt files.</li>
+  <li><strong>Performance Optimizations:</strong>
+    <ol>
+      <li>Distributed crawling using multiple servers.</li>
+      <li>Use a <strong>DNS cache</strong> to avoid repeated lookups.</li>
+      <li>Geographically distribute crawl servers for faster downloads.</li>
+      <li>Use a short timeout to avoid slow or unresponsive servers.</li>
+    </ol>
+  </li>
+</ul>
+
+<h4>Robustness</h4>
+<ol>
+  <li><strong>Consistent Hashing:</strong> Distribute load among servers effectively.</li>
+  <li><strong>Error Handling:</strong> Prevent system crashes from exceptions.</li>
+  <li><strong>Data Validation:</strong> Ensure content integrity.</li>
+</ol>
+
+<h4>Extensibility</h4>
+<ul>
+  <li>Add modules for new content types (e.g., PNG downloader, web monitor).</li>
+  <li>Example: Plug in a module to monitor web content for copyright violations.</li>
+</ul>
+<img class="orig-img" src="09.%20Web%20Crawler/images/extensibility.png" alt="Politeness">
+
+<h4>Avoiding Problematic Content</h4>
+<ol>
+  <li><strong>Duplicate Content:</strong> Detect using hash comparisons.</li>
+  <li><strong>Spider Traps:</strong> Avoid infinite loops with techniques like URL length limits.</li>
+  <li><strong>Data Noise:</strong> Filter irrelevant content like ads or spam.</li>
+</ol>
+
+<h3>Step 4: Wrap Up</h3>
+<h4>Key Takeaways</h4>
+<ol>
+  <li>Web crawlers must balance scalability, robustness, politeness, and extensibility.</li>
+  <li><strong>Politeness</strong> prevents overloading servers, while <strong>priority</strong> ensures important pages are crawled first.</li>
+  <li>Efficient storage and error handling are crucial for handling large-scale crawling.</li>
+</ol>
+
+<h4>Additional Considerations</h4>
+<ul>
+  <li><strong>Server-Side Rendering:</strong> Handle dynamic content generated by JavaScript or AJAX.</li>
+  <li><strong>Anti-Spam Measures:</strong> Exclude low-quality or irrelevant pages.</li>
+  <li><strong>Database Sharding:</strong> Scale the data layer using replication and sharding.</li>
+  <li><strong>Horizontal Scaling:</strong> Use stateless servers to scale crawl jobs efficiently.</li>
+  <li><strong>Analytics:</strong> Collect and analyze data for insights.</li>
+</ul>

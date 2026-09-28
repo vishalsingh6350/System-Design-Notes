@@ -1,0 +1,201 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>On a single database, giving every new row an ID is trivial: <code>auto_increment</code> hands out 1, 2, 3 like a deli-counter ticket roll. Now picture that deli with dozens of counters in several cities, all serving customers at once, and a rule that no two tickets may ever share a number &mdash; and that the numbers must roughly tell you who arrived first. Passing one ticket roll around is far too slow; letting each counter print its own risks duplicates. This chapter designs a generator that produces over 10,000 unique, time-sortable, 64-bit numeric IDs per second, with no central ticket roll to become a bottleneck.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The chapter is a requirements checklist followed by four candidate designs, each tested against that checklist. Snowflake is the winner, so it is the biggest hub; the other three are useful mainly as foils that show why each requirement matters.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Requirements</span> <span class="why">— the scorecard every design is judged against</span>
+      <ul>
+        <li>Unique and numeric, fits in 64 bits</li>
+        <li>Ordered by date (increasing with time, but not strictly +1)</li>
+        <li>Over 10,000 IDs per second
+          <ul><li><span class="peripheral">Why plain auto_increment fails: scalability and synchronisation in distributed setups</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Rejected designs</span> <span class="why">— each fails at least one requirement, which teaches you the requirement</span>
+      <ul>
+        <li>Multi-master replication: auto_increment by +k for k servers
+          <ul><li><span class="peripheral">Hard across data centres; not time-ordered; painful when servers change</span></li></ul>
+        </li>
+        <li>UUID: 128-bit, generated independently
+          <ul><li><span class="peripheral">No coordination, scales easily &mdash; but too long, not time-sortable, may be non-numeric</span></li></ul>
+        </li>
+        <li>Ticket server: one central DB hands out numbers
+          <ul><li><span class="peripheral">Simple, numeric &mdash; but a single point of failure</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Twitter Snowflake bit layout</span> <span class="why">— the chosen design: split 64 bits into meaningful sections</span>
+      <ul>
+        <li>1 sign bit + 41 timestamp + 5 datacenter + 5 machine + 12 sequence</li>
+        <li>Timestamp: milliseconds since a custom epoch (Twitter default 1288834974657)
+          <ul><li><span class="peripheral">Epoch = Nov 04, 2010, 01:42:54 UTC</span></li></ul>
+        </li>
+        <li>Sequence: up to 4096 IDs per millisecond per machine, reset every millisecond</li>
+      </ul>
+    </li>
+    <li><span class="hub">Operational concerns</span> <span class="why">— what can still go wrong after the design is chosen</span>
+      <ul>
+        <li>Clock synchronisation via NTP</li>
+        <li>Section-length tuning for the use case</li>
+        <li>High availability: redundancy and failover</li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Requirements are the root: without them you cannot say why UUID or a ticket server loses. The rejected designs each expose one tension (coordination vs uniqueness, size vs independence, simplicity vs single point of failure). Snowflake resolves all three by baking time, location and a per-millisecond counter into the bits, and the operational concerns are the fine print on that bargain.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Inside a Snowflake generator, an ID is assembled field by field. Treat each field as a box that contributes a slice of the final 64-bit number.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Requirement filter</h4>
+      <p><strong>Input:</strong> candidate designs (multi-master, UUID, ticket server, Snowflake).</p>
+      <p><strong>Output:</strong> Snowflake, the only one that is 64-bit, numeric, time-ordered, decentralised and fast.</p>
+      <p class="io-story">A sieve: each requirement shakes out one contender until only one is left in the pan.</p>
+      <p class="io-arrow">&rarr; feeds into: the bit layout</p>
+    </div>
+    <div class="io-block">
+      <h4>Timestamp section (41 bits)</h4>
+      <p><strong>Input:</strong> the machine clock in milliseconds, minus the custom epoch.</p>
+      <p><strong>Output:</strong> the high-order bits of the ID.</p>
+      <p class="io-story">Because time sits in the most significant bits, a later ID is numerically bigger &mdash; sorting by ID is sorting by time.</p>
+      <p class="io-arrow">&rarr; feeds into: the assembled ID</p>
+    </div>
+    <div class="io-block">
+      <h4>Datacenter ID + machine ID (5 + 5 bits)</h4>
+      <p><strong>Input:</strong> fixed identifiers chosen when the machine starts.</p>
+      <p><strong>Output:</strong> the middle bits, unique per generator (up to 32 &times; 32 generators).</p>
+      <p class="io-story">A return address stamped on every ticket. Two machines printing in the same millisecond still cannot collide, because their addresses differ.</p>
+      <p class="io-arrow">&rarr; feeds into: the assembled ID</p>
+    </div>
+    <div class="io-block">
+      <h4>Sequence number (12 bits)</h4>
+      <p><strong>Input:</strong> how many IDs this machine already issued in the current millisecond.</p>
+      <p><strong>Output:</strong> the low-order bits, 0 to 4095, reset to 0 each new millisecond.</p>
+      <p class="io-story">A tally counter clicked for every ticket within the same tick of the clock, wiped clean when the clock ticks over.</p>
+      <p class="io-arrow">&rarr; feeds into: the assembled ID</p>
+    </div>
+    <div class="io-block">
+      <h4>Clock sync (NTP) and HA</h4>
+      <p><strong>Input:</strong> drift between machine clocks; generator failures.</p>
+      <p><strong>Output:</strong> clocks kept close together; generators backed by redundancy and failover.</p>
+      <p class="io-story">The whole scheme trusts the clocks, so NTP is the metronome keeping every counter in rhythm.</p>
+      <p class="io-arrow">&rarr; feeds into: IDs that stay correctly ordered across machines</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one ID</h4>
+    <ol class="journey-steps">
+      <li>A web server needs a new ID for a freshly created record. It asks its local Snowflake generator &mdash; no network round-trip to a central server.</li>
+      <li>The generator reads the current time and subtracts Twitter's epoch <code>1288834974657</code>. In the notes' example the result is <code>297616116568</code> milliseconds.</li>
+      <li>That number fills the 41 timestamp bits, right after the sign bit, which is always 0.</li>
+      <li>Next come the datacenter bits <code>01010</code> (datacenter 10) and the machine bits <code>01100</code> (machine 12), configured when the generator started.</li>
+      <li>This is the first ID this machine has issued in that millisecond, so the 12 sequence bits are all zeros.</li>
+      <li>The fields are concatenated into one 64-bit number and returned.</li>
+      <li>Reading it back: take the timestamp bits, convert to decimal (297616116568), add the epoch to get 1586451091225, and convert milliseconds to UTC &mdash; Apr 09 2020 16:51:31 UTC. The ID literally carries its birth time.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Generate unique, date-sortable, 64-bit numeric IDs at over 10,000 per second across many machines without any central coordinator, by encoding time, location and a per-millisecond counter directly into the bits.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine every ID as a postmarked envelope. The big date-and-time stamp across the front is the 41-bit timestamp, so stacking envelopes by postmark sorts them by when they were sent. Below it is the post office's region code and branch number &mdash; the 5-bit datacenter ID and 5-bit machine ID &mdash; so two branches stamping at the same instant still produce different envelopes. In the corner is a little counter the clerk clicks for each envelope within the same millisecond &mdash; the 12-bit sequence &mdash; reset at every tick. No branch ever phones head office for permission, which is why there is no single point of failure; the only shared thing is the clock on the wall, kept in step by NTP.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">64 bits</span><span class="beacon-def">The hard size limit; instantly rules out 128-bit UUIDs.</span></div>
+    <div class="beacon"><span class="beacon-term">Sortable by date</span><span class="beacon-def">Rules out UUID and multi-master; forces time into the high bits.</span></div>
+    <div class="beacon"><span class="beacon-term">10,000+ IDs/sec</span><span class="beacon-def">The throughput bar; a single ticket server becomes the bottleneck and SPOF.</span></div>
+    <div class="beacon"><span class="beacon-term">Multi-master (+k)</span><span class="beacon-def">Each DB increments by k (e.g. 1,3,5 and 2,4,6); unique but not time-ordered and awkward to resize.</span></div>
+    <div class="beacon"><span class="beacon-term">UUID (128-bit)</span><span class="beacon-def">Coordination-free and easy to scale, but too long, not time-sortable, may be non-numeric.</span></div>
+    <div class="beacon"><span class="beacon-term">Ticket server</span><span class="beacon-def">Centralised auto_increment; simple and numeric, but a single point of failure.</span></div>
+    <div class="beacon"><span class="beacon-term">1 | 41 | 5 | 5 | 12</span><span class="beacon-def">Sign, timestamp, datacenter, machine, sequence &mdash; the Snowflake layout to draw from memory.</span></div>
+    <div class="beacon"><span class="beacon-term">Custom epoch 1288834974657</span><span class="beacon-def">Twitter's zero point (Nov 04, 2010, 01:42:54 UTC); timestamps count from here, not from 1970.</span></div>
+    <div class="beacon"><span class="beacon-term">2^5 = 32</span><span class="beacon-def">Maximum datacenters, and maximum machines per datacenter.</span></div>
+    <div class="beacon"><span class="beacon-term">2^12 = 4096</span><span class="beacon-def">IDs per machine per millisecond; the sequence resets to 0 each millisecond.</span></div>
+    <div class="beacon"><span class="beacon-term">NTP</span><span class="beacon-def">Network Time Protocol keeps clocks close, since ordering depends on synchronised time.</span></div>
+    <div class="beacon"><span class="beacon-term">Section-length tuning</span><span class="beacon-def">Trade sequence bits for timestamp bits (or vice versa) to fit the workload.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers almost always ask you to draw the Snowflake layout and defend it against the alternatives. Nail the bit budget, the comparison table, and the clock caveat, and you have covered most of the chapter's yield.</p>
+
+  <div class="drill">
+    <h4>The Snowflake bit budget, field by field</h4>
+    <p>Sixty-four bits, five sections. The leading sign bit is always 0, keeping the number positive. The next 41 bits are milliseconds since the custom epoch &mdash; placing time in the most significant bits is what makes larger IDs later IDs. For scale, 2^41 milliseconds works out to roughly 69 years of headroom from the epoch.</p>
+    <p>Then 5 bits of datacenter ID and 5 bits of machine ID: 32 datacenters, each with up to 32 machines. Finally 12 bits of sequence: up to 4096 IDs per machine within one millisecond. That is far beyond the 10,000 per second requirement even on a single machine.</p>
+    <div class="anim" data-anim="snowflake"></div>
+    <figure class="guide-fig"><img src="07.%20Unique-Id%20Generator/images/twitter-snowflake.png" alt="Snowflake ID layout: 1 bit sign, 41 bits timestamp, 5 bits datacenter ID, 5 bits machine ID, 12 bits sequence number"><figcaption>The layout to memorise: 1 | 41 | 5 | 5 | 12. Notice how most of the budget goes to time &mdash; that is what buys sortability.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Section</th><th>Bits</th><th>Capacity</th><th>Set when</th></tr></thead>
+      <tbody>
+        <tr><td>Sign</td><td>1</td><td>Always 0</td><td>Fixed</td></tr>
+        <tr><td>Timestamp</td><td>41</td><td>ms since custom epoch</td><td>Every ID</td></tr>
+        <tr><td>Datacenter ID</td><td>5</td><td>32 datacenters</td><td>Startup</td></tr>
+        <tr><td>Machine ID</td><td>5</td><td>32 machines per datacenter</td><td>Startup</td></tr>
+        <tr><td>Sequence</td><td>12</td><td>4096 per ms, resets each ms</td><td>Every ID</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>Decoding an ID back into a timestamp</h4>
+    <p>Because the timestamp is embedded, any Snowflake ID can be read back into its creation time. Slice out the 41 timestamp bits, convert them to decimal, add the epoch, and convert the resulting milliseconds to UTC.</p>
+    <figure class="guide-fig"><img src="07.%20Unique-Id%20Generator/images/snowflake-id-breakdown.png" alt="Snowflake ID converted from binary timestamp bits to Apr 09 2020 16:51:31 UTC"><figcaption>Green bits (timestamp) &rarr; 297616116568 &rarr; + epoch 1288834974657 = 1586451091225 &rarr; Apr 09 2020 16:51:31 UTC. The magenta and yellow groups are datacenter and machine IDs; the blue zeros are the sequence.</figcaption></figure>
+    <ol class="steps">
+      <li>Take the 41 bits after the sign bit.</li>
+      <li>Convert binary to decimal: 297616116568.</li>
+      <li>Add Twitter's epoch 1288834974657: 1586451091225.</li>
+      <li>Interpret as milliseconds since the Unix epoch and convert to UTC: Apr 09 2020 16:51:31.</li>
+    </ol>
+  </div>
+
+  <div class="drill">
+    <h4>Why the other three designs lose</h4>
+    <p>Multi-master replication uses each database's auto_increment but steps by k, where k is the number of servers &mdash; with two MySQL servers, one yields 1, 3, 5 and the other 2, 4, 6. Unique, yes, but IDs from different servers do not increase with time, it is hard to stretch across data centres, and changing k when servers join or leave is painful.</p>
+    <p>UUIDs are the opposite extreme: every server mints 128-bit IDs with no coordination at all. Superb for scaling, but they blow the 64-bit budget and do not sort by time. A ticket server centralises one auto_increment counter: simple and numeric, but every ID depends on one box, which is a single point of failure.</p>
+    <figure class="guide-fig"><img src="07.%20Unique-Id%20Generator/images/multi-master.png" alt="Two MySQL servers generating odd and even IDs for web servers"><figcaption>Multi-master with k = 2: one MySQL hands out odd IDs, the other even. If the "odd" server is busier, a newer odd ID can be smaller than an older even one &mdash; order by time breaks.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Design</th><th>Fits 64-bit numeric</th><th>Time-sortable</th><th>No central SPOF</th><th>Main weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Multi-master</td><td>Yes</td><td>No</td><td>Yes</td><td>Hard to scale across DCs and resize</td></tr>
+        <tr><td>UUID</td><td>No (128-bit)</td><td>No</td><td>Yes</td><td>Too long, may be non-numeric</td></tr>
+        <tr><td>Ticket server</td><td>Yes</td><td>Increasing</td><td>No</td><td>Single point of failure</td></tr>
+        <tr><td>Snowflake</td><td>Yes</td><td>Yes</td><td>Yes</td><td>Depends on synchronised clocks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>The fine print: clocks, tuning, availability</h4>
+    <p>Snowflake quietly assumes every machine agrees on the time. If one clock drifts, its IDs can sort out of order relative to other machines. The notes' remedy is Network Time Protocol (NTP) to minimise drift.</p>
+    <p>The 41/5/5/12 split is a default, not a law. A workload with low concurrency but a need for a longer lifespan could shrink the sequence and grow the timestamp. And because every insert in the system needs an ID, the generator is mission-critical: build in redundancy and failover.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Decentralised, 64-bit, time-ordered, 4096 IDs per ms per machine, no coordination per ID.</p></div>
+      <div class="con"><strong>Costs</strong><p>Relies on clock sync; datacenter and machine IDs must be assigned uniquely; bit sizes lock in capacity limits.</p></div>
+    </div>
+    <div class="pitfall"><strong>Common trap:</strong> claiming IDs increase by exactly 1. The requirement is only that IDs increase with time; Snowflake IDs jump in large, uneven steps.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Draw the bit layout in the margin from memory, then answer each question before revealing.</p>
+  <details class="qa"><summary>Why is UUID rejected even though it needs no coordination?</summary><div class="qa-answer"><p>UUIDs are 128 bits, exceeding the 64-bit requirement, and they are not sortable by time and may be non-numeric. Easy scaling does not compensate for failing the size and ordering requirements.</p></div></details>
+  <details class="qa"><summary>What are the five Snowflake sections and their bit sizes?</summary><div class="qa-answer"><p>Sign bit (1, always 0), timestamp (41), datacenter ID (5), machine ID (5), sequence number (12). Total 64 bits.</p></div></details>
+  <details class="qa"><summary>What happens to the sequence number when the millisecond changes?</summary><div class="qa-answer"><p>It resets to 0. Within a single millisecond it counts up to 4095, allowing 4096 IDs per machine per millisecond.</p></div></details>
+  <details class="qa"><summary>Why does putting the timestamp in the high-order bits make IDs sortable by time?</summary><div class="qa-answer"><p>The most significant bits dominate numeric comparison. An ID created later has a larger timestamp, so it is numerically larger regardless of the lower datacenter, machine and sequence bits.</p></div></details>
+  <details class="qa"><summary>What goes wrong if machine clocks drift apart, and what is the fix?</summary><div class="qa-answer"><p>IDs from different machines may no longer reflect true creation order, since ordering depends on synchronised clocks. Use Network Time Protocol (NTP) to minimise drift.</p></div></details>
+  <details class="qa"><summary>Compare a ticket server and multi-master replication.</summary><div class="qa-answer"><p>A ticket server is one central auto_increment: simple and numeric but a single point of failure. Multi-master spreads the load with +k steps, avoiding one SPOF, but IDs are not time-ordered and resizing is hard.</p></div></details>
+  <details class="qa"><summary>How many distinct generators can the default Snowflake layout support?</summary><div class="qa-answer"><p>32 datacenters times 32 machines per datacenter, from 5 bits each (2^5 = 32).</p></div></details>
+</div>

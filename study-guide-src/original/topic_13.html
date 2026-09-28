@@ -1,0 +1,184 @@
+<h3>Introduction</h3>
+<p>Autocomplete, also known as typeahead or incremental search, provides real-time suggestions to users as they type in search boxes. The system must efficiently deliver top-k relevant and popular suggestions based on historical query data.</p>
+<h4>Key Features</h4>
+<ul>
+  <li>Suggest up to <strong>5 autocomplete results</strong>.</li>
+  <li>Based on <strong>query popularity</strong> (frequency).</li>
+  <li>Support only <strong>lowercase English characters</strong>.</li>
+  <li>Fast response time (&lt;100 ms) and scalable.</li>
+</ul>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Requirements</h4>
+<ol>
+  <li><strong>Real-Time Suggestions:</strong> Display relevant matches as the user types.</li>
+  <li><strong>Top-k Results:</strong> Return up to 5 results sorted by popularity.</li>
+  <li><strong>Scalability:</strong> Handle <strong>10 million DAU</strong> with a peak QPS of <strong>48,000</strong>.</li>
+  <li><strong>High Availability:</strong> Handle failures without system downtime.</li>
+  <li><strong>Data Growth:</strong> Support daily storage growth of <strong>0.4 GB</strong> for new query data.</li>
+</ol>
+
+<h3>Step 2: High-Level Design</h3>
+<p>At the high-level, the system is broken down into two services:</p>
+<ol>
+  <li><strong>Data Gathering Service:</strong>
+    <ul>
+      <li>Collects user queries and aggregates them for frequency analysis in real-time.</li>
+      <li>Real-time processing is not practical for large data sets; however, it is a good starting point</li>
+    </ul>
+  </li>
+  <li><strong>Query Service:</strong> Provides the top-k suggestions based on the user's input.</li>
+</ol>
+
+<h4>Data Gathering Service</h4>
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/data-gathering.png" alt="Data Gathering">
+<ul>
+  <li>Aggregates query data from analytics logs and updates the frequency table.</li>
+  <li>Processes historical data weekly to build a <strong>trie</strong> (prefix tree).</li>
+</ul>
+
+<h4>Query Service</h4>
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/frequency-table.png" alt="Frequency Table">
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/basic-search-suggestions.png" alt="Search Suggestions">
+<ul>
+  <li>Uses the frequency table from data gathering service.</li>
+  <li>Processes user input and retrieves top-k suggestions from the frequency table using a Trie.</li>
+  <li>Optimized for fast lookups using caching and efficient data structures.</li>
+  <li>For example when a user types "tw" in the search box, the following top 5 searched queries are displayed.</li>
+</ul>
+
+<h3>Step 3: Design Deep Dive</h3>
+<h4>Trie Data Structure</h4>
+<p>The <strong>trie</strong> is a tree-like data structure used to store and retrieve query strings efficiently.</p>
+<h4>Key Features</h4>
+<ol>
+  <li><strong>Compact Storage:</strong> Represents prefixes hierarchically to minimize redundancy.</li>
+  <li><strong>Frequency Information:</strong> Stores the popularity of queries at each node.</li>
+</ol>
+<p><strong>Steps to get top k most searched queries</strong></p>
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/trie-structure.png" alt="Trie Structure">
+<ul>
+  <li>Find the prefix</li>
+  <li>Traverse the subtree from prefix node to get all valid children</li>
+  <li>Sort the children and get top k</li>
+</ul>
+<p><strong>Optimizations:</strong></p>
+<ul>
+  <li>Cache top-k queries at each node to speed up retrieval and avoid traversing the whole trie.</li>
+</ul>
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/cached-trie.png" alt="Cached Trie">
+<ul>
+  <li>Limit prefix length to reduce search space as users rarely type a long search query (say 50).</li>
+</ul>
+
+<h4>Trie Operations</h4>
+<ol>
+  <li><strong>Create:</strong>
+    <ul>
+      <li>Built weekly using aggregated query data.</li>
+      <li>The source of data is from Analytics Log/DB.</li>
+    </ul>
+  </li>
+  <li><strong>Update:</strong> Rarely updated in real-time; weekly updates replace old data.</li>
+  <li><strong>Delete:</strong>
+    <img class="orig-img" src="13.%20Search%20Autocomplete/images/delete-kv.png" alt="Delete KV">
+    <ul>
+      <li>Filters remove unwanted or harmful suggestions (e.g., hate speech).</li>
+      <li>Having a filter layer gives us the flexibility of removing results based on different filter rules.</li>
+      <li>Unwanted suggestions are removed physically from the database asynchronically.</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Query Processing Flow</h4>
+<ol>
+  <li><strong>Prefix Search:</strong>
+    <ul>
+      <li>Identify the prefix node corresponding to the user's input.</li>
+      <li>Traverse the subtree to collect valid suggestions.</li>
+    </ul>
+  </li>
+  <li><strong>Top-k Sorting:</strong>
+    <ul><li>Cache top-k suggestions at each node to minimize sorting overhead.</li></ul>
+  </li>
+  <li><strong>Response Construction:</strong>
+    <ul><li>Construct results using cached data for fast response times.</li></ul>
+  </li>
+</ol>
+
+<h4>Optimizations</h4>
+<ol>
+  <li><strong>Cache at Each Node:</strong> Store the top-k queries to avoid redundant traversals.</li>
+  <li><strong>Limit Prefix Length:</strong> Cap prefix length to a small value (e.g., 50 characters) for faster lookups.</li>
+  <li><strong>AJAX Requests:</strong> Use lightweight asynchronous requests for real-time responses.</li>
+  <li><strong>Browser Caching:</strong> Save autocomplete results in the browser cache for frequently searched terms.</li>
+</ol>
+
+<h4>Data Gathering Pipeline</h4>
+<p>In the high-level design, whenever a user types a search query, data is updated in real-time. This approach is not practical.</p>
+<ul>
+  <li>Users may enter billions of queries per day. Updating the trie on every query is not feasible.</li>
+  <li>Top suggestions may not change much once the trie is built.</li>
+</ul>
+
+<h4>Updated Design</h4>
+<img class="orig-img" src="13.%20Search%20Autocomplete/images/data-gathering-flow.png" alt="Updated Data Gathering Flow">
+<ol>
+  <li><strong>Analytics Logs:</strong>
+    <ul>
+      <li>Stores raw query data as logs for weekly aggregation.</li>
+      <li>Logs are append-only and are not indexed</li>
+    </ul>
+  </li>
+  <li><strong>Aggregators:</strong>
+    <ul>
+      <li>Process logs into frequency tables, suitable for trie construction.</li>
+      <li>For real-time applications such as Twitter, aggregate data in a shorter time interval.</li>
+      <li>For other cases, aggregating data less frequently, say once per week is good enough.</li>
+    </ul>
+  </li>
+  <li><strong>Workers:</strong> Asynchronous servers rebuild the trie and store it in persistent storage.</li>
+  <li><strong>Storage Options:</strong>
+    <ul>
+      <li><strong>Trie Cache</strong>: Trie Cache is a distributed cache system that keeps trie in memory for fast read.</li>
+      <li><strong>Trie DB</strong>
+        <ol>
+          <li><strong>Document Store (e.g., MongoDB)</strong>: Since a new trie is built weekly, we can periodically take a snapshot of it, serialize it, and store the serialized data in the database like MongoDB</li>
+          <li><strong>Key-Value Store:</strong>
+            <ul>
+              <li>Maps prefixes to node data for fast access.</li>
+              <li>Every prefix in the trie is mapped to a key in a hash table.</li>
+              <li>Data on each trie node is mapped to a value in a hash table.</li>
+            </ul>
+            <img class="orig-img" src="13.%20Search%20Autocomplete/images/trie-db.png" alt="Trie DB">
+          </li>
+        </ol>
+      </li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Scalability</h4>
+<ol>
+  <li><strong>Sharding:</strong>
+    <ul>
+      <li>Distribute trie nodes across servers based on prefix ranges (e.g., <code>a-m</code>, <code>n-z</code>).</li>
+      <li>Further shard within prefixes to balance uneven distributions (e.g., <code>aa-ag</code>, <code>ah-an</code>).</li>
+    </ul>
+  </li>
+  <li><strong>Load Balancing:</strong>
+    <img class="orig-img" src="13.%20Search%20Autocomplete/images/sharding.png" alt="Sharding">
+    <ul><li>Use a shard map manager to route requests to the appropriate server.</li></ul>
+  </li>
+</ol>
+
+<h3>Step 4: Advanced Features</h3>
+<h4>Multi-Language Support</h4>
+<ol>
+  <li><strong>Unicode Characters:</strong> Use Unicode to support non-English languages.</li>
+  <li><strong>Country-Specific Tries:</strong> Build separate tries for different countries or regions.</li>
+</ol>
+<h4>Trending Queries</h4>
+<ul>
+  <li>Handle real-time events by dynamically updating trie nodes or weighting recent queries more heavily.</li>
+</ul>

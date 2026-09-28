@@ -1,0 +1,124 @@
+<h3>Introduction</h3>
+<p>This chapter explores the design and implementation of a rate limiter&mdash;a system component used to control traffic rates sent by clients or services. Rate limiters are crucial for preventing abuse, reducing costs, and ensuring the stability of server resources. Examples of their use include limiting posts, account creations, and reward claims.</p>
+
+<h3>Benefits of Rate Limiting</h3>
+<ul>
+<li><strong>Preventing DoS Attacks:</strong> Blocking excess calls to avoid resource starvation.</li>
+<li><strong>Cost Reduction:</strong> Limiting unnecessary requests to reduce server expenses.</li>
+<li><strong>Preventing Overloads:</strong> Filtering out excessive requests to stabilize server performance.</li>
+</ul>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Key Features</h4>
+<ul>
+<li>Server-side API rate limiter.</li>
+<li>Support for multiple throttle rules.</li>
+<li>Handle large-scale systems in distributed environments.</li>
+<li>Option for a standalone service or application-level code.</li>
+<li>Inform users when throttled.</li>
+</ul>
+
+<h4>Requirements</h4>
+<ul>
+<li>Accurate request throttling.</li>
+<li>Minimal latency.</li>
+<li>Low memory usage.</li>
+<li>Distributed capability.</li>
+<li>Clear exception handling.</li>
+<li>High fault tolerance.</li>
+</ul>
+
+<h3>Step 2: High-Level Design</h3>
+<h4>Placement Options</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/rate_limiter_architecture.png" alt="Rate Limiting Middleware Architecture">
+
+<ol>
+<li><strong>Client-Side Implementation:</strong> Unreliable due to potential misuse.</li>
+<li><strong>Server-Side Implementation:</strong> Preferred for control and reliability.</li>
+<li><strong>Middleware (API Gateway):</strong> A flexible option for integrated rate limiting.</li>
+</ol>
+
+<h4>Guidelines for Placement</h4>
+<ul>
+<li>Evaluate current tech stack and choose efficient options.</li>
+<li>Select appropriate algorithms based on business needs.</li>
+<li>Use an API gateway if microservices are employed.</li>
+<li>Opt for commercial solutions if resources are limited.</li>
+</ul>
+
+<h3>Step 3: Rate Limiting Algorithms</h3>
+
+<h4>1. Token Bucket</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/token-bucket.png" alt="Token Bucket Algorithm">
+<ul>
+<li><strong>Description:</strong> Tokens are added to a bucket at a fixed rate; each request consumes a token.</li>
+<li><strong>Parameters:</strong> Bucket size and refill rate.</li>
+<li><strong>Pros:</strong> Easy to implement, memory-efficient, supports traffic bursts.</li>
+<li><strong>Cons:</strong> Requires careful parameter tuning.</li>
+</ul>
+
+<h4>2. Leaking Bucket</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/leaking-bucket.png" alt="Leaking Bucket Algorithm">
+<ul>
+<li><strong>Description:</strong> Processes requests at a fixed rate using a FIFO queue.</li>
+<li><strong>Pros:</strong> Memory-efficient, stable outflow rate.</li>
+<li><strong>Cons:</strong> Traffic bursts may delay recent requests.</li>
+</ul>
+<p>Example: <a href="https://github.com/uber-go/ratelimit">https://github.com/uber-go/ratelimit</a></p>
+
+<h4>3. Fixed Window Counter</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/fixed-window-counter.png" alt="Fixed Window Counter">
+<ul>
+<li><strong>Description:</strong> Divides time into fixed intervals and uses counters to limit requests.</li>
+<li><strong>Pros:</strong> Simple, efficient for specific use cases.</li>
+<li><strong>Cons:</strong> Traffic spikes at window edges can exceed limits.</li>
+</ul>
+<p>Sudden burst of traffic at the edges of time windows could cause more requests than allowed quota to go through.</p>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/fixed-window-issue.png" alt="Fixed Window Issue">
+
+<h4>4. Sliding Window Log</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/sliding-window-log.png" alt="Sliding Window Log">
+<ul>
+<li><strong>Description:</strong> Tracks timestamps to allow a rolling time window.</li>
+<li><strong>Pros:</strong> Accurate rate limiting.</li>
+<li><strong>Cons:</strong> High memory consumption.</li>
+</ul>
+
+<h4>5. Sliding Window Counter</h4>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/sliding-window-counter.png" alt="Fixed Window Counter">
+<ul>
+<li><strong>Description:</strong> Combines fixed window and sliding log methods for smoothing spikes.</li>
+<li><strong>Pros:</strong> Memory-efficient, handles traffic bursts.</li>
+<li><strong>Cons:</strong> Approximation may not be perfectly strict.</li>
+</ul>
+
+<h3>High-Level Architecture</h3>
+<img class="orig-img" src="04.%20Rate%20Limiter/images/architecture.png" alt="Architecture">
+<ul>
+<li><strong>Data Storage:</strong> Use in-memory caching (e.g., Redis) for fast counter operations.</li>
+<li><strong>Steps:</strong>
+  <ol>
+    <li>Client sends request to middleware.</li>
+    <li>Middleware checks counters in Redis.</li>
+    <li>Request is processed or rejected based on limits.</li>
+  </ol>
+</li>
+</ul>
+
+<h3>Advanced Considerations</h3>
+<h4>Distributed Environments</h4>
+<ul>
+<li><strong>Challenges:</strong> Race conditions, synchronization issues.</li>
+<li><strong>Solutions:</strong> Use locks, Lua scripts, or sorted sets in Redis. Employ centralized data stores for synchronization.</li>
+</ul>
+
+<h4>Performance Optimizations</h4>
+<ul>
+<li>Multi-data center setups for reduced latency.</li>
+<li>Eventual consistency models for synchronization.</li>
+</ul>
+
+<h4>Monitoring</h4>
+<ul>
+<li>Regular analytics to ensure algorithm effectiveness and adjust rules as needed.</li>
+</ul>

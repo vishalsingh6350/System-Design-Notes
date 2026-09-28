@@ -1,0 +1,199 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>Someone pastes a monstrous Amazon product link &mdash; a tangle of <code>/dp/</code>, tracking parameters and referral codes &mdash; and gets back <code>tinyurl.com/qtj5opu</code>. Minutes later that tiny link is in a million tweets, and every tap has to bounce instantly to the right page. Now multiply: 100 million new short links every day, kept alive for 10 years, with ten clicks for every link created. The job looks like a toy, but it is really a high-volume dictionary that must mint unique seven-character keys forever and answer lookups at lightning speed.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">Two verbs drive the whole system: shorten (write) and redirect (read). Everything else either creates the short key, stores the mapping, or serves it fast. Read the hubs as layers from the outside in.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Requirements &amp; scale</span> <span class="why">— the numbers that size every other decision</span>
+      <ul>
+        <li>100 million URLs generated per day, supported for 10 years
+          <ul><li><span class="peripheral">365 billion records, about 365 TB</span></li></ul>
+        </li>
+        <li>10:1 read-to-write ratio: reads dominate</li>
+        <li>Short URLs unique and as short as possible</li>
+      </ul>
+    </li>
+    <li><span class="hub">API &amp; redirect semantics</span> <span class="why">— the contract with the outside world</span>
+      <ul>
+        <li><code>POST api/v1/data/shorten</code> with <code>{longUrl}</code> &rarr; shortURL</li>
+        <li><code>GET api/v1/shortUrl</code> &rarr; longURL for redirection</li>
+        <li>301 (permanent, browser caches) vs 302 (temporary, good for analytics)</li>
+      </ul>
+    </li>
+    <li><span class="hub">Short-key generation</span> <span class="why">— the heart of the design: turning a long URL into 7 characters</span>
+      <ul>
+        <li>Base 62 conversion of a unique ID
+          <ul><li><span class="peripheral">Characters [0-9, a-z, A-Z]; 7 chars &asymp; 3.5 trillion URLs</span></li></ul>
+        </li>
+        <li>Hash (CRC32, MD5, SHA-1) + collision resolution
+          <ul><li><span class="peripheral">Take first 7 characters; append a predefined string on collision; Bloom filter to check existence</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Storage &amp; serving</span> <span class="why">— keeping 365 billion mappings and returning them quickly</span>
+      <ul>
+        <li>Relational table: <code>id</code>, <code>shortURL</code>, <code>longURL</code></li>
+        <li>Cache in front of the database on the redirect path</li>
+        <li>Scaling: stateless web tier; DB replication and sharding
+          <ul><li><span class="peripheral">Rate limiter per IP; analytics on clicks, source, timestamps</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The requirements tell you the key must be about seven characters and the read path must be heavily optimised. Key generation is the central decision because it determines whether you need a unique ID generator (from the previous chapter) and whether collisions exist at all. Storage and caching then follow directly from the 10:1 read ratio.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Two pipelines share one table. The shortening pipeline writes a mapping once; the redirecting pipeline reads it many times. Trace the boxes in order.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Shorten API (POST)</h4>
+      <p><strong>Input:</strong> <code>{longUrl: longURLString}</code>.</p>
+      <p><strong>Output:</strong> a request to find or create a short key.</p>
+      <p class="io-story">The front counter where you hand over your unwieldy address and wait for a claim ticket.</p>
+      <p class="io-arrow">&rarr; feeds into: duplicate check</p>
+    </div>
+    <div class="io-block">
+      <h4>Duplicate check</h4>
+      <p><strong>Input:</strong> the longURL.</p>
+      <p><strong>Output:</strong> the existing shortURL if found; otherwise a signal to create a new one.</p>
+      <p class="io-story">Before printing a new ticket, the clerk checks whether this exact address already has one, so the same long URL is not stored twice.</p>
+      <p class="io-arrow">&rarr; feeds into: ID generator (if new)</p>
+    </div>
+    <div class="io-block">
+      <h4>Distributed unique ID generator</h4>
+      <p><strong>Input:</strong> a request for a fresh ID.</p>
+      <p><strong>Output:</strong> a globally unique number, e.g. <code>2009215674938</code>.</p>
+      <p class="io-story">The ticket roll. Because every number is unique, everything derived from it is unique too &mdash; no collisions to resolve.</p>
+      <p class="io-arrow">&rarr; feeds into: Base 62 encoder</p>
+    </div>
+    <div class="io-block">
+      <h4>Base 62 encoder</h4>
+      <p><strong>Input:</strong> the numeric ID.</p>
+      <p><strong>Output:</strong> a compact string such as <code>zn9edcu</code>.</p>
+      <p class="io-story">Rewrites a long decimal number using 62 symbols instead of 10, so it shrinks to a handful of characters &mdash; like writing a big number in a denser alphabet.</p>
+      <p class="io-arrow">&rarr; feeds into: database write</p>
+    </div>
+    <div class="io-block">
+      <h4>Relational database</h4>
+      <p><strong>Input:</strong> the row <code>&lt;id, shortURL, longURL&gt;</code>.</p>
+      <p><strong>Output:</strong> a durable mapping, replicated and sharded for scale.</p>
+      <p class="io-story">The master ledger of every claim ticket ever issued: 365 billion lines over 10 years.</p>
+      <p class="io-arrow">&rarr; feeds into: the cache and the redirect path</p>
+    </div>
+    <div class="io-block">
+      <h4>Redirect path (cache &rarr; DB &rarr; 301/302)</h4>
+      <p><strong>Input:</strong> <code>GET</code> on a shortURL.</p>
+      <p><strong>Output:</strong> an HTTP redirect whose <code>location</code> header is the longURL.</p>
+      <p class="io-story">The valet: hand over the ticket, the valet checks the nearby rack (cache) first, walks to the back lot (database) only if needed, then points you to your car.</p>
+      <p class="io-arrow">&rarr; feeds into: the user's browser landing on the long URL</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one click</h4>
+    <ol class="journey-steps">
+      <li>Earlier, someone POSTed <code>https://en.wikipedia.org/wiki/Systems_design</code> to <code>api/v1/data/shorten</code>. It was not in the database, so the ID generator issued <code>2009215674938</code>.</li>
+      <li>Base 62 turned that ID into <code>zn9edcu</code>, and the row <code>&lt;2009215674938, zn9edcu, https://en.wikipedia.org/wiki/Systems_design&gt;</code> was saved.</li>
+      <li>Now a reader taps <code>https://tinyurl.com/zn9edcu</code>. The browser sends a GET to the load balancer.</li>
+      <li>The load balancer forwards it to one of many stateless web servers.</li>
+      <li>The web server looks up <code>zn9edcu</code> in the cache. On a hit, it has the long URL immediately.</li>
+      <li>On a miss, it queries the database for the <code>&lt;shortURL, longURL&gt;</code> mapping (and can populate the cache for next time).</li>
+      <li>The server responds with a redirect whose location is the Wikipedia URL &mdash; 301 if you want browsers to cache it, 302 if you want every click to come back for analytics.</li>
+      <li>The browser follows the redirect and the reader lands on the article.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Map each long URL to a unique, as-short-as-possible key and serve a flood of redirects quickly, sized for 100 million new URLs a day over 10 years with reads outnumbering writes ten to one.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a giant coat check at a stadium. When you hand over a bulky coat (the long URL), the attendant takes the next number off a never-repeating ticket roll (the unique ID generator) and writes it in a compact code (Base 62), then records coat and code in the master ledger (the relational database). When you return with your ticket (the short URL click), the attendant first glances at the rack right behind the counter where popular coats hang (the cache) before trekking to the back rooms (the database). Hand over a "permanent" slip (301) and you will never need to visit the counter again for that coat; hand over a "temporary" slip (302) and you come back every time, which lets the manager count visits (analytics).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">100M/day &times; 10 years</span><span class="beacon-def">365 billion records, about 365 TB &mdash; the capacity every design choice must hold.</span></div>
+    <div class="beacon"><span class="beacon-term">10:1 read-to-write</span><span class="beacon-def">Redirects dominate, so cache the read path aggressively.</span></div>
+    <div class="beacon"><span class="beacon-term">POST api/v1/data/shorten</span><span class="beacon-def">Takes a longUrl, returns a shortURL &mdash; the write API.</span></div>
+    <div class="beacon"><span class="beacon-term">GET api/v1/shortUrl</span><span class="beacon-def">Returns the longURL to redirect to &mdash; the read API.</span></div>
+    <div class="beacon"><span class="beacon-term">301 redirect</span><span class="beacon-def">Permanent; the browser caches it, so repeat clicks skip your service (less load).</span></div>
+    <div class="beacon"><span class="beacon-term">302 redirect</span><span class="beacon-def">Temporary; every click reaches your service, which is useful for tracking clicks.</span></div>
+    <div class="beacon"><span class="beacon-term">Base 62 [0-9, a-z, A-Z]</span><span class="beacon-def">Encode a unique ID in 62 symbols; no collisions, length grows with the ID.</span></div>
+    <div class="beacon"><span class="beacon-term">62^7 &asymp; 3.5 trillion</span><span class="beacon-def">Seven characters cover far more than the 365 billion URLs needed.</span></div>
+    <div class="beacon"><span class="beacon-term">2009215674938 &rarr; zn9edcu</span><span class="beacon-def">The notes' worked Base 62 example; a 13-digit ID collapses to 7 characters.</span></div>
+    <div class="beacon"><span class="beacon-term">Hash + collision resolution</span><span class="beacon-def">CRC32/MD5/SHA-1, keep first 7 chars; collisions need a retry loop or Bloom filter.</span></div>
+    <div class="beacon"><span class="beacon-term">Bloom filter</span><span class="beacon-def">Fast existence check that avoids hitting the database on every collision test.</span></div>
+    <div class="beacon"><span class="beacon-term">Stateless web tier + sharded DB</span><span class="beacon-def">Scale web servers by adding boxes; scale data with replication and sharding.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The key-generation decision, the 301-vs-302 choice, and the two flows are where almost every interview question on this topic lands. The rest (rate limiting, analytics) is worth a sentence each.</p>
+
+  <div class="drill">
+    <h4>Base 62 vs hash + collision resolution</h4>
+    <p>Both approaches aim for a seven-character key. Base 62 starts from a unique numeric ID and simply rewrites it with 62 symbols. Because the input ID is unique, the output string is unique &mdash; collisions are impossible by construction. The price is that you need a distributed unique ID generator, and the length is not fixed: it grows as IDs grow.</p>
+    <div class="anim" data-anim="base62"></div>
+    <p>Hashing starts from the long URL itself. Run it through CRC32, MD5 or SHA-1 and keep the first seven characters. That gives a fixed length and no dependency on an ID generator, but truncating a hash invites collisions: two different URLs can share the same first seven characters.</p>
+    <figure class="guide-fig"><img src="08.%20URL%20Shortener/images/url-lookup.png" alt="Flowchart: hash the long URL, check the database, on collision append a predefined string and retry"><figcaption>The hash approach's collision loop: hash &rarr; shortURL &rarr; "exists in DB?" If yes, append a predefined string to the long URL and hash again. Each lap can cost a database query, which is why a Bloom filter is suggested.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Aspect</th><th>Hash + collision resolution</th><th>Base 62 conversion</th></tr></thead>
+      <tbody>
+        <tr><td>Short URL length</td><td>Fixed</td><td>Not fixed; grows with the ID</td></tr>
+        <tr><td>Needs unique ID generator</td><td>No</td><td>Yes</td></tr>
+        <tr><td>Collisions</td><td>Possible; must be resolved</td><td>Not possible</td></tr>
+        <tr><td>Next short URL guessable</td><td>No; not based on an ID</td><td>Yes if IDs increment by 1 (security concern)</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall"><strong>Common trap:</strong> forgetting that Base 62's sequential IDs make short URLs enumerable. If the ID goes up by 1, anyone can guess the next link &mdash; mention this as a security concern.</div>
+  </div>
+
+  <div class="drill">
+    <h4>301 vs 302: load versus insight</h4>
+    <p>A 301 says the short URL has permanently moved to the long URL. The browser caches that answer, so the next time the same user clicks, the browser goes straight to the destination without asking your service. Great for reducing load.</p>
+    <p>A 302 says the move is temporary, so the browser checks back every time. More traffic hits your servers, but you see every click &mdash; exactly what you want for analytics like click rates, sources and timestamps.</p>
+    <figure class="guide-fig"><img src="08.%20URL%20Shortener/images/url-redirection.png" alt="Browser dev tools showing a 301 response from tinyurl with a location header pointing to Amazon"><figcaption>A real redirect in dev tools: GET tinyurl.com/qtj5opu returns status 301, and the location header carries the full Amazon URL. The browser does the rest.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>301 gains</strong><p>Browser caching cuts repeat requests to your service, lowering load.</p></div>
+      <div class="con"><strong>301 costs</strong><p>Repeat clicks bypass you, so you cannot track them; choose 302 when analytics matter.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>The shortening flow, step by step</h4>
+    <p>The write path is a short decision tree. The first branch prevents duplicates; the second creates a new, collision-free key using the previous chapter's ID generator.</p>
+    <figure class="guide-fig"><img src="08.%20URL%20Shortener/images/url-shortening-flow.png" alt="Flowchart: longURL in DB? yes return shortURL, no generate ID, convert, save"><figcaption>Notice the early exit at step 2: if the long URL already exists, return its short URL and do nothing else. Only new URLs consume an ID.</figcaption></figure>
+    <ol class="steps">
+      <li>Receive the longURL.</li>
+      <li>Check whether it already exists in the database.</li>
+      <li>If it does, return the existing shortURL.</li>
+      <li>If not, generate a new unique ID with the distributed ID generator.</li>
+      <li>Convert the ID to a shortURL with Base 62.</li>
+      <li>Save <code>&lt;id, shortURL, longURL&gt;</code> in the database.</li>
+    </ol>
+  </div>
+
+  <div class="drill">
+    <h4>The redirect flow and scaling it</h4>
+    <p>Because reads outnumber writes ten to one, the redirect path is where performance is won. The request passes through a load balancer to a stateless web server, which checks the cache first and falls back to the database only on a miss, then returns the long URL.</p>
+    <figure class="guide-fig"><img src="08.%20URL%20Shortener/images/url-redirecting-flow.png" alt="User GETs tinyurl.com/zn9edcu through load balancer to web servers, cache and database, returning the Wikipedia long URL"><figcaption>Five hops: (1) GET tinyurl.com/zn9edcu, (2) load balancer to web servers, (3) cache lookup, (4) database on a miss, (5) return the long URL. The cache sits closer than the database for a reason.</figcaption></figure>
+    <p>Scaling follows the usual pattern. Web servers hold no state, so you add or remove them freely. The database tier uses replication for availability and sharding to split 365 TB across machines. A rate limiter caps requests per IP to stop abuse, and click analytics (rates, sources, timestamps) feed business insight.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Scribble your answer beside each question before tapping to reveal.</p>
+  <details class="qa"><summary>Why are seven Base 62 characters enough for this system?</summary><div class="qa-answer"><p>62^7 is about 3.5 trillion possible keys, while the system needs about 365 billion URLs over 10 years (100 million a day). Seven characters leave plenty of headroom.</p></div></details>
+  <details class="qa"><summary>When would you choose a 302 redirect instead of a 301?</summary><div class="qa-answer"><p>When you need analytics such as click tracking. A 302 is temporary, so every click comes back to your service; a 301 is cached by the browser, so repeat clicks bypass you.</p></div></details>
+  <details class="qa"><summary>Compare Base 62 conversion with hash + collision resolution on collisions and dependencies.</summary><div class="qa-answer"><p>Base 62 cannot collide because it encodes a unique ID, but it requires a unique ID generator and its length grows with the ID. Hashing needs no ID generator and has a fixed length, but truncating to seven characters causes collisions that must be resolved.</p></div></details>
+  <details class="qa"><summary>What happens if the same long URL is submitted twice?</summary><div class="qa-answer"><p>The shortening flow first checks whether the longURL exists in the database. If it does, the existing shortURL is returned and no new ID is generated.</p></div></details>
+  <details class="qa"><summary>Why is resolving hash collisions by appending a predefined string expensive, and what helps?</summary><div class="qa-answer"><p>Each retry requires checking whether the new short URL already exists, potentially a database query per attempt, and it may loop several times. A Bloom filter makes these existence checks fast.</p></div></details>
+  <details class="qa"><summary>What security concern does Base 62 introduce, and why?</summary><div class="qa-answer"><p>If IDs increment by 1, the next short URL is easy to predict, so links can be enumerated. Hash-based keys do not have this property because they do not depend on a sequential ID.</p></div></details>
+  <details class="qa"><summary>Why does the redirect path check the cache before the database?</summary><div class="qa-answer"><p>Reads outnumber writes 10:1, so most traffic is redirects. Serving popular mappings from the cache is faster and shields the database from the bulk of the load.</p></div></details>
+</div>

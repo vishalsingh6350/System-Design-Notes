@@ -1,0 +1,228 @@
+<h3>Introduction</h3>
+<p>Google Drive is a cloud-based file storage and synchronization service that allows users to store, access, and share files from various devices. This chapter discusses designing a scalable system with the following features:</p>
+<ul>
+  <li><strong>File Upload and Download</strong></li>
+  <li><strong>File Sync Across Devices</strong></li>
+  <li><strong>File Sharing</strong></li>
+  <li><strong>File Revision History</strong></li>
+  <li><strong>Notifications for Edits, Deletes, and Shares</strong></li>
+</ul>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Key Requirements</h4>
+<h4>Functional Requirements:</h4>
+<ul>
+  <li>Upload and download files.</li>
+  <li>Sync files across multiple devices.</li>
+  <li>Maintain file revisions.</li>
+  <li>Enable file sharing with permissions.</li>
+  <li>Send notifications on file edits, deletions, and shares.</li>
+</ul>
+<h4>Non-Functional Requirements:</h4>
+<ul>
+  <li><strong>Reliability:</strong> Data loss is unacceptable.</li>
+  <li><strong>Fast Sync Speed:</strong> Avoid user impatience with delayed syncing.</li>
+  <li><strong>Bandwidth Efficiency:</strong> Minimize unnecessary data usage.</li>
+  <li><strong>Scalability:</strong> Handle 10 million daily active users (DAU).</li>
+  <li><strong>High Availability:</strong> Operate seamlessly during server failures or network issues.</li>
+</ul>
+<h4>Constraints and Assumptions</h4>
+<ul>
+  <li>Users get <strong>10 GB free space</strong>.</li>
+  <li>Maximum file size: <strong>10 GB</strong>.</li>
+  <li>Average file upload size: <strong>500 KB</strong>.</li>
+  <li>Upload frequency: <strong>2 files per day per user</strong>.</li>
+  <li>Total storage required: <strong>500 PB</strong>.</li>
+</ul>
+
+<h3>Step 2: High-Level Design</h3>
+<h4>Single-Server Setup</h4>
+<p>A basic setup includes:</p>
+<ol>
+  <li><strong>Web Server:</strong> Handles uploads and downloads.</li>
+  <li><strong>Metadata Database:</strong> to keep track of metadata like user data, login info, files info.</li>
+  <li><strong>Storage Directory:</strong> Holds files organized by namespaces.</li>
+</ol>
+<img class="orig-img" src="15.%20Google%20Drive/images/namespaces.png" alt="Namespaces">
+<ul>
+  <li>A web server and a directory called drive/ is set up as the root directory to store uploaded files.</li>
+  <li>Under drive/ directory, there is a list of directories called namespaces.</li>
+  <li>Each namespace contains all the uploaded files for that user.</li>
+  <li>Each file or folder can be uniquely identified by joining the namespace and the relative path.</li>
+</ul>
+<p>This design serves as a starting point but is inadequate for scaling.</p>
+<h4>APIs</h4>
+<ol>
+  <li><strong>Upload a file to Google Drive:</strong> Two types of uploads are supported
+    <ul>
+      <li>Simple upload: Used when file size is small.</li>
+      <li>Resumable upload:
+        <ul>
+          <li>Endpoint: https://api.example.com/files/upload?uploadType=resumable</li>
+          <li>Send the initial request to retrieve the resumable URL.</li>
+          <li>Upload the data and monitor upload state</li>
+          <li>If upload is disturbed, resume the upload.</li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+  <li><strong>Download a file from Google Drive:</strong> To download a file
+    <ul><li>Endpoint: https://api.example.com/files/download</li></ul>
+  </li>
+  <li><strong>Get file revisions:</strong>
+    <ul><li>Endpoint: https://api.example.com/files/list_revisions</li></ul>
+  </li>
+</ol>
+
+<h4>Moving to Distributed Systems</h4>
+<h4>Improvements:</h4>
+<ol>
+  <li><strong>Sharding:</strong> Split storage across servers based on <code>user_id</code>.</li>
+  <li><strong>Amazon S3:</strong> Use S3 for scalable and redundant file storage with cross-region replication.
+    <img class="orig-img" src="15.%20Google%20Drive/images/replication.png" alt="Replication">
+  </li>
+  <li><strong>Load Balancer:</strong> Distribute traffic across multiple web servers.</li>
+  <li><strong>Metadata Database Replication:</strong> Ensure availability through database sharding and replication.</li>
+</ol>
+
+<h4>Sync Conflicts:</h4>
+<p>For a large storage system like Google Drive, sync conflicts happen from time to time. When two users modify the same file or folder at the same time, a conflict happens.</p>
+<img class="orig-img" src="15.%20Google%20Drive/images/sync-conflicts.png" alt="Sync Conflicts">
+<ul>
+  <li>In the example user 1 and user 2 tries to update the same file at the same time, but user 1's file is processed by our system first.</li>
+  <li>User 1's update operation goes through, but, user 2 gets a sync conflict.</li>
+  <li>The system presents both copies of the same file: user 2's local copy and the latest version from the server.</li>
+  <li>User 2 has the option to merge both files or override one version with the other.</li>
+</ul>
+
+<h4>Improved design</h4>
+<img class="orig-img" src="15.%20Google%20Drive/images/high-level-design.png" alt="High Level Design">
+<ol>
+  <li><strong>User Interaction:</strong> Users access the application via browser or mobile app.</li>
+  <li><strong>Block Servers:</strong>
+    <ul>
+      <li>Files are split into <strong>4 MB blocks</strong> (maximum size) and assigned unique hash values.</li>
+      <li>Blocks are stored independently in cloud storage (e.g., Amazon S3).</li>
+      <li>File reconstruction involves joining blocks in a specific order.</li>
+    </ul>
+  </li>
+  <li><strong>Cloud Storage:</strong> Blocks are stored in cloud storage for scalability and redundancy.</li>
+  <li><strong>Cold Storage:</strong> Inactive files are moved to cold storage to reduce costs.</li>
+  <li><strong>Load Balancer:</strong> Distributes requests evenly among API servers to ensure efficient operation.</li>
+  <li><strong>API Servers:</strong>
+    <ul>
+      <li>Handle user authentication, profile management, and file metadata updates.</li>
+      <li>Manage all non-uploading workflows.</li>
+    </ul>
+  </li>
+  <li><strong>Metadata Database and Cache:</strong>
+    <ul>
+      <li>Stores metadata for users, files, blocks, and versions.</li>
+      <li>Frequently accessed metadata is cached for faster retrieval.</li>
+    </ul>
+  </li>
+  <li><strong>Notification Service:</strong>
+    <ul>
+      <li>A <strong>publisher/subscriber system</strong> that notifies clients about file changes (add, edit, delete).</li>
+      <li>Ensures clients can pull the latest updates.</li>
+    </ul>
+  </li>
+  <li><strong>Offline Backup Queue:</strong> Temporarily stores file change information for offline clients to sync when back online.</li>
+</ol>
+
+<h3>Step 3: Design Deep Dive</h3>
+<h4>Metadata Database</h4>
+<p>A highly simplified version is shown below as it only includes the most important tables and fields.</p>
+<h4>Schema Design:</h4>
+<ul>
+  <li><strong>User Table:</strong> Stores user profiles and preferences.</li>
+  <li><strong>File Table:</strong> Maintains file metadata (e.g., size, name, path).</li>
+  <li><strong>Block Table:</strong> Tracks file blocks for reconstructing files.</li>
+  <li><strong>File Version Table:</strong> Stores file revision history.</li>
+</ul>
+<img class="orig-img" src="15.%20Google%20Drive/images/metadata-database.png" alt="Metadata Database">
+
+<h4>File Upload Flow</h4>
+<ol>
+  <li><strong>File Upload:</strong>
+    <ul>
+      <li>File is split into blocks, compressed, and encrypted by the block server.</li>
+      <li>Blocks are uploaded to block servers and stored in S3.</li>
+    </ul>
+  </li>
+  <li><strong>Metadata Upload:</strong>
+    <ul>
+      <li>Client sends metadata to the API server.</li>
+      <li>Metadata is stored in the database with status <code>pending</code>.</li>
+    </ul>
+  </li>
+  <li><strong>Completion:</strong>
+    <ul>
+      <li>S3 triggers a callback to update the file status to <code>uploaded</code>.</li>
+      <li>Notification service informs relevant users.</li>
+    </ul>
+  </li>
+</ol>
+<img class="orig-img" src="15.%20Google%20Drive/images/upload-flow.png" alt="Upload Flow">
+
+<h4>File Sync</h4>
+<ol>
+  <li><strong>Delta Sync:</strong> Transfer only modified blocks instead of the entire file.
+    <img class="orig-img" src="15.%20Google%20Drive/images/delta-sync.png" alt="Delta Sync">
+  </li>
+  <li><strong>Compression:</strong> Blocks are compressed using compression algorithms depending on file types.</li>
+  <li><strong>Conflict Resolution:</strong>
+    <ul>
+      <li>First processed version wins.</li>
+      <li>Conflicting versions are saved separately for user resolution.</li>
+    </ul>
+  </li>
+</ol>
+<img class="orig-img" src="15.%20Google%20Drive/images/file-sync.png" alt="File Sync">
+
+<h4>File Download Flow</h4>
+<p>Download flow is triggered when a file is added or edited elsewhere. There are two ways a client can know:</p>
+<ul>
+  <li>If client A is online while a file is changed by another client, notification service will inform client A.</li>
+  <li>If client A is offline while a file is changed by another client, data will be saved to the cache. When the offline client is online again, it pulls the latest changes.</li>
+</ul>
+<p>Once a client knows a file is changed, it first requests metadata via API servers, then downloads blocks to construct the file.</p>
+<ol>
+  <li><strong>Trigger:</strong> Notification service informs the client of file updates.</li>
+  <li><strong>Metadata Fetch:</strong> Client retrieves updated metadata via API.</li>
+  <li><strong>Block Download:</strong> Client downloads updated blocks from block servers and reconstructs the file.</li>
+</ol>
+<img class="orig-img" src="15.%20Google%20Drive/images/download-flow.png" alt="Upload Flow">
+
+<h4>Notification Service</h4>
+<ol>
+  <li><strong>Purpose:</strong> Keeps clients updated about file changes.</li>
+  <li><strong>Mechanism:</strong> Implements <strong>long polling</strong> for asynchronous notifications.</li>
+  <li><strong>Example:</strong> When a file is added, edited, or deleted, notifications are pushed to all relevant clients.</li>
+</ol>
+
+<h4>Storage Optimization</h4>
+<ol>
+  <li><strong>De-duplication:</strong> Remove duplicate blocks at the account level using hash-based comparisons.</li>
+  <li><strong>Versioning Strategy:</strong>
+    <ul>
+      <li>Limit the number of saved revisions.</li>
+      <li>Prioritize recent versions for frequently edited files.</li>
+    </ul>
+  </li>
+  <li><strong>Cold Storage:</strong> Move rarely accessed files to cheaper storage solutions (e.g., Amazon S3 Glacier).</li>
+</ol>
+
+<h4>Failure Handling</h4>
+<ol>
+  <li><strong>Load Balancer Failure:</strong> Secondary load balancer becomes active.</li>
+  <li><strong>Block Server Failure:</strong> Pending tasks are reassigned to other servers.</li>
+  <li><strong>Metadata Database Failure:</strong>
+    <ul>
+      <li>Promote a slave node to master.</li>
+      <li>Redirect traffic to remaining replicas.</li>
+    </ul>
+  </li>
+  <li><strong>Cloud Storage Failure:</strong> Use cross-region replication to fetch unavailable files.</li>
+  <li><strong>Notification Service Failure:</strong> Clients reconnect to alternative servers.</li>
+</ol>

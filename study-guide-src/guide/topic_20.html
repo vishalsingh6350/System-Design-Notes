@@ -1,0 +1,220 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 3 a.m. and a memory leak is slowly strangling a pool of web servers. No human is watching, yet five minutes after the first instance stops answering, an on-call engineer's phone buzzes through PagerDuty with one clear alert &mdash; not fifty duplicates. She opens a dashboard and sees the CPU and memory lines for that pool bending upward since midnight. Behind that calm moment is a system quietly ingesting about 10 million metrics from 100,000 machines, keeping them for a year, and continuously asking "is anything wrong?" The challenge is swallowing a relentless firehose of tiny numbers while still answering sudden, urgent questions in a flash.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The notes name five core components &mdash; collection, transmission, storage, alerting, visualization. Read them as a river: data flows in from the left, pools in the time-series database, and is drawn out on the right by alerts and dashboards.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Time-series data model</span> <span class="why">— everything is (metric name, labels, timestamp, value); every component speaks this shape</span>
+      <ul>
+        <li>Series identified by name + optional tags/labels, e.g. <code>CPU.load host=webserver01,region=us-west</code>
+          <ul><li><span class="peripheral">Line protocol format used by Prometheus, OpenTSDB</span></li></ul>
+        </li>
+        <li>Access pattern: constant heavy writes, rare but bursty reads (during incidents)</li>
+        <li>Keep label cardinality low
+          <ul><li><span class="peripheral">InfluxDB builds an index per label</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Collection: pull vs push</span> <span class="why">— how 10M metrics leave 100,000 machines</span>
+      <ul>
+        <li>Pull: collectors scrape <code>/metrics</code> endpoints found via service discovery (ZooKeeper / etcd)
+          <ul><li><span class="peripheral">Consistent hash ring so each server is scraped by exactly one collector</span></li></ul>
+        </li>
+        <li>Push: agent on each host pushes (may pre-aggregate) to collectors behind a load balancer + autoscaling
+          <ul><li><span class="peripheral">Prometheus = pull; CloudWatch, Graphite = push</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Transmission + storage: Kafka &rarr; time-series DB</span> <span class="why">— the heart of the design; decouples ingest from storage and keeps data safe</span>
+      <ul>
+        <li>Kafka buffer, partitioned by metric name (then labels); Flink / Spark / Storm consumers
+          <ul><li><span class="peripheral">Alternative: Gorilla-style ingestion to avoid Kafka's ops overhead</span></li></ul>
+        </li>
+        <li>Purpose-built TSDB (InfluxDB, Prometheus), not a general-purpose DB
+          <ul><li><span class="peripheral">InfluxDB: 250k+ writes/s on 8 cores, 32GB RAM</span></li></ul>
+        </li>
+        <li>Encoding (delta / double-delta), down-sampling, cold storage
+          <ul><li><span class="peripheral">~85% of queries hit the last 26h (Facebook research)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Read side: query service, alerting, visualization</span> <span class="why">— where data turns into decisions and pictures</span>
+      <ul>
+        <li>Query service + cache in front of the TSDB (optional)</li>
+        <li>Alert manager: YAML rules, dedupe/merge, alert store, Kafka, alert consumers &rarr; email, SMS, PagerDuty, webhooks</li>
+        <li>Visualization: off-the-shelf Grafana
+          <ul><li><span class="peripheral">Alerting too is usually bought, not built</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The data model is the root because it dictates the database choice, the Kafka partitioning, and the query language. Collection and transmission exist to feed the storage hub safely at scale; the read side exists only to interrogate it. If storage is chosen poorly, both dashboards and alerts become slow, which is why the notes call data storage "the heart of this design."</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Six boxes, left to right. Know what each swallows and emits and you can redraw the final design from memory.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Metrics source (+ optional agent)</h4>
+      <p><strong>Input:</strong> Raw machine and app stats &mdash; CPU load, memory, disk, request counts, queue depth.</p>
+      <p><strong>Output:</strong> Metrics exposed at <code>/metrics</code> (pull) or pushed by an agent, possibly pre-aggregated (e.g. a 1-minute counter).</p>
+      <p class="io-story">A patient's vital-signs monitor: it either waits for the nurse to read it, or phones in readings on its own.</p>
+      <p class="io-arrow">&rarr; feeds into: Metrics collector</p>
+    </div>
+    <div class="io-block">
+      <h4>Metrics collector (autoscaling group)</h4>
+      <p><strong>Input:</strong> Scrape targets and intervals from service discovery, or incoming push requests.</p>
+      <p><strong>Output:</strong> A stream of time-series points.</p>
+      <p class="io-story">A team of meter readers; the consistent hash ring gives each reader a fixed set of houses so no meter is read twice.</p>
+      <p class="io-arrow">&rarr; feeds into: Kafka</p>
+    </div>
+    <div class="io-block">
+      <h4>Kafka</h4>
+      <p><strong>Input:</strong> Points from all collectors.</p>
+      <p><strong>Output:</strong> Durable, partitioned streams (per metric name, optionally per label).</p>
+      <p class="io-story">A reservoir behind a dam: if the database downstream is down, water piles up safely instead of flooding away.</p>
+      <p class="io-arrow">&rarr; feeds into: Stream-processing consumers</p>
+    </div>
+    <div class="io-block">
+      <h4>Consumers (Flink / Spark / Storm)</h4>
+      <p><strong>Input:</strong> Kafka partitions.</p>
+      <p><strong>Output:</strong> Writes to the time-series DB, optionally aggregated to cut volume.</p>
+      <p class="io-story">A sorting line that can compress a minute of readings into one number before shelving it &mdash; at the price of losing the detail.</p>
+      <p class="io-arrow">&rarr; feeds into: Time-series DB</p>
+    </div>
+    <div class="io-block">
+      <h4>Time-series DB</h4>
+      <p><strong>Input:</strong> Time-stamped points; down-sampling rules; queries.</p>
+      <p><strong>Output:</strong> Compressed storage (raw 7d, 1-min for 30d, 1-hour for 1y) and fast label-indexed aggregations.</p>
+      <p class="io-story">A library that shelves today's newspapers whole, keeps last month's as summaries, and last year's as a one-page digest.</p>
+      <p class="io-arrow">&rarr; feeds into: Query service (+ cache)</p>
+    </div>
+    <div class="io-block">
+      <h4>Query service &rarr; alerting &amp; visualization</h4>
+      <p><strong>Input:</strong> Periodic rule queries from the alert manager; ad-hoc dashboard queries.</p>
+      <p><strong>Output:</strong> Deduplicated alerts to email, SMS, PagerDuty, webhooks; charts in Grafana.</p>
+      <p class="io-story">The front desk that shields the library: it answers repeat questions from a cache and lets you swap the library later without retraining visitors.</p>
+      <p class="io-arrow">&rarr; feeds into: On-call humans</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one metric</h4>
+    <ol class="journey-steps">
+      <li>Instance i631 in the us-west web pool exposes <code>CPU.load host=i631,region=us-west 1613707265 76</code> at its <code>/metrics</code> endpoint.</li>
+      <li>A collector owns i631 on the consistent hash ring. It got the target, pull interval, timeout and retry settings from service discovery, and scrapes on schedule.</li>
+      <li>The collector writes the point to Kafka, into the partition for metric name <code>CPU.load</code>.</li>
+      <li>A Flink consumer reads the partition and writes the point to InfluxDB, which stores the timestamp as a small delta from the previous one rather than a full 10-digit number.</li>
+      <li>Every interval, the alert manager runs its cached rules through the query service, e.g. "average CPU load across us-west web servers over the last 10 minutes."</li>
+      <li>Separately, the rule <code>instance_down: up == 0 for 5m</code> fires for a neighbor host. The alert manager merges repeats into one alert event, records its state in the alert store, and publishes it to Kafka.</li>
+      <li>An alert consumer pulls the event and pages the on-call engineer via PagerDuty; she opens Grafana, which queries the same service (hot results come from cache).</li>
+      <li>Seven days later, this 10-second point is rolled into a 1-minute average; after 30 days, into a 1-hour average; eventually it can move to cheap cold storage.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Reliably ingest a write-heavy firehose of infrastructure metrics, store it compactly for a year, and answer dashboard and alert queries with low latency so no critical alert is ever missed.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a national weather service. Thousands of weather stations are the metric sources, either waiting for inspectors to read them (pull) or radioing readings in (push). The central post room that queues incoming reports so nothing is lost when the archivists are overwhelmed is Kafka. The climate archive, which keeps hourly detail for recent days but only daily summaries for past years, is the time-series database with its down-sampling rules. The forecasters' desk that answers questions about the data is the query service, the storm-warning office that sounds sirens when thresholds are crossed &mdash; once, not fifty times &mdash; is the alert manager, and the big wall of weather maps is Grafana.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">1000 pools x 100 machines x ~100 metrics = ~10M</span><span class="beacon-def">The scale of distinct metrics; tells you ingest is the dominant load.</span></div>
+    <div class="beacon"><span class="beacon-term">Raw 7d / 1-min 30d / 1-h 1y</span><span class="beacon-def">Retention and roll-up policy; storage shrinks as data ages.</span></div>
+    <div class="beacon"><span class="beacon-term">Time series = name + labels + (t, v) points</span><span class="beacon-def">The universal data shape; drives DB choice and partitioning.</span></div>
+    <div class="beacon"><span class="beacon-term">Write-heavy, bursty reads</span><span class="beacon-def">Optimize for ingest; expect read spikes during incidents.</span></div>
+    <div class="beacon"><span class="beacon-term">Low label cardinality</span><span class="beacon-def">Each unique label value costs index space; keep them few.</span></div>
+    <div class="beacon"><span class="beacon-term">Pull vs push</span><span class="beacon-def">Pull: easy debugging and health checks. Push: short-lived jobs, firewalls, anywhere senders.</span></div>
+    <div class="beacon"><span class="beacon-term">Consistent hash ring of collectors</span><span class="beacon-def">Each server scraped by exactly one collector; no double counting.</span></div>
+    <div class="beacon"><span class="beacon-term">Kafka between collector and DB</span><span class="beacon-def">Prevents data loss when the DB is down; decouples collection from processing.</span></div>
+    <div class="beacon"><span class="beacon-term">85% of queries hit last 26h</span><span class="beacon-def">Favor a DB optimized for recent data; old data can be coarse or cold.</span></div>
+    <div class="beacon"><span class="beacon-term">Delta / double-delta encoding</span><span class="beacon-def">Store small differences instead of full timestamps; big compression wins.</span></div>
+    <div class="beacon"><span class="beacon-term">Flux, not SQL</span><span class="beacon-def">Time-series queries (e.g. moving averages) are clumsy in SQL; TSDBs offer their own languages.</span></div>
+    <div class="beacon"><span class="beacon-term">Buy Grafana and alerting</span><span class="beacon-def">High-quality visualization and alerting are hard to build; off-the-shelf is usually justified.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers probe five areas: why a time-series DB, the push vs pull debate, the Kafka-buffered pipeline and where to aggregate, storage compression and down-sampling, and the alert manager's duties.</p>
+
+  <div class="drill">
+    <h4>Why a purpose-built time-series database</h4>
+    <p>A general-purpose relational database could be tuned to cope, but only with expert-level effort. A NoSQL store can work in theory, yet designing a scalable schema for time-series queries is hard. Purpose-built time-series databases &mdash; InfluxDB and Prometheus are the most popular &mdash; pair an in-memory cache with on-disk storage and ship query languages made for this data.</p>
+    <p>Consider the notes' example: an exponential moving average takes a nest of three sub-queries and window functions in SQL. In InfluxDB's Flux it is four short lines: pick the database, set a range of <code>-1h</code>, filter by measurement, apply <code>exponentialMovingAverage</code>. The shape of the language matches the shape of the data.</p>
+    <p>TSDBs also aggregate efficiently by label because they index labels. The flip side is cardinality: every distinct label value adds to the index, so labels like a unique request ID would blow it up.</p>
+    <div class="pitfall"><strong>Common trap:</strong> diving into TSDB internals. The notes say that is niche knowledge; for the interview, it is enough to know metrics are time-series data, to name InfluxDB/Prometheus, and to cite a number like 250k+ writes/s on an 8-core, 32GB box.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Pull vs push collection</h4>
+    <p>In the pull model, collectors fetch from each service's <code>/metrics</code> endpoint. They learn what to scrape &mdash; IPs, intervals, timeouts, retries &mdash; from service discovery (ZooKeeper or etcd), either by subscribing to change notifications or by polling. Many collectors share the load via a consistent hash ring, so each server has exactly one owner. In the push model, an agent on each host sends metrics to collectors that sit behind a load balancer in an autoscaling group, since they may otherwise reject pushes under load.</p>
+    <table class="compare">
+      <thead><tr><th>Concern</th><th>Pull</th><th>Push</th></tr></thead>
+      <tbody>
+        <tr><td>Debugging</td><td>Wins: inspect <code>/metrics</code> any time, even from a laptop</td><td>Missing data could be network issues</td></tr>
+        <tr><td>Health check</td><td>Wins: no response means server is down</td><td>Ambiguous: network or server?</td></tr>
+        <tr><td>Short-lived jobs</td><td>May finish before scraped (fix: push gateway)</td><td>Wins</td></tr>
+        <tr><td>Firewalls / multi-DC</td><td>All endpoints must be reachable</td><td>Wins: LB + autoscaling accepts data from anywhere</td></tr>
+        <tr><td>Transport</td><td>Typically TCP</td><td>Typically UDP, lower latency (TCP setup cost is small anyway)</td></tr>
+        <tr><td>Authenticity</td><td>Wins: targets defined in config</td><td>Anyone can push; needs whitelist or auth</td></tr>
+      </tbody>
+    </table>
+    <p>There is no clear winner. Prometheus pulls; CloudWatch and Graphite push. A large organization probably needs both, especially where installing a push agent is not even possible.</p>
+  </div>
+
+  <div class="drill">
+    <h4>The Kafka-buffered pipeline and where to aggregate</h4>
+    <p>Collectors in autoscaling groups handle ingest spikes, but if the time-series database goes down, incoming data has nowhere to land. Placing Kafka between collectors and the database solves this: Kafka retains data until consumers (Storm, Flink, Spark) can write it, and it cleanly separates collection from processing.</p>
+    <figure class="guide-fig"><img src="20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/final-design.png" alt="Final design of the metrics monitoring system"><figcaption>The full river: source &rarr; collector &rarr; Kafka &rarr; consumers &rarr; time-series DB. On the right, alerting and visualization both query through the query service, which has its own cache.</figcaption></figure>
+    <p>Partition Kafka by metric name so consumers can aggregate per metric; for more scale, partition further by labels and prioritize important metrics. The main cost is operational overhead; a Gorilla-style ingestion system is an arguably equally scalable alternative.</p>
+    <table class="compare">
+      <thead><tr><th>Aggregate at</th><th>Gains</th><th>Costs</th></tr></thead>
+      <tbody>
+        <tr><td>Collection agent</td><td>Less data sent</td><td>Only simple logic (e.g. 1-minute counter)</td></tr>
+        <tr><td>Ingestion pipeline (Flink)</td><td>Much lower write volume</td><td>Raw data lost; precision gone</td></tr>
+        <tr><td>Query side</td><td>No data loss</td><td>Slow queries over lots of raw data</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>Storage tricks: encoding, down-sampling, cold storage</h4>
+    <p>Because about 85% of queries target the past 26 hours, the storage layer should be built around recent data being hot and old data being cheap. Three levers do this.</p>
+    <figure class="guide-fig"><img src="20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/double-delta-encoding.png" alt="Double-delta encoding of timestamps"><figcaption>Timestamps 1610087371, ...381, ...391, ...400, ...411 collapse to deltas 10, 10, 9, 11. Small numbers need far fewer bits than full 10-digit timestamps.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>Encoding and compression:</strong> store differences between neighboring timestamps instead of full values; good TSDBs do this built-in.</li>
+      <li><strong>Down-sampling:</strong> keep raw for 7 days, then 1-minute resolution to 30 days, then 1-hour to a year. In the notes' example, six 10-second CPU readings (10, 16, 20, 30, 20, 30) become two 30-second averages (19 and 25).</li>
+      <li><strong>Cold storage:</strong> move rarely used old data to much cheaper storage.</li>
+    </ol>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Dramatically less disk; queries over long ranges touch fewer points.</p></div>
+      <div class="con"><strong>Costs</strong><p>Old data loses fine detail forever; a spike lasting 20 seconds last month may vanish into a 1-hour average.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>The alerting pipeline</h4>
+    <p>Alert rules are written in YAML and loaded into a cache. The alert manager reads them, queries the query service at the configured interval, and creates an alert event when a rule is met &mdash; e.g. <code>up == 0</code> held <code>for: 5m</code> with <code>severity: page</code>.</p>
+    <figure class="guide-fig"><img src="20.%20Metrics%20Monitoring%20and%20Alerting%20System/images/alerting-system.png" alt="Alerting system components"><figcaption>Seven steps: rule files load into cache (1), the alert manager reads them (2) and queries (3), records state in the alert store (4), publishes to Kafka (5), and alert consumers (6) fan out to email, text, PagerDuty and HTTPS endpoints (7).</figcaption></figure>
+    <p>The alert manager's other duties matter as much as detection: filtering, merging and deduplicating (one instance firing repeatedly yields one event), access control over who can manage alerts, and retries so each alert is delivered at least once. The alert store (a key-value DB such as Cassandra) tracks every alert's state to back that guarantee, and Kafka decouples detection from the notification senders.</p>
+    <div class="pitfall"><strong>Common trap:</strong> proposing to build alerting and dashboards from scratch. The notes stress that off-the-shelf options (and Grafana for visualization) are hard to justify not using.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Jot your answer in the margin with your stylus, then tap to reveal.</p>
+  <details class="qa"><summary>Why put Kafka between the metrics collectors and the time-series database?</summary><div class="qa-answer"><p>If the database goes down, collectors would otherwise lose data. Kafka retains the stream until consumers can write it, decouples collection from processing, and scales reliably. The trade-off is operational overhead.</p></div></details>
+  <details class="qa"><summary>Name two situations where push beats pull.</summary><div class="qa-answer"><p>Short-lived batch jobs that end before a scrape, and firewalled or multi-data-center setups where collectors cannot reach every endpoint. With push, collectors behind a load balancer and autoscaling group can receive data from anywhere.</p></div></details>
+  <details class="qa"><summary>What goes wrong if two pull-based collectors scrape the same server?</summary><div class="qa-answer"><p>Metrics are collected twice, wasting resources and duplicating data. A consistent hash ring assigns each server to exactly one collector, preventing overlap.</p></div></details>
+  <details class="qa"><summary>Compare aggregating in the ingestion pipeline vs at query time.</summary><div class="qa-answer"><p>Ingestion-time aggregation (e.g. in Flink) shrinks write volume but discards raw data and precision. Query-time aggregation preserves everything but can make queries slow because of the sheer data processed.</p></div></details>
+  <details class="qa"><summary>Why keep label cardinality low?</summary><div class="qa-answer"><p>Time-series databases like InfluxDB index each label. Many unique label values inflate those indexes, hurting memory and query performance.</p></div></details>
+  <details class="qa"><summary>A single instance triggers the same rule 30 times in 10 minutes. What should the on-call engineer receive?</summary><div class="qa-answer"><p>One alert. The alert manager filters, merges and deduplicates alerts, while the alert store tracks state so the notification is sent at least once but not spammed.</p></div></details>
+  <details class="qa"><summary>How does the "85% of queries in the last 26h" finding shape storage?</summary><div class="qa-answer"><p>It justifies optimizing for recent data: keep recent data at full resolution and fast, down-sample older data (1-minute, then 1-hour), and push old data to cheap cold storage.</p></div></details>
+</div>

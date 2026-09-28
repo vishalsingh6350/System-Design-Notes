@@ -1,0 +1,152 @@
+<h3>Introduction</h3>
+<p>This chapter discusses the design of a URL shortening service like TinyURL. The system's main goals include <strong>URL shortening</strong>, <strong>redirecting</strong>, and <strong>high scalability</strong> to handle large traffic volumes.</p>
+
+<h4>Requirements</h4>
+<ul>
+  <li>Shortened URLs must be <strong>unique</strong> and as <strong>short as possible</strong>.</li>
+  <li>Handle <strong>100 million URL generations per day</strong> with a 10-year support capacity.</li>
+  <li>Support <strong>efficient read operations</strong> with a 10:1 read-to-write ratio.</li>
+  <li>Store 365 billion records, requiring approximately <strong>365 TB</strong> of storage over 10 years.</li>
+</ul>
+
+<h3>Step 1: High-Level Design</h3>
+<h4>API Endpoints</h4>
+<ol>
+  <li><strong>URL Shortening:</strong>
+    <ul>
+      <li>Endpoint: <code>POST api/v1/data/shorten</code></li>
+      <li>Parameters: <code>{longUrl: longURLString}</code></li>
+      <li>Returns: <code>shortURL</code></li>
+    </ul>
+  </li>
+  <li><strong>URL Redirecting:</strong>
+    <ul>
+      <li>Endpoint: <code>GET api/v1/shortUrl</code></li>
+      <li>Returns: <code>longURL</code> for redirection.</li>
+    </ul>
+  </li>
+</ol>
+<img class="orig-img" src="08.%20URL%20Shortener/images/url-redirection.png" alt="URL Redirection">
+
+<h4>URL Redirection</h4>
+<ul>
+  <li><strong>301 Redirect:</strong> A 301 redirect shows that the requested URL is "permanently" moved to the long URL. The browser caches the response, and subsequent requests for the same URL will not be sent to the URL shortening service.</li>
+  <li><strong>302 Redirect:</strong> Temporary; useful for analytics like tracking clicks.</li>
+</ul>
+
+<h4>URL Shortening</h4>
+<img class="orig-img" src="08.%20URL%20Shortener/images/url-shortening.png" alt="URL Shortening">
+<ul>
+  <li>Use a <strong>hash function</strong> to generate a short URL, mapping long URLs to unique shortened versions.</li>
+  <li>The hash function must satisfy the following requirements:
+    <ul>
+      <li>Each longURL must be hashed to one hashValue.</li>
+      <li>Each hashValue can be mapped back to the longURL.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>Step 2: Deep Dive into Design</h3>
+<h4>Data Model</h4>
+<p>Store <code>&lt;shortURL, longURL&gt;</code> mappings in a relational database to optimize memory usage. The table schema includes:</p>
+<ul>
+  <li><code>id</code> (primary key),</li>
+  <li><code>shortURL</code>,</li>
+  <li><code>longURL</code>.</li>
+</ul>
+<img class="orig-img" src="08.%20URL%20Shortener/images/table-schema.png" alt="Table Schema">
+
+<h4>Hash Function</h4>
+<h4>1. Base 62 Conversion:</h4>
+<ul>
+  <li>Encodes numbers using characters <code>[0-9, a-z, A-Z]</code>, providing <strong>62 possible characters</strong>.</li>
+  <li>Base conversion is another approach commonly used for URL shorteners.</li>
+  <li>A unique id can be assigned to the short url and ID can be base 62 converted to get the short URL.</li>
+  <li>A 7-character hash supports up to <strong>3.5 trillion unique URLs</strong>, enough for 365 billion URLs.</li>
+</ul>
+<p><strong>Example:</strong><br>
+Convert ID <code>2009215674938</code> to Base 62:</p>
+<ul>
+  <li><code>2009215674938</code> &rarr; <code>zn9edcu</code>.</li>
+</ul>
+
+<h4>2. Hash + Collision Resolution:</h4>
+<ul>
+  <li>Use hash functions like CRC32, MD5, or SHA-1.</li>
+</ul>
+<img class="orig-img" src="08.%20URL%20Shortener/images/hash-function.png" alt="Hash Function">
+<ul>
+  <li>One approach is to collect the first 7 characters of a hash value; however, this method can lead to hash collisions.</li>
+  <li>To resolve collisions, recursively append a new predefined string until no more collision but this can be expensive.</li>
+  <li>Resolve collisions with <strong>Bloom Filters</strong> for efficient lookup.</li>
+</ul>
+<img class="orig-img" src="08.%20URL%20Shortener/images/url-lookup.png" alt="URL Lookup">
+
+<h4>Comparison</h4>
+<ul>
+  <li><strong>Hash + Collision Resolution:</strong>
+    <ul>
+      <li>Fixed short URL length</li>
+      <li>Does not need a unique ID generator</li>
+      <li>Collision is possible and needs resolution</li>
+      <li>Not possible to find the next available short URL because it does not depend on ID</li>
+    </ul>
+  </li>
+  <li><strong>Base 62 Conversion</strong>
+    <ul>
+      <li>The length is not fixed and goes up with ID</li>
+      <li>It needs a unique ID generator</li>
+      <li>Collision is not possible</li>
+      <li>Easy to find the next short URL if ID increments by 1 (Can be a security concern)</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>URL Shortening Flow</h3>
+<img class="orig-img" src="08.%20URL%20Shortener/images/url-shortening-flow.png" alt="URL Shortening">
+<ol>
+  <li>Check if <code>longURL</code> exists in the database.</li>
+  <li>If found, return the existing <code>shortURL</code>.</li>
+  <li>Otherwise:
+    <ul>
+      <li>Generate a unique ID using a <strong>distributed ID generator</strong>.</li>
+      <li>Convert the ID to <code>shortURL</code> using Base 62.</li>
+      <li>Store the <code>&lt;id, shortURL, longURL&gt;</code> mapping in the database.</li>
+    </ul>
+  </li>
+</ol>
+
+<h3>URL Redirecting Flow</h3>
+<img class="orig-img" src="08.%20URL%20Shortener/images/url-redirecting-flow.png" alt="URL Shortening">
+<ol>
+  <li>User clicks a <code>shortURL</code>.</li>
+  <li>Query <code>&lt;shortURL, longURL&gt;</code> mapping:
+    <ul>
+      <li>Check the <strong>cache</strong> first for faster access.</li>
+      <li>If not in the cache, query the database.</li>
+    </ul>
+  </li>
+  <li>Redirect the user to <code>longURL</code>.</li>
+</ol>
+
+<h3>Additional Considerations</h3>
+<h4>Rate Limiter</h4>
+<ul>
+  <li>Prevent abuse by setting limits on requests per IP.</li>
+</ul>
+
+<h4>Scalability</h4>
+<ol>
+  <li><strong>Web Tier:</strong> Stateless, scalable by adding/removing web servers.</li>
+  <li><strong>Database Tier:</strong> Use replication and sharding.</li>
+</ol>
+
+<h4>Analytics</h4>
+<ul>
+  <li>Collect data like click rates, source, and timestamps for business insights.</li>
+</ul>
+
+<h4>High Availability and Reliability</h4>
+<ul>
+  <li>Ensure consistent and reliable services using database replication and fault-tolerant design.</li>
+</ul>

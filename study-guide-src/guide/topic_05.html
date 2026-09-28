@@ -1,0 +1,185 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 9 p.m. on a Friday and your cache cluster of four servers is humming along, each one holding a quarter of your hottest keys. Then server 1 quietly dies. With the classic formula <code>hash(key) % N</code>, N drops from 4 to 3, and in one instant almost every key on every surviving server now "belongs" somewhere else. The caches are still full of data, but nobody is looking in the right place: a storm of cache misses slams straight into your database. Consistent hashing exists so that losing (or adding) one server disturbs only the keys that server actually touched.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet this chapter is one problem, one shape, one lookup rule and one fix. Read the map top-down: each hub is a load-bearing idea; the grey peripheral items are details you can reconstruct once the hub is solid.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">The rehashing problem</span> <span class="why">— the pain that motivates everything else</span>
+      <ul>
+        <li><code>serverIndex = hash(key) % N</code> works while N is fixed
+          <ul><li><span class="peripheral">Example: 4 servers, keys spread by hash % 4</span></li></ul>
+        </li>
+        <li>Change N and most keys remap
+          <ul><li><span class="peripheral">Server 1 goes offline &rarr; hash % 3 &rarr; most keys land on a new server &rarr; cache misses</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">The hash ring</span> <span class="why">— the shape that makes change local instead of global</span>
+      <ul>
+        <li>Hash space 0 to 2^160 &minus; 1 (e.g. SHA-1), ends joined into a circle
+          <ul><li><span class="peripheral">Same hash function f places both servers (by IP or name) and keys</span></li></ul>
+        </li>
+        <li>Clockwise lookup rule: a key belongs to the first server found walking clockwise</li>
+      </ul>
+    </li>
+    <li><span class="hub">Adding &amp; removing servers</span> <span class="why">— the payoff: only one arc of keys moves</span>
+      <ul>
+        <li>Added server: keys between it and its anticlockwise predecessor move to it</li>
+        <li>Removed server: keys between its predecessor and it move to the next server clockwise
+          <ul><li><span class="peripheral">Worked examples: s4 added between s3 and s0; s1 removed, its keys go to s2</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Virtual nodes</span> <span class="why">— the fix that makes the ring fair</span>
+      <ul>
+        <li>Problems with the basic ring: uneven partition sizes, non-uniform key distribution</li>
+        <li>Each server appears many times on the ring
+          <ul><li><span class="peripheral">More virtual nodes &rarr; smaller standard deviation &rarr; more balanced load</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The rehashing problem is the "why"; the ring is the "how"; the add/remove behaviour is the proof that the ring works; virtual nodes patch the one weakness the plain ring still has. Each hub leans on the previous one, so if you can draw the ring and trace a key clockwise, the rest follows.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each step as a sealed box: something goes in, something comes out, and the output of one is the input of the next. This is the causal chain from "a key arrives" to "the cluster changed and barely noticed".</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Hash function f (e.g. SHA-1)</h4>
+      <p><strong>Input:</strong> a key string, or a server's IP/name.</p>
+      <p><strong>Output:</strong> a number in the range 0 to 2^160 &minus; 1.</p>
+      <p class="io-story">A blender that turns any name into a seemingly random position number. The same input always lands in the same place, which is what makes lookups repeatable.</p>
+      <p class="io-arrow">&rarr; feeds into: placement on the ring</p>
+    </div>
+    <div class="io-block">
+      <h4>Ring placement</h4>
+      <p><strong>Input:</strong> hash values for every server and every key.</p>
+      <p><strong>Output:</strong> points dotted around a circle (s0, s1, s2... and k0, k1, k2...).</p>
+      <p class="io-story">Bend the number line until 2^160 &minus; 1 touches 0, and you get a clock face. Servers and keys now share one geography.</p>
+      <p class="io-arrow">&rarr; feeds into: clockwise lookup</p>
+    </div>
+    <div class="io-block">
+      <h4>Clockwise lookup</h4>
+      <p><strong>Input:</strong> a key's position on the ring.</p>
+      <p><strong>Output:</strong> the owning server &mdash; the first server met walking clockwise.</p>
+      <p class="io-story">Each server "owns" the arc of ring just behind it (anticlockwise). A key simply walks forward until it bumps into an owner.</p>
+      <p class="io-arrow">&rarr; feeds into: routing the read/write to that server</p>
+    </div>
+    <div class="io-block">
+      <h4>Membership change (add or remove)</h4>
+      <p><strong>Input:</strong> a server joining or leaving the ring.</p>
+      <p><strong>Output:</strong> one arc of keys changes owner; every other key stays put.</p>
+      <p class="io-story">Adding a house on a circular street only changes the postman's route for the stretch just before the new house.</p>
+      <p class="io-arrow">&rarr; feeds into: minimal redistribution (the whole point)</p>
+    </div>
+    <div class="io-block">
+      <h4>Virtual nodes</h4>
+      <p><strong>Input:</strong> each physical server, replicated as many labelled points (s0_0, s0_1, s0_2...).</p>
+      <p><strong>Output:</strong> many small, interleaved arcs per server instead of one big lopsided arc.</p>
+      <p class="io-story">Instead of one big slice of pie per guest, everyone gets many thin slices scattered around the dish, so nobody ends up with half the pie by accident.</p>
+      <p class="io-arrow">&rarr; feeds into: balanced load, no hotspots</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one key</h4>
+    <ol class="journey-steps">
+      <li>A request arrives for <code>key0</code>. The system runs it through the same hash function f used for the servers.</li>
+      <li>The resulting hash lands <code>key0</code> near the top of the ring, just anticlockwise of server <code>s0</code>.</li>
+      <li>Walking clockwise, the first server met is <code>s0</code>, so <code>s0</code> stores and serves <code>key0</code>.</li>
+      <li>Traffic grows and you add <code>s4</code>. Its hash places it on the ring between <code>key0</code> and <code>s0</code>.</li>
+      <li>Now the clockwise walk from <code>key0</code> hits <code>s4</code> first, so <code>key0</code> moves to <code>s4</code>.</li>
+      <li>Which keys moved? Only those between <code>s4</code> and its anticlockwise predecessor <code>s3</code>. <code>key1</code>, <code>key2</code> and <code>key3</code> never notice.</li>
+      <li>Later <code>s1</code> fails. Only keys between <code>s0</code> and <code>s1</code> are affected, and they slide clockwise to <code>s2</code>. Everything else keeps hitting a warm cache.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Consistent hashing lets you scale horizontally by guaranteeing that a change in server count remaps only a fraction of keys, while virtual nodes keep the data spread evenly enough to avoid hotspots.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a circular running track with lockers bolted at random spots around it &mdash; those lockers are your servers, placed by hashing their names. Every runner (a key) starts at a spot determined by their own hash and jogs clockwise until they reach the first locker, and that is where their bag lives. Bolt a new locker onto the track and only the runners who started in the short stretch just before it change lockers; everyone else jogs to the same place as before. Rip a locker out and only its runners jog a little further to the next one. Finally, to stop one locker from covering a huge empty stretch of track, each owner bolts many small lockers all around the loop &mdash; those are virtual nodes &mdash; so every owner covers a fair share of the distance.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">hash(key) % N</span><span class="beacon-def">The naive mapping; the instant you see N change, expect most keys to move.</span></div>
+    <div class="beacon"><span class="beacon-term">Rehashing problem</span><span class="beacon-def">Server count changes &rarr; mass key reassignment &rarr; cache misses and overload.</span></div>
+    <div class="beacon"><span class="beacon-term">Hash ring</span><span class="beacon-def">The hash space with its ends joined; the shape that makes change local.</span></div>
+    <div class="beacon"><span class="beacon-term">0 to 2^160 &minus; 1</span><span class="beacon-def">The SHA-1 hash space; connect 0 to the maximum value and the line becomes the ring.</span></div>
+    <div class="beacon"><span class="beacon-term">Clockwise lookup</span><span class="beacon-def">A key belongs to the first server found moving clockwise from its position.</span></div>
+    <div class="beacon"><span class="beacon-term">Affected range (add)</span><span class="beacon-def">From the new server anticlockwise to its predecessor; those keys move to the new server.</span></div>
+    <div class="beacon"><span class="beacon-term">Affected range (remove)</span><span class="beacon-def">From the removed server anticlockwise to its predecessor; those keys move to the next server clockwise.</span></div>
+    <div class="beacon"><span class="beacon-term">Uneven partitions</span><span class="beacon-def">With few servers, arcs between them differ wildly in length.</span></div>
+    <div class="beacon"><span class="beacon-term">Non-uniform key distribution</span><span class="beacon-def">Keys can cluster so that one server receives far more than the rest.</span></div>
+    <div class="beacon"><span class="beacon-term">Virtual nodes</span><span class="beacon-def">Many ring positions per server; more of them means lower standard deviation and better balance.</span></div>
+    <div class="beacon"><span class="beacon-term">Hotspot</span><span class="beacon-def">A server overloaded with a disproportionate share of keys &mdash; what the ring plus virtual nodes mitigates.</span></div>
+    <div class="beacon"><span class="beacon-term">Dynamo, Cassandra, Discord, Akamai, Maglev</span><span class="beacon-def">Real systems using the technique &mdash; drop these names to show it is industrial-strength.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Three ideas carry nearly all the exam and interview weight: why modulo hashing breaks, exactly which keys move on the ring, and why virtual nodes are non-negotiable. Drill these; skim the rest.</p>
+
+  <div class="drill">
+    <h4>Why modulo hashing collapses when N changes</h4>
+    <p>With four servers, <code>serverIndex = hash % 4</code> spreads keys neatly: key1 and key3 on server 0, key0 and key4 on server 1, and so on. The formula is perfectly fine as long as the pool never changes size.</p>
+    <p>Now server 1 goes offline. The formula becomes <code>hash % 3</code>, and because the divisor changed, the remainder changes for most keys &mdash; not just the ones that lived on server 1. Keys that were happily cached on servers 0, 2 and 3 are suddenly routed elsewhere. The data is still sitting in memory; clients are just knocking on the wrong door.</p>
+    <figure class="guide-fig"><img src="05.%20Consistent%20Hashing/images/server-hashing-miss.png" alt="Keys redistributed after server 1 goes offline, with hash % 3"><figcaption>After server 1 dies and the formula becomes hash % 3, every red key has moved &mdash; including key3, key5 and key7, which were never on server 1. That collateral movement is the rehashing problem.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> saying "only the dead server's keys are lost". With modulo hashing the damage is global &mdash; most keys on healthy servers are remapped too, which is what causes the cache-miss storm.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Exactly which keys move on the ring</h4>
+    <p>The rule to memorise: start at the server that changed and walk <em>anticlockwise</em> until you hit the next server. That arc is the affected range. Nothing outside it moves.</p>
+    <p>When a server is added, the keys in that arc used to walk past the gap and land on the next server clockwise; now the new server intercepts them. When a server is removed, the keys in its arc keep walking clockwise and land on its successor.</p>
+    <div class="anim" data-anim="hash-ring"></div>
+    <figure class="guide-fig"><img src="05.%20Consistent%20Hashing/images/server-addition.png" alt="Server s4 added to the ring; key0 moves from s0 to s4"><figcaption>s4 is added. key0 used to walk clockwise to s0 (dashed, crossed out); now it stops at s4. Only keys between s3 and s4 are affected &mdash; k1, k2 and k3 are untouched.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Event</th><th>Affected range</th><th>Where the keys go</th><th>Example from the notes</th></tr></thead>
+      <tbody>
+        <tr><td>Server added</td><td>New server &rarr; anticlockwise to predecessor</td><td>To the new server</td><td>s4 added; keys between s3 and s4 move to s4</td></tr>
+        <tr><td>Server removed</td><td>Removed server &rarr; anticlockwise to predecessor</td><td>To the next server clockwise</td><td>s1 removed; keys between s0 and s1 move to s2</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall"><strong>Common trap:</strong> mixing up directions. Lookup walks <em>clockwise</em>; finding the affected range walks <em>anticlockwise</em>. Say both out loud when you draw it.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Virtual nodes: turning a lumpy ring into a fair one</h4>
+    <p>The plain ring has two flaws. Server positions are effectively random, so with only a handful of servers one might own a huge arc while another owns a sliver (uneven partition sizes). And keys themselves may bunch up, so one server receives far more than its share (non-uniform key distribution).</p>
+    <p>The fix is to place each server on the ring many times. Server 0 becomes s0_0, s0_1, s0_2; server 1 becomes s1_0, s1_1, s1_2. Each physical server now owns many short, interleaved arcs. Statistically, the more virtual nodes you add, the smaller the standard deviation of load, and the more balanced the data.</p>
+    <figure class="guide-fig"><img src="05.%20Consistent%20Hashing/images/virtual-nodes.png" alt="Two servers each represented by three virtual nodes on the ring"><figcaption>Two physical servers, three virtual nodes each. Notice how the purple (s0) and blue (s1) arcs alternate around the ring &mdash; neither server can hog one giant stretch.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Much more even load; fewer hotspots; when a server leaves, its many small arcs are spread across many neighbours rather than dumped on one.</p></div>
+      <div class="con"><strong>Costs</strong><p>More positions to store and search on the ring &mdash; extra metadata in exchange for balance.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Why it matters: the three benefits</h4>
+    <ol class="steps">
+      <li><strong>Minimised redistribution</strong> &mdash; only a fraction of keys move when servers come and go.</li>
+      <li><strong>Horizontal scalability</strong> &mdash; you can add servers without a cluster-wide reshuffle.</li>
+      <li><strong>Hotspot mitigation</strong> &mdash; with virtual nodes, data is balanced so no single server is overloaded.</li>
+    </ol>
+    <p>These are why Amazon DynamoDB, Apache Cassandra, Discord, Akamai's CDN and the Maglev load balancer all lean on consistent hashing. In the next chapter, the key-value store uses this exact ring for partitioning and replication.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch a ring in the margin and answer with your stylus before tapping to reveal.</p>
+  <details class="qa"><summary>Why does <code>hash(key) % N</code> cause a cache-miss storm when one server dies?</summary><div class="qa-answer"><p>Because N changes, the remainder changes for most keys, not just those on the dead server. Keys still cached on healthy servers are routed to different servers, so lookups miss even though the data exists.</p></div></details>
+  <details class="qa"><summary>How is the owning server of a key found on the hash ring?</summary><div class="qa-answer"><p>Hash the key onto the ring with the same function used for servers, then walk clockwise from its position. The first server encountered owns the key.</p></div></details>
+  <details class="qa"><summary>What happens if server s1 is removed from the ring, with s0 before it and s2 after it?</summary><div class="qa-answer"><p>Only keys between s0 and s1 are affected. They continue clockwise and are reassigned to s2. All other keys keep their servers.</p></div></details>
+  <details class="qa"><summary>You add s4 between s3 and s0. Which keys move and to where?</summary><div class="qa-answer"><p>The keys in the arc from s3 up to s4 (walking anticlockwise from s4 until you hit s3). They used to go to s0; now they stop at s4.</p></div></details>
+  <details class="qa"><summary>What two problems does the basic ring have, and what fixes them?</summary><div class="qa-answer"><p>Uneven partition sizes and non-uniform key distribution. Virtual nodes fix both by giving each server many ring positions, which shrinks the standard deviation of load.</p></div></details>
+  <details class="qa"><summary>Compare modulo hashing and consistent hashing when a server is added.</summary><div class="qa-answer"><p>Modulo hashing reshuffles most keys across all servers because the divisor changes. Consistent hashing moves only the keys in one arc to the new server; everything else stays.</p></div></details>
+  <details class="qa"><summary>What would happen with too few virtual nodes per server?</summary><div class="qa-answer"><p>Arc lengths would vary a lot, so load would be lopsided and some servers would become hotspots. More virtual nodes means lower standard deviation and more balanced data.</p></div></details>
+</div>

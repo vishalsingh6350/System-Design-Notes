@@ -1,0 +1,319 @@
+<h3>Introduction</h3>
+<p>A <strong>proximity service</strong> is designed to find nearby locations, such as restaurants, hotels, gas stations, and other businesses. This functionality is used in applications like <strong>Google Maps</strong> and <strong>Yelp</strong> to help users discover places within a defined radius.</p>
+
+<h3>Step 1: Understanding the Problem and Establishing Scope</h3>
+<h4><strong>Functional Requirements</strong></h4>
+<ol>
+  <li><strong>Search for businesses</strong> based on user location (latitude, longitude) and search radius.</li>
+  <li><strong>Allow business owners</strong> to add, update, or delete businesses (not real-time).</li>
+  <li><strong>Provide detailed business information</strong> when requested.</li>
+</ol>
+<h4><strong>Non-Functional Requirements</strong></h4>
+<ul>
+  <li><strong>Low latency</strong>: Users should get quick responses.</li>
+  <li><strong>Data privacy</strong>: Compliance with GDPR and CCPA regulations.</li>
+  <li><strong>High availability</strong>: Handle peak-hour spikes in busy locations.</li>
+</ul>
+<h4><strong>Back-of-the-Envelope Estimation</strong></h4>
+<ul>
+  <li><strong>100 million daily active users</strong>.</li>
+  <li><strong>200 million businesses</strong> in the system.</li>
+  <li><strong>Search QPS Calculation</strong>:
+    <ul>
+      <li>Users make <strong>5 searches per day</strong>.</li>
+      <li><strong>Search QPS</strong> = (100M &times; 5) / 86,400 &asymp; <strong>5,000 QPS</strong>.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>Step 2: High-Level Design</h3>
+<h4><strong>API Design</strong></h4>
+<h4><strong>Search Nearby Businesses</strong></h4>
+<p>GET /v1/search/nearby</p>
+<ul>
+  <li><strong>Request Parameters</strong>:
+    <ul>
+      <li><code>latitude</code>: User's location latitude.</li>
+      <li><code>longitude</code>: User's location longitude.</li>
+      <li><code>radius</code>: Search radius (default: 5000m).</li>
+    </ul>
+  </li>
+</ul>
+<h4><strong>Business APIs</strong></h4>
+<table>
+  <thead>
+    <tr><th>API Endpoint</th><th>Description</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>GET /v1/businesses/{id}</code></td><td>Fetch detailed business info</td></tr>
+    <tr><td><code>POST /v1/businesses</code></td><td>Add a new business</td></tr>
+    <tr><td><code>PUT /v1/businesses/{id}</code></td><td>Update business details</td></tr>
+    <tr><td><code>DELETE /v1/businesses/{id}</code></td><td>Remove a business from the system</td></tr>
+  </tbody>
+</table>
+
+<h4><strong>Data Model</strong></h4>
+<ul>
+  <li>Since the read volume is high because two features are very commonly used, a relational database such as MySQL is a good fit.
+    <ul>
+      <li>Search for nearby businesses</li>
+      <li>View the detailed information of a business</li>
+    </ul>
+  </li>
+</ul>
+<h4><strong>Data Schema</strong></h4>
+<ul>
+  <li>Key Database tables are the business table and the geospatial index table</li>
+  <li>The business table consists the detailed information about a business.</li>
+</ul>
+<h4><strong>High-Level System Architecture</strong></h4>
+<p>The system comprises of two parts: Location based service (LBS) and business related service.</p>
+<img class="orig-img" src="16.%20Proximity%20Service/images/high-level-design.png" alt="HLD">
+<ul>
+  <li><strong>Location-Based Service (LBS)</strong>:
+    <ul>
+      <li>Processes location-based search queries.</li>
+      <li>Read-heavy service with no write requests.</li>
+      <li>QPS is high especially during peak hours in dense areas and the system is stateless.</li>
+    </ul>
+  </li>
+  <li><strong>Business Service</strong>: Deals with two types of requests.
+    <ul>
+      <li>Business owners create, update or delete businesses.</li>
+      <li>Customers view detailed information about a business.</li>
+    </ul>
+  </li>
+  <li><strong>Load Balancer</strong>: Routes traffic to LBS and Business service.</li>
+  <li><strong>Database Cluster</strong>:
+    <ul>
+      <li>Uses <strong>primary-replica architecture</strong> for read-heavy workloads.</li>
+      <li>There might be some discrepancy between data read b/w data read by LBS and data written by by primary database.</li>
+      <li>This inconsistency is not an issue because the business information is not updated in real-time.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>Step 3: Algorithms for Fetching Nearby Businesses</h3>
+<h4><strong>Option 1: Two-Dimensional Search (Naive Approach)</strong></h4>
+<img class="orig-img" src="16.%20Proximity%20Service/images/2d-search.png" alt="2D">
+<p>The most intuitive way is to draw a circle with pre-defined radius and find all the businesses within the circle.</p>
+<p><strong>SQL Query:</strong></p>
+<pre><code>SELECT business_id, latitude, longitude
+FROM business
+WHERE (latitude BETWEEN :lat - radius AND :lat + radius)
+AND (longitude BETWEEN :long - radius AND :long + radius);</code></pre>
+<p><strong>Problems:</strong></p>
+<ul>
+  <li><strong>Inefficient</strong>: Requires scanning the entire database.</li>
+  <li><strong>Limited by one-dimensional indexes</strong> (latitude/longitude).</li>
+</ul>
+<p>A potential improvement is to build index on longitude and latitude columns, although this is slightly better but still very slow.</p>
+
+<h4>Better Approach</h4>
+<ul>
+  <li>The problem with last approach is that the database index can only increase search speed in one dimension.</li>
+  <li>An optimal approach is to represent the two-dimensional data into one dimension using geospatial indexing.
+    <ul>
+      <li>Hash: Even grid, Geo Hash</li>
+      <li>Tree: Quadtree, Google S2, RTree</li>
+    </ul>
+  </li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/geospatial-index-types.png" alt="2D">
+
+<h4><strong>Option 2: Evenly Divided Grid</strong></h4>
+<img class="orig-img" src="16.%20Proximity%20Service/images/even-grid.png" alt="Even Grid">
+<ul>
+  <li><strong>Divides the world into fixed-size grids</strong>.</li>
+  <li><strong>Issue</strong>: Uneven business distribution (high density in cities, sparse in rural areas).</li>
+</ul>
+
+<h4><strong>Option 3: Geohash</strong></h4>
+<ul>
+  <li>Divide the planet into four quadrants along with the prime meridian and equator. And then divide each grid into four smaller grids.</li>
+  <li>Each grids can be represented by altering b/w longitude and latitude bit.</li>
+  <li>Repeat this subdivision</li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/geohash.png" alt="Geohash">
+<img class="orig-img" src="16.%20Proximity%20Service/images/geohash-1.png" alt="Geohash">
+<ul>
+  <li><strong>Encodes latitude and longitude into a single alphanumeric string</strong>. It has 12 precisions (levels)</li>
+  <li><strong>Hierarchical grid structure</strong> allows for efficient searching.</li>
+  <li>The right precision is chosen by using the minimal geohash length according to the table.</li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/geohash-radius-mapping.png" alt="Geohash Radius">
+<ul>
+  <li>Geohash guarantees that the longer a shared prefix is between two geohashes, the closer they are.</li>
+</ul>
+<p><strong>Challenges</strong>:</p>
+<img class="orig-img" src="16.%20Proximity%20Service/images/boundary-issue.png" alt="Boundary Issue">
+<ul>
+  <li><strong>Boundary issues</strong> (businesses close to grid edges may get excluded).
+    <ul>
+      <li>Two locations can be very close but have no shared prefix at all (can be on other side of equator)</li>
+      <li>Two locations can have a long shared prefix but belong to different geohashes.</li>
+    </ul>
+  </li>
+  <li>Solution: Need to search neighboring grids.</li>
+</ul>
+
+<h4><strong>Option 4: Quadtree</strong></h4>
+<p>A quadtree is a tree data structure that recursively divides a two-dimensional space into four quadrants, with each internal node having exactly four children, representing the four sub-regions of the space.</p>
+<ul>
+  <li>The quadtree is an in-memory data structure and it runs on each LBS server and built on server startup time.</li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/quadtree.png" alt="Quadtree">
+<ul>
+  <li>The root node is recursively broken down into 4 quadrants until no nodes are left with more than x number of businesses (100 in this case).</li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/building-quadtree.png" alt="Building Quadtree">
+<ul>
+  <li>The quadtree index doesn't take too much memory (typically in GBs) and can easily fit in one server.</li>
+  <li>Since the time complexity to build the tree is nlogn, it might take a few minutes to build the tree.</li>
+  <li><strong>Efficient for k-nearest search queries</strong> (e.g., find the closest gas station).</li>
+</ul>
+<img class="orig-img" src="16.%20Proximity%20Service/images/realworld-quadtree.png" alt="Real World Quadtree">
+<h4>Operational considerations</h4>
+<ul>
+  <li>For around 200 million businesses, it might take few minutes to build a quadtree at the server start time.</li>
+  <li>While the quadtree is built it cannot serve traffic, therefore a new release should be rolled out incrementally to a subset of servers.</li>
+  <li>When updating a business or adding a new the easiest approach is to incrementally rebuild the quadtree. (Leading to a lot of cache invalidation)</li>
+  <li>Also possible to update the quadtree on the fly but more complex to implement. (Needs locking mechanism)</li>
+</ul>
+
+<h4><strong>Option 5: Google S2</strong></h4>
+<p>It maps a sphere to a 1D index based on Hilbert curve. Two points that are close to each other on the Hilbert curve are close in 1D space.</p>
+<img class="orig-img" src="16.%20Proximity%20Service/images/hilbert-curve.png" alt="Hilbert curve">
+<img class="orig-img" src="16.%20Proximity%20Service/images/geofence.png" alt="Geofence">
+<ul>
+  <li><strong>Divides the earth into small cells using a Hilbert curve</strong>.</li>
+  <li>Great for geofencing because it can cover arbitrary areas with varying levels.</li>
+  <li>Geofencing also allows to define parameters that surround the area of interest.</li>
+  <li>Another advantage if instead of having a fixed level of precision, we can specify min,max level and max cells in S2.</li>
+</ul>
+
+<h3>Tradeoff Comparison</h3>
+<h4>Geohash</h4>
+<ul>
+  <li>Easy to use and implement - No need to build/rebuild a tree</li>
+  <li>Supports fixed radius results</li>
+  <li>Updating the index is easy.</li>
+  <li>Cannot dynamically adjust the grid size based on population density.</li>
+</ul>
+<h4>Quadtree</h4>
+<ul>
+  <li>Slightly harder to implement.</li>
+  <li>Supports fetching k-nearest businesses.</li>
+  <li>Can dynamically adjust the grid size based on population density.</li>
+  <li>Updating the index is more complicated as might need to rebuild the whole tree.</li>
+</ul>
+
+<h3>Step 4: Scaling the Database and Caching Strategy</h3>
+<h4><strong>Scaling the Business Table</strong></h4>
+<ul>
+  <li><strong>Sharding by business ID</strong> ensures even data distribution.</li>
+  <li>We have separate rows for each business in the table.</li>
+</ul>
+<table>
+  <thead><tr><th>Geohash</th><th>Business ID</th></tr></thead>
+  <tbody>
+    <tr><td>9q9hvu</td><td>343</td></tr>
+    <tr><td>9q9hvu</td><td>347</td></tr>
+    <tr><td>9q9hvu</td><td>112</td></tr>
+  </tbody>
+</table>
+
+<h4><strong>Scaling the Geospatial Index</strong></h4>
+<ul>
+  <li>Might not be a good fit for the geohash table. In this case everything can fit in a single server so there's no technical reason for sharding.</li>
+  <li>A better approach is to have read-replicas to help with read loads.</li>
+</ul>
+
+<h4><strong>Cache Strategy</strong></h4>
+<p>The most obvious cache key choice is the location coordinate, however it has a few issues:</p>
+<ul>
+  <li>Location coordinates from gps are not accurate.</li>
+  <li>A user can move causing the location coordinate to change.</li>
+  <li>A better key is the geohash.</li>
+</ul>
+<table>
+  <thead><tr><th>Cache Key</th><th>Cache Value</th></tr></thead>
+  <tbody>
+    <tr><td><code>geohash</code></td><td>List of business IDs in that grid</td></tr>
+    <tr><td><code>business_id</code></td><td>Business details (name, address, reviews, etc.)</td></tr>
+  </tbody>
+</table>
+
+<h3>Step 5: Deployment Strategy and Final Architecture</h3>
+<h4><strong>Region and Availability Zones</strong></h4>
+<ul><li>Deploy LBS and Business Service <strong>across multiple regions</strong>.</li></ul>
+<h4><strong>Handling Real-Time Updates</strong></h4>
+<ul><li><strong>Business updates are batch processed daily</strong>.</li></ul>
+<h4><strong>Final System Architecture</strong></h4>
+<img class="orig-img" src="16.%20Proximity%20Service/images/final-design.png" alt="Final Design">
+<p>This final algorithm looks like this:</p>
+
+<h3>Steps to Retrieve Nearby Businesses</h3>
+<ol>
+  <li><strong>User Request:</strong>
+    <ul>
+      <li>A user searches for restaurants within <strong>500 meters</strong>.</li>
+      <li>The client sends <strong>latitude (37.776720), longitude (-122.416730), and radius (500m)</strong> to the <strong>load balancer</strong>.</li>
+    </ul>
+  </li>
+  <li><strong>Request Forwarding:</strong>
+    <ul><li>The <strong>load balancer (LB)</strong> forwards the request to the <strong>Location-Based Service (LBS)</strong>.</li></ul>
+  </li>
+  <li><strong>Geohash Calculation:</strong>
+    <ul>
+      <li>LBS determines the <strong>geohash length</strong> matching the radius.</li>
+      <li>Using a reference table, <strong>500m corresponds to geohash length = 6</strong>.</li>
+    </ul>
+  </li>
+  <li><strong>Fetching Neighboring Geohashes:</strong>
+    <ul>
+      <li>LBS calculates <strong>neighboring geohashes</strong> to include nearby areas.</li>
+      <li>The result is a list:
+        <pre><code>[my_geohash, neighbor1_geohash, neighbor2_geohash, ..., neighbor8_geohash]</code></pre>
+      </li>
+    </ul>
+  </li>
+  <li><strong>Fetching Business IDs from Redis:</strong>
+    <ul>
+      <li>For each geohash in the list, LBS queries the <strong>Geohash Redis server</strong> to fetch <strong>business IDs</strong>.</li>
+      <li>Parallel queries are used to minimize latency.</li>
+    </ul>
+  </li>
+  <li><strong>Retrieving &amp; Ranking Businesses:</strong>
+    <ul>
+      <li>LBS fetches <strong>full business details</strong> from the <strong>Business Info Redis server</strong>.</li>
+      <li>Businesses are <strong>sorted by distance</strong> from the user's location.</li>
+      <li>The <strong>ranked results</strong> are sent back to the client.</li>
+    </ul>
+  </li>
+</ol>
+
+<h3>Key Optimizations</h3>
+<ul>
+  <li><strong>Parallel Redis Calls</strong>: Reduces response time.</li>
+  <li><strong>Geohash Indexing</strong>: Ensures efficient spatial queries.</li>
+  <li><strong>Caching</strong>: Speeds up lookup and retrieval of business data.</li>
+</ul>
+<p>This method ensures <strong>low-latency, scalable</strong> retrieval of businesses near a user's location.</p>
+
+<h4><strong>Choosing the Best Indexing Method</strong></h4>
+<table>
+  <thead><tr><th>Indexing Method</th><th>Pros</th><th>Cons</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Geohash</strong></td><td>Easy to implement, efficient for proximity search</td><td>Boundary issues, fixed grid size</td></tr>
+    <tr><td><strong>Quadtree</strong></td><td>Dynamically adjusts to density, supports k-nearest queries</td><td>More complex, requires tree rebalancing</td></tr>
+    <tr><td><strong>Google S2</strong></td><td>Advanced geofencing, used in Google Maps</td><td>Harder to implement</td></tr>
+  </tbody>
+</table>
+
+<h3>References</h3>
+<ol>
+  <li><a href="https://www.movable-type.co.uk/scripts/geohash.html">Geohash Algorithm</a></li>
+  <li><a href="https://en.wikipedia.org/wiki/Quadtree">Quadtree Indexing</a></li>
+  <li><a href="https://s2geometry.io/">Google S2 Geometry</a></li>
+</ol>

@@ -1,0 +1,223 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You launch your app on a single machine: the web app, the database and the cache all share one box, like a food truck where one cook takes orders, grills, and washes dishes. It works beautifully for a hundred friends. Then a post goes viral and a million strangers show up at once. The CPU pins at 100%, the database starts queuing reads behind writes, and if that one box reboots, your entire product vanishes from the internet. This chapter is the story of turning that food truck into a restaurant chain, one deliberate step at a time.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet, scaling is four moves repeated at every tier: separate the parts, copy them, move hot data closer, and decouple what does not need to wait. Read the map top to bottom; each hub unlocks the ones beneath it.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Separation of tiers</span> <span class="why">— you cannot scale a part independently until it lives on its own machine</span>
+      <ul>
+        <li>Single server: DNS resolves api.mysite.com to one IP; HTTP returns HTML or JSON
+          <ul><li><span class="peripheral">Traffic from web apps (server-side Python/Java, client-side JS/HTML) and mobile apps (HTTP + JSON)</span></li></ul>
+        </li>
+        <li>Dedicated database server
+          <ul>
+            <li><span class="peripheral">SQL (MySQL, PostgreSQL) vs NoSQL (key-value, graph, column, document)</span></li>
+            <li><span class="peripheral">NoSQL when you need super-low latency, unstructured data, only serialization, or massive volume</span></li>
+          </ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Horizontal scaling + redundancy</span> <span class="why">— adding machines instead of bigger machines is the only path past hardware limits and single points of failure</span>
+      <ul>
+        <li>Load balancer spreads traffic; reroutes if a server dies</li>
+        <li>Stateless web tier: session data moves to a shared store, enabling auto-scaling</li>
+        <li>Database replication: master takes writes, slaves take reads
+          <ul><li><span class="peripheral">Failover: slave promoted to master; data recovery scripts, multi-master, circular replication</span></li></ul>
+        </li>
+        <li>Multi-data center: GeoDNS routing, data replication across centers
+          <ul><li><span class="peripheral">Traffic redirection tools, data synchronization, automated deployment</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Caching layers</span> <span class="why">— memory is far faster than disk, so every repeated read you absorb early protects the database</span>
+      <ul>
+        <li>Cache tier: read-heavy, rarely-modified data
+          <ul><li><span class="peripheral">Expiration, consistency, SPOF mitigation, LRU eviction</span></li></ul>
+        </li>
+        <li>CDN: static assets (images, CSS, JS) on geographically distributed servers
+          <ul><li><span class="peripheral">Cost, cache expiry, CDN fallback, file invalidation</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Decoupling &amp; data partitioning</span> <span class="why">— at the largest scale, components must stop waiting on each other and data must stop living in one place</span>
+      <ul>
+        <li>Message queue: producers publish, consumers process asynchronously</li>
+        <li>Sharding by a key such as user_id
+          <ul><li><span class="peripheral">Resharding (consistent hashing), celebrity problem, joins and de-normalization</span></li></ul>
+        </li>
+        <li><span class="peripheral">Logging, metrics, automation to see and steer the whole machine</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Separation comes first because it is the precondition for everything else: you cannot put a load balancer in front of a web tier that still owns the database. Horizontal scaling is the spine, but it only works once servers are stateless and data is replicated. Caching then shields the data tier, and decoupling plus sharding carry you from millions of users into tens of millions.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each layer as a sealed box: something goes in, something comes out, and the output of one is the input of the next. The order below is the order a request actually meets them.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>DNS / GeoDNS</h4>
+      <p><strong>Input:</strong> A domain name such as api.mysite.com plus the user's location.</p>
+      <p><strong>Output:</strong> The IP address of the nearest data center's entry point.</p>
+      <p class="io-story">The phone book of the internet; with GeoDNS it is a phone book that hands you the number of the branch closest to your house.</p>
+      <p class="io-arrow">&rarr; feeds into: CDN (for static files) and the load balancer (for dynamic requests)</p>
+    </div>
+    <div class="io-block">
+      <h4>CDN</h4>
+      <p><strong>Input:</strong> A request for a static asset: an image, a CSS file, a JavaScript bundle.</p>
+      <p><strong>Output:</strong> The asset from the nearest edge server, or, on a miss, a fetch from the origin that is then cached.</p>
+      <p class="io-story">Vending machines placed in every neighborhood so people stop driving to the central warehouse for a soda.</p>
+      <p class="io-arrow">&rarr; feeds into: the browser renders the page shell; dynamic calls continue to the load balancer</p>
+    </div>
+    <div class="io-block">
+      <h4>Load balancer</h4>
+      <p><strong>Input:</strong> Every dynamic HTTP request hitting the public IP.</p>
+      <p><strong>Output:</strong> The same request forwarded to one healthy web server in the pool.</p>
+      <p class="io-story">A host at the restaurant door seating guests at whichever table is free, and quietly skipping a waiter who has gone home sick.</p>
+      <p class="io-arrow">&rarr; feeds into: stateless web servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Stateless web server</h4>
+      <p><strong>Input:</strong> A request plus a session ID; session data is fetched from a shared store.</p>
+      <p><strong>Output:</strong> Business logic executed; reads go to cache/DB, slow side-work goes to a queue.</p>
+      <p class="io-story">An interchangeable waiter who keeps no notes in a pocket; every order is written on the shared board, so any waiter can serve any guest.</p>
+      <p class="io-arrow">&rarr; feeds into: cache, database, message queue</p>
+    </div>
+    <div class="io-block">
+      <h4>Cache tier</h4>
+      <p><strong>Input:</strong> A key for frequently read, rarely modified data.</p>
+      <p><strong>Output:</strong> The value from memory (hit), or nothing (miss), in which case the server reads the DB and fills the cache.</p>
+      <p class="io-story">The spice rack beside the stove: the cook grabs salt in a second instead of walking to the basement pantry.</p>
+      <p class="io-arrow">&rarr; feeds into: on a miss, the database</p>
+    </div>
+    <div class="io-block">
+      <h4>Replicated, sharded database</h4>
+      <p><strong>Input:</strong> Writes (insert, update, delete) and reads, each routed by a sharding key like user_id.</p>
+      <p><strong>Output:</strong> Writes land on the master of the right shard; reads are served by its slaves.</p>
+      <p class="io-story">A library split into several buildings by surname; in each building, one head librarian updates the catalog while many assistants answer questions from copies.</p>
+      <p class="io-arrow">&rarr; feeds into: the response returned to the web server</p>
+    </div>
+    <div class="io-block">
+      <h4>Message queue + workers</h4>
+      <p><strong>Input:</strong> Messages published by producers, e.g. "process this photo".</p>
+      <p><strong>Output:</strong> Consumers pull messages and perform the work asynchronously, at their own pace.</p>
+      <p class="io-story">The ticket rail in a kitchen: waiters clip orders and walk away; cooks pull tickets when their hands are free.</p>
+      <p class="io-arrow">&rarr; feeds into: background results, observed via logging and metrics</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one request</h4>
+    <ol class="journey-steps">
+      <li>A user in Europe opens your app. GeoDNS resolves api.mysite.com to the European data center rather than the US one.</li>
+      <li>The page's logo, CSS and JavaScript are fetched from a nearby CDN edge; they were cached there after the first visitor's miss hit the origin.</li>
+      <li>The app then calls GET /feed. The load balancer receives it on its public IP and forwards it to Server 2, because Server 1 just failed a health check.</li>
+      <li>Server 2 holds no memory of this user. It reads the session from the shared NoSQL store using the session ID, so it does not matter which server answered last time.</li>
+      <li>It asks the cache for the user's profile: a hit, returned from memory in a fraction of the time a disk read would take.</li>
+      <li>The feed items are a miss. The server hashes user_id to find shard 2 and reads from one of that shard's slave replicas, then writes the result into the cache with an expiry.</li>
+      <li>The user also uploads a photo. The server writes the metadata to shard 2's master, then publishes a "resize photo" message to the queue and responds immediately.</li>
+      <li>A worker picks up the message seconds later and creates thumbnails; logs and metrics record the latency and error rate of every step for the dashboards.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Scaling is not one big leap but an iterative sequence of removing the current bottleneck and single point of failure. The five takeaways: keep the web tier stateless, build redundancy at every tier, cache aggressively, shard the data tier, and decouple components.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of growing a single food truck into a national restaurant chain. The host at the door who seats guests is the <strong>load balancer</strong>; the interchangeable waiters who carry no private notes are the <strong>stateless web servers</strong>, and the shared order board is the <strong>session store</strong>. The spice rack by the stove is the <strong>cache</strong>, and the vending machines in every neighborhood are the <strong>CDN</strong>. The head chef who alone changes the recipe book while sous-chefs read copies is <strong>master-slave replication</strong>; splitting the recipe book into volumes by dish is <strong>sharding</strong>. The ticket rail between waiters and cooks is the <strong>message queue</strong>, and opening branches in other cities, with GeoDNS as the signpost, is the <strong>multi-data center</strong> setup.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Vertical scaling (scale up)</span><span class="beacon-def">Bigger CPU/RAM on one box: simple, but capped by hardware, costly, and still a single point of failure.</span></div>
+    <div class="beacon"><span class="beacon-term">Horizontal scaling (scale out)</span><span class="beacon-def">More servers in a pool behind a load balancer; the default choice for large-scale systems.</span></div>
+    <div class="beacon"><span class="beacon-term">Load balancer</span><span class="beacon-def">Distributes traffic across servers; gives redundancy (reroute on failure) and scalability (add servers on spikes).</span></div>
+    <div class="beacon"><span class="beacon-term">Master-slave replication</span><span class="beacon-def">Writes to the master, reads from many slaves; you see it whenever reads far outnumber writes.</span></div>
+    <div class="beacon"><span class="beacon-term">Slave promotion</span><span class="beacon-def">If the master dies a slave becomes master; it may be stale, so recovery scripts fill the gap.</span></div>
+    <div class="beacon"><span class="beacon-term">Cache (LRU eviction)</span><span class="beacon-def">In-memory store for read-often, write-rarely data; when full, the least recently used item is evicted.</span></div>
+    <div class="beacon"><span class="beacon-term">CDN</span><span class="beacon-def">Geographically distributed cache for static content; you pay per transfer and must plan fallback and invalidation.</span></div>
+    <div class="beacon"><span class="beacon-term">Stateless web tier</span><span class="beacon-def">Session data lives in a shared store, so any server can handle any request and auto-scaling becomes trivial.</span></div>
+    <div class="beacon"><span class="beacon-term">GeoDNS</span><span class="beacon-def">Resolves a domain to the nearest data center, cutting latency and enabling failover between regions.</span></div>
+    <div class="beacon"><span class="beacon-term">Message queue</span><span class="beacon-def">Durable buffer between producers and consumers; signals asynchronous work and independent scaling of each side.</span></div>
+    <div class="beacon"><span class="beacon-term">Sharding key</span><span class="beacon-def">The field (e.g. user_id) that decides which shard holds a row; must spread data evenly.</span></div>
+    <div class="beacon"><span class="beacon-term">Celebrity problem</span><span class="beacon-def">One hot key overloads one shard; the fix may be a dedicated shard per celebrity.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Four ideas carry most of the weight in interviews and later chapters: the load balancer, replication, statelessness, and sharding. Master these and the rest of the chapter reads like variations on a theme.</p>
+
+  <div class="drill">
+    <h4>Load balancer: redundancy and elasticity in one box</h4>
+    <p>Without a load balancer, users connect straight to one web server. If that server goes offline, the site is down; if traffic doubles, the server chokes. Placing a load balancer in front changes the contract: users talk only to the balancer's public IP, and the web servers sit behind it on private IPs.</p>
+    <p>Two benefits fall out immediately. <strong>Redundancy:</strong> if Server 1 goes offline, all traffic is routed to Server 2. <strong>Scalability:</strong> if traffic grows rapidly, you add Server 3, 4, 5 to the pool and the balancer starts using them.</p>
+    <div class="anim" data-anim="lb-failover"></div>
+    <figure class="guide-fig"><img src="01.%20Scaling/images/load-balancer.png" alt="Load balancer distributing traffic to two web servers"><figcaption>Notice that users only ever see the load balancer's address. The servers behind it can come and go without any client noticing.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th></th><th>Vertical scaling</th><th>Horizontal scaling</th></tr></thead>
+      <tbody>
+        <tr><td>How</td><td>Add CPU/RAM to one server</td><td>Add more servers behind a load balancer</td></tr>
+        <tr><td>Limit</td><td>Hard hardware ceiling</td><td>Practically unbounded</td></tr>
+        <tr><td>Failure</td><td>One box = single point of failure</td><td>Redundant; traffic rerouted</td></tr>
+        <tr><td>Cost</td><td>High overall cost at the top end</td><td>Commodity machines added incrementally</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>Database replication: one writer, many readers</h4>
+    <p>Most applications read far more than they write, so the master-slave model splits the work accordingly. All data-modifying commands (insert, update, delete) go to the master. Copies of the data flow to slaves, which serve reads in parallel. That is why a system usually has many more slaves than masters.</p>
+    <p>The payoff is threefold: better performance through parallel reads, reliability because data survives the loss of a server, and high availability because the site stays up when a database dies.</p>
+    <figure class="guide-fig"><img src="01.%20Scaling/images/database-replication.png" alt="Master database replicating to slave databases; web servers write to master and read from slaves"><figcaption>Follow the arrows: writes flow only into the master, replication flows out to the slaves, and reads fan out across the slaves.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>One slave, and it dies:</strong> reads go temporarily to the master until a replacement slave is added.</li>
+      <li><strong>Several slaves, one dies:</strong> reads are redirected to the other healthy slaves and a new server replaces the dead one.</li>
+      <li><strong>Master dies:</strong> a slave is promoted to master and a new slave is added for replication.</li>
+      <li><strong>Promoted slave was behind:</strong> missing data is filled by data recovery scripts; multi-master and circular replication are alternative setups.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> assuming slave promotion is lossless. In production the promoted slave may not be up to date, so you must mention recovery scripts or a stronger replication scheme.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Stateless web tier: the key that unlocks auto-scaling</h4>
+    <p>A stateful server remembers a user's session in its own memory. That forces every request from that user back to the same server (sticky sessions), which makes adding or removing servers painful and failures destructive: the session dies with the box.</p>
+    <p>The fix is to move session data out to a shared data store, shared by every server. Now every web server is interchangeable. The load balancer can send any request anywhere, and servers can be auto-scaled up and down with traffic.</p>
+    <figure class="guide-fig"><img src="01.%20Scaling/images/stateless.png" alt="Stateless web tier: web servers fetch session state from a shared data store"><figcaption>Every web server points to the same shared store for state. Any server can pick up any user, which is exactly what auto-scaling needs.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Easy horizontal scaling, painless auto-scaling, and a server crash no longer logs users out.</p></div>
+      <div class="con"><strong>Costs</strong><p>Every request needs a lookup in the shared store, which itself must be fast and redundant.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Sharding: splitting the data tier itself</h4>
+    <p>Eventually even a replicated master cannot hold all the data or absorb all the writes. Vertical scaling of the database has physical and cost limits and heightens single-point-of-failure risk. Sharding splits one large database into smaller shards. Each shard has the same schema, but the rows on each are unique to it.</p>
+    <p>A sharding key decides the placement, for example a function of user_id picks which of four shards holds a user. The single most important decision is choosing a key that spreads data evenly.</p>
+    <figure class="guide-fig"><img src="01.%20Scaling/images/horizontal-scaling.png" alt="Database horizontally scaled into shards by user_id"><figcaption>Each user lands on exactly one shard, chosen by a function of user_id. All shards share the schema but hold different rows.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Challenge</th><th>What goes wrong</th><th>Remedy in the notes</th></tr></thead>
+      <tbody>
+        <tr><td>Resharding</td><td>A shard fills up from growth, or uneven distribution exhausts some shards faster</td><td>Consistent hashing</td></tr>
+        <tr><td>Celebrity (hotspot)</td><td>Excessive access to one key overloads its shard</td><td>Allocate a shard per celebrity</td></tr>
+        <tr><td>Joins</td><td>Joins across shards are hard</td><td>De-normalize so queries hit a single table</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall"><strong>Common trap:</strong> picking a key that looks unique but clusters traffic, such as a timestamp. Evenness of both data and load is what makes a sharding key good.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin with your stylus first, then tap to reveal.</p>
+  <details class="qa"><summary>Why must the web tier be made stateless before you can auto-scale it?</summary><div class="qa-answer"><p>A stateful server holds session data in its own memory, so a user's requests must keep returning to that same server. Adding or removing servers would then break sessions. Moving session data into a shared store makes every server interchangeable, so the load balancer can route anywhere and servers can come and go freely.</p></div></details>
+  <details class="qa"><summary>What happens if the master database goes offline?</summary><div class="qa-answer"><p>A slave is promoted to be the new master and a new slave is added. Because the promoted slave may not be fully up to date, missing data must be recovered with data recovery scripts; multi-master or circular replication can help.</p></div></details>
+  <details class="qa"><summary>Compare vertical and horizontal scaling.</summary><div class="qa-answer"><p>Vertical scaling adds CPU and RAM to one machine: simple but capped by hardware, expensive, and without redundancy. Horizontal scaling adds more machines behind a load balancer, giving redundancy and near-unlimited growth, which is why large systems prefer it.</p></div></details>
+  <details class="qa"><summary>When is a cache the right tool, and what policy removes items when it is full?</summary><div class="qa-answer"><p>Use a cache when data is read frequently but modified infrequently. When the cache is full, an eviction policy frees memory; LRU (least recently used) is the most popular. Also plan expiration, consistency with the data store, and multiple cache servers to avoid a single point of failure.</p></div></details>
+  <details class="qa"><summary>What happens to users if the CDN has a temporary outage?</summary><div class="qa-answer"><p>Clients should detect the problem and fall back to requesting the static resources directly from the origin server. Without that fallback, pages would load without images, CSS or scripts.</p></div></details>
+  <details class="qa"><summary>Why does sharding make joins hard, and what is the usual workaround?</summary><div class="qa-answer"><p>Related rows may live on different shards on different servers, so a single join query cannot see them all. The common workaround is to de-normalize the data so queries can be answered from a single table on one shard.</p></div></details>
+  <details class="qa"><summary>What does a message queue buy you compared to a direct call?</summary><div class="qa-answer"><p>Producers publish a message and move on; consumers process it asynchronously when they are ready. The queue buffers bursts and decouples the two sides, so each can scale and fail independently.</p></div></details>
+</div>

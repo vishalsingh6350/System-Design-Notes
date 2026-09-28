@@ -1,0 +1,210 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is peak season and a beachfront hotel has exactly one Deluxe King left for New Year's Eve. Two travelers, one in Tokyo and one in Toronto, press "Book" within the same heartbeat, while a third, impatient, double-taps the button on a laggy phone. Across a chain of 5,000 hotels and a million rooms, the system must sell each room once (well, up to 110% of once, because hotels deliberately overbook), charge each guest once, and never lose a paid reservation. Traffic is modest on average, just a few bookings per second, but the whole problem lives in those rare collisions where everyone reaches for the same room at the same instant.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">This is a correctness-first system with low steady load. Read the map as: a data model that counts inventory, a set of guards that keep that count honest, and scaling and service boundaries built around the database.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Relational DB with ACID guarantees</span> <span class="why">— the one thing that makes "never double-sell, never double-charge" achievable</span>
+      <ul>
+        <li>Read-heavy, low-write workload (only a fraction of visitors book)</li>
+        <li>Clear, structured data that models naturally in tables
+          <ul><li><span class="peripheral">Read replicas across zones for high availability</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">room_type_inventory table</span> <span class="why">— the ledger every booking reads and writes</span>
+      <ul>
+        <li>One row per (hotel_id, room_type_id, date) with total_inventory and total_reserved</li>
+        <li>Overbooking check: total_reserved + n &lt;= 110% * total_inventory
+          <ul><li><span class="peripheral">Rows pre-populated by a daily CRON job; ~73 mil rows for 2 years</span></li></ul>
+        </li>
+        <li>Guests reserve a room type, not a specific room number
+          <ul><li><span class="peripheral">Original schema (reserve a roomID) fit Airbnb, not hotels</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Concurrency control</span> <span class="why">— the heart of the problem: preventing double booking</span>
+      <ul>
+        <li>Same user clicks twice: idempotency key (reservationID) + unique constraint</li>
+        <li>Many users, same room: pessimistic lock, optimistic lock, or DB constraint
+          <ul><li><span class="peripheral">Client-side button disabling fails if JavaScript is off</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Microservice architecture</span> <span class="why">— separates concerns but raises the cross-service consistency question</span>
+      <ul>
+        <li>Hotel, Rate, Reservation, Payment, Hotel Management services behind a public API gateway</li>
+        <li>Reservation + inventory kept in one service and one DB (hybrid)
+          <ul><li><span class="peripheral">2PC and Saga if you must split them</span></li><li><span class="peripheral">gRPC for inter-service calls; CDN for static assets</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Scaling for 1000x traffic</span> <span class="why">— stateless services replicate easily; the DB is the bottleneck</span>
+      <ul>
+        <li>Shard by hash(hotel_id) — every query filters on it</li>
+        <li>Redis inventory cache, kept in sync via CDC (Debezium)
+          <ul><li><span class="peripheral">TTL expires past dates; history can go to cold storage</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The relational database is the root because every correctness guarantee in this design is borrowed from its transactions and constraints. The inventory table is what those transactions protect, the concurrency hub is how they protect it, and the microservice and scaling hubs are about not breaking that protection as the system grows.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">A booking travels from browsing to a committed row in the inventory ledger. Each box below narrows the funnel and adds one layer of protection.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>CDN + Hotel service</h4>
+      <p><strong>Input:</strong> Page views for hotel and room detail pages (the wide top of the funnel: ~300 detail views per 3 bookings).</p>
+      <p><strong>Output:</strong> Static hotel and room info, images and JS bundles.</p>
+      <p class="io-story">The glossy brochure rack in the lobby. The content rarely changes, so it is cached aggressively and costs almost nothing to hand out.</p>
+      <p class="io-arrow">&rarr; feeds into: Rate service and the reservation page</p>
+    </div>
+    <div class="io-block">
+      <h4>Rate service</h4>
+      <p><strong>Input:</strong> Hotel, room type and future dates.</p>
+      <p><strong>Output:</strong> The price for each night, which changes daily and depends on how full the hotel is.</p>
+      <p class="io-story">The price board that a clerk rewrites every morning, raising prices as the hotel fills.</p>
+      <p class="io-arrow">&rarr; feeds into: the reservation form</p>
+    </div>
+    <div class="io-block">
+      <h4>Reservation form (idempotency key)</h4>
+      <p><strong>Input:</strong> The guest starts filling in details.</p>
+      <p><strong>Output:</strong> A globally unique reservationID generated up front and attached to the eventual POST.</p>
+      <p class="io-story">A numbered claim ticket handed out before you order. However many times you wave it, the kitchen only cooks that ticket once.</p>
+      <p class="io-arrow">&rarr; feeds into: Reservation service</p>
+    </div>
+    <div class="io-block">
+      <h4>Reservation service + inventory DB</h4>
+      <p><strong>Input:</strong> POST /v1/reservations with hotelID, roomTypeID, roomCount, dates, reservationID.</p>
+      <p><strong>Output:</strong> A new reservation row and incremented total_reserved for every night, or a rollback.</p>
+      <p class="io-story">The front desk ledger. The clerk checks each night has space (allowing 10% overbooking), pencils in the guest, and a lock or constraint stops two clerks writing in the last slot at once.</p>
+      <p class="io-arrow">&rarr; feeds into: Payment service</p>
+    </div>
+    <div class="io-block">
+      <h4>Payment service</h4>
+      <p><strong>Input:</strong> A pending reservation and the guest's payment.</p>
+      <p><strong>Output:</strong> Payment processed and the reservation status updated (state machine).</p>
+      <p class="io-story">The cashier who stamps the ticket "paid" only after the money clears.</p>
+      <p class="io-arrow">&rarr; feeds into: reservation status, admin panel</p>
+    </div>
+    <div class="io-block">
+      <h4>CDC &rarr; Redis inventory cache</h4>
+      <p><strong>Input:</strong> Database change events (via Debezium).</p>
+      <p><strong>Output:</strong> Keys like hotelID_roomTypeID_{date} holding available room counts.</p>
+      <p class="io-story">A departures board that mirrors the ledger a moment later. It may briefly be stale, but the ledger itself still refuses invalid bookings.</p>
+      <p class="io-arrow">&rarr; feeds into: availability checks on future page loads</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one booking</h4>
+    <ol class="journey-steps">
+      <li>A guest views hotel 211's detail page, served from the CDN and the Hotel service's cache, and checks prices for room type 1001 from the Rate service.</li>
+      <li>They open the reservation page. A reservation order is created with a unique reservationID, say 13422445.</li>
+      <li>They request 3 rooms of type 1001 for 2021-06-01 to 2021-06-02 and press "Complete booking". The request hits the public API gateway (authentication, rate limiting).</li>
+      <li>The Reservation service selects the inventory rows: 2021-06-01 shows 100 total / 80 reserved, 2021-06-02 shows 100 / 82.</li>
+      <li>It checks each night: 80 + 3 = 83 and 82 + 3 = 85, both within 110% of 100 = 110. Allowed.</li>
+      <li>In the same transaction it increments total_reserved to 83 and 85 and inserts the reservation row. With optimistic locking, the update succeeds only if the row's version has not changed since it was read.</li>
+      <li>The laggy phone sends the same POST again with reservationID 13422445. The unique constraint on reservation_id rejects the duplicate; no second booking, no second charge.</li>
+      <li>The Payment service charges the guest in full and updates the reservation's status.</li>
+      <li>Debezium streams the inventory change to Redis, and the next visitor sees fewer rooms left for those nights.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Sell each night of each room type no more than the allowed 110% of inventory, exactly once per booking, using the relational database as the single source of truth even under simultaneous clicks.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of an old grand hotel with a leather-bound reservations ledger at the front desk. Each page is one night for one room type, with two numbers written at the top: rooms we have and rooms promised (room_type_inventory). Every guest arrives holding a numbered claim ticket so the clerk never writes them in twice (reservationID idempotency key). When two clerks reach for the same page, either one physically holds the book while writing (pessimistic lock), or both write in pencil and the second erases if the page number changed while they were writing (optimistic lock with a version). A chalkboard in the lobby copies the ledger's free-room counts a moment later (Redis via CDC), and when the chain grows, the ledger is split into separate books per hotel (sharding by hotel_id).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">~240k bookings/day &asymp; 3 TPS</span><span class="beacon-def">Write load is tiny; the challenge is contention, not throughput.</span></div>
+    <div class="beacon"><span class="beacon-term">300 &rarr; 30 &rarr; 3 funnel</span><span class="beacon-def">10% conversion per page means reads dominate; cache the browsing pages.</span></div>
+    <div class="beacon"><span class="beacon-term">110% * total_inventory</span><span class="beacon-def">The overbooking rule baked into the availability check.</span></div>
+    <div class="beacon"><span class="beacon-term">(hotel_id, room_type_id, date)</span><span class="beacon-def">One inventory row per night per room type; makes checks and updates simple range queries.</span></div>
+    <div class="beacon"><span class="beacon-term">73 mil rows</span><span class="beacon-def">5,000 hotels x 20 types x 730 days; fits on one DB server, replicate for availability.</span></div>
+    <div class="beacon"><span class="beacon-term">reservationID</span><span class="beacon-def">Idempotency key plus a unique constraint; kills the double-click problem.</span></div>
+    <div class="beacon"><span class="beacon-term">SELECT ... FOR UPDATE</span><span class="beacon-def">Pessimistic lock; safe under heavy contention but unscalable and deadlock-prone.</span></div>
+    <div class="beacon"><span class="beacon-term">version column</span><span class="beacon-def">Optimistic locking; fast when conflicts are rare, which fits a low-QPS booking system.</span></div>
+    <div class="beacon"><span class="beacon-term">CHECK constraint</span><span class="beacon-def">DB enforces total_inventory - total_reserved &gt;= 0; easy, but hard to version-control.</span></div>
+    <div class="beacon"><span class="beacon-term">hash(hotel_id) % servers</span><span class="beacon-def">Shard key; 30,000 QPS over 16 shards = 1,875 QPS each.</span></div>
+    <div class="beacon"><span class="beacon-term">CDC / Debezium</span><span class="beacon-def">Async DB-to-Redis sync; cache may lag, but the DB still blocks invalid bookings.</span></div>
+    <div class="beacon"><span class="beacon-term">2PC vs Saga</span><span class="beacon-def">Cross-service consistency options: blocking atomic commit vs eventually consistent compensations.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Nearly every follow-up question in this interview circles back to double booking and the database that prevents it. These drills cover the model, both flavors of double booking, and how to grow without breaking guarantees.</p>
+
+  <div class="drill">
+    <h4>The inventory ledger: why reserve a room type</h4>
+    <p>The first schema let guests reserve a specific roomID. That works for Airbnb, where each listing is unique, but hotel guests book "a Deluxe King", and a room number is picked later. So the API changes to roomTypeID plus roomCount, and a new table, room_type_inventory, tracks capacity per night.</p>
+    <p>Each row answers one question: for this hotel, this room type, this date, how many rooms exist (total_inventory, excluding rooms taken out of service) and how many are promised (total_reserved)? A stay of several nights touches several rows, and each must pass the check total_reserved + n &lt;= 110% of total_inventory.</p>
+    <table class="compare"><thead><tr><th>hotel_id</th><th>room_type_id</th><th>date</th><th>total_inventory</th><th>total_reserved</th></tr></thead><tbody>
+      <tr><td>211</td><td>1001</td><td>2021-06-01</td><td>100</td><td>80</td></tr>
+      <tr><td>211</td><td>1001</td><td>2021-06-02</td><td>100</td><td>82</td></tr>
+      <tr><td>2210</td><td>101</td><td>2021-06-01</td><td>30</td><td>23</td></tr>
+    </tbody></table>
+    <p>Sizing: 5,000 hotels x 20 room types x 2 years x 365 days = 73 million rows, pre-created by a daily CRON job. A single database handles that; read replicas add availability. If reservations ever outgrow it, move history to cold storage and shard by hotel_id.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Double booking, part 1: the same user clicks twice</h4>
+    <p>Disabling the button after one click helps, but a user with JavaScript turned off never sees it grey out. The robust fix is server-side: make the API idempotent so repeating it has no additional effect.</p>
+    <figure class="guide-fig"><img src="22.%20Hotel%20Reservation%20System/images/idempotency.png" alt="Idempotent reservation flow using reservation_id"><figcaption>The reservation ID is minted when the order is created, before the guest submits. Both submissions carry the same ID, so the second is recognised as a repeat.</figcaption></figure>
+    <ol class="steps">
+      <li>Generate a globally unique reservation order ID while the guest fills in details.</li>
+      <li>Submit the booking with that reservation_id.</li>
+      <li>A second click resends the same reservation_id.</li>
+      <li>The reservation_id column has a unique constraint, so the second insert fails and no duplicate is stored.</li>
+    </ol>
+  </div>
+
+  <div class="drill">
+    <h4>Double booking, part 2: many users, one last room</h4>
+    <p>Assume the isolation level is not serializable. User 1's transaction reads 99 of 100 reserved: space! User 2's transaction reads the same 99: space! User 2 writes 100 and commits. User 1, still trusting its stale read, also writes and commits. Two guests, one room. The classic check-then-act race.</p>
+    <div class="anim" data-anim="optimistic-lock"></div>
+    <figure class="guide-fig"><img src="22.%20Hotel%20Reservation%20System/images/double-booking-multiple-users.png" alt="Two concurrent transactions both reserving the last room"><figcaption>Follow the two timelines: both reads happen before either write, so both see a free room.</figcaption></figure>
+    <table class="compare"><thead><tr><th>Option</th><th>How it works</th><th>Strength</th><th>Weakness</th></tr></thead><tbody>
+      <tr><td>Pessimistic lock</td><td>SELECT ... FOR UPDATE locks rows until commit</td><td>Serializes updates; good under heavy contention</td><td>Deadlocks; long transactions block everyone; not scalable (not recommended)</td></tr>
+      <tr><td>Optimistic lock</td><td>Read version, write version + 1, reject if version changed</td><td>No DB lock; fast when conflicts are rare</td><td>Many rollbacks when contention is high</td></tr>
+      <tr><td>DB constraint</td><td>CHECK (total_inventory - total_reserved &gt;= 0)</td><td>Easy to implement</td><td>Poor under high contention; hard to version-control; not all DBs support it</td></tr>
+    </tbody></table>
+    <p>Version numbers are preferred over timestamps because server clocks can be inaccurate. Since booking QPS is low, conflicts are rare, which makes optimistic locking (or the constraint) the good fit here.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Picking pessimistic locking because it "feels safest". The notes explicitly reject it for scalability: a lock held too long stalls every other transaction touching those rows.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Scaling to booking.com size: shard and cache</h4>
+    <p>If the system is adopted by a huge travel site, QPS could be 1,000 times larger. The services are stateless, so you just add replicas. The database is stateful and is the real bottleneck. Shard it by hotel_id, since every query filters on it: at 30,000 QPS across 16 shards, each shard handles 1,875 QPS, comfortably within one MySQL cluster.</p>
+    <figure class="guide-fig"><img src="22.%20Hotel%20Reservation%20System/images/inventory-cache.png" alt="Redis inventory cache synchronised from the database via CDC"><figcaption>Reads for availability hit Redis; writes still go to the database, and CDC carries changes to the cache asynchronously.</figcaption></figure>
+    <p>The cache key is hotelID_roomTypeID_{date} with the number of available rooms as the value, and TTLs expire past dates. Because sync is asynchronous, the cache can briefly show a room that is gone. That is acceptable: the database still rejects the invalid booking, and the user simply refreshes to see "no rooms left", which could happen anyway if they hesitated.</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Lower DB load and in-memory speed for the read-heavy browsing path.</p></div><div class="con"><strong>Costs</strong><p>Keeping cache and DB consistent is hard; you must reason about how staleness affects the user.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Consistency across microservices</h4>
+    <p>In a monolith, "reserve rooms, then record payment" can sit in one database transaction: all or nothing. In pure microservices, each service owns its own DB, so a failure halfway leaves inventory updated but payment not (or vice versa).</p>
+    <p>The design takes a pragmatic hybrid: reservation and inventory live in the same service and the same relational DB, so ACID still protects the critical update. If an interviewer insists on full separation, two tools exist. Two-phase commit gives atomic commit across nodes but blocks everything when one node lags. A Saga chains local transactions and runs compensating transactions on failure, trading atomicity for eventual consistency. Both add real complexity, so ask whether the purity is worth it.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch your answer in the margin first, then open each one to check.</p>
+  <details class="qa"><summary>Why a relational database when average write load is only ~3 TPS?</summary><div class="qa-answer"><p>The workload is read-heavy with few writes, the data is clearly structured, and above all ACID transactions prevent problems like double charges or negative inventory. NoSQL's write optimizations are not needed here.</p></div></details>
+  <details class="qa"><summary>What happens if two users read "99 of 100 reserved" at the same time without any locking?</summary><div class="qa-answer"><p>Both see space, both increment, both commit, and the last room is sold twice. Optimistic locking, a DB constraint or pessimistic locking prevents this.</p></div></details>
+  <details class="qa"><summary>Compare optimistic and pessimistic locking for this system.</summary><div class="qa-answer"><p>Pessimistic locking holds row locks until commit; it avoids conflicts but risks deadlocks and does not scale. Optimistic locking uses a version check and rolls back on conflict; it is faster when contention is low, which fits a low-QPS booking system.</p></div></details>
+  <details class="qa"><summary>How does the reservationID prevent a double click from creating two bookings?</summary><div class="qa-answer"><p>It is generated once when the order is created and sent with every submission. A unique constraint on the reservation_id column rejects the second insert.</p></div></details>
+  <details class="qa"><summary>Why is it acceptable for the Redis inventory cache to be briefly stale?</summary><div class="qa-answer"><p>The database remains the source of truth and rejects any invalid reservation. The worst case is a user seeing availability that is gone and getting a "no rooms left" message after refreshing.</p></div></details>
+  <details class="qa"><summary>Why shard by hotel_id rather than by reservation or date?</summary><div class="qa-answer"><p>Every query filters on hotel_id, so each query lands on a single shard. With 16 shards, 30,000 QPS becomes 1,875 QPS per shard.</p></div></details>
+  <details class="qa"><summary>Why keep reservation and inventory in the same service?</summary><div class="qa-answer"><p>So one relational transaction can update both atomically. Splitting them would require 2PC (blocking, slow) or a Saga (eventually consistent, complex).</p></div></details>
+</div>

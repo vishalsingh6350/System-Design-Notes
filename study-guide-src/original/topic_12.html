@@ -1,0 +1,190 @@
+<h3>Introduction</h3>
+<p>A <strong>chat system</strong> supports real-time messaging between users. This chapter focuses on designing a chat app that includes:</p>
+<ul>
+  <li><strong>One-on-One Chat</strong></li>
+  <li><strong>Group Chat (max 100 users)</strong></li>
+  <li><strong>Online Presence Indicators</strong></li>
+  <li><strong>Multiple Device Support</strong></li>
+  <li><strong>Push Notifications</strong></li>
+</ul>
+<p>The system targets <strong>50 million daily active users (DAU)</strong> and stores chat history permanently.</p>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Requirements</h4>
+<ol>
+  <li><strong>Features:</strong>
+    <ul>
+      <li>One-on-one and group chat (max 100 members).</li>
+      <li>Text-based messages (up to 100,000 characters).</li>
+      <li>Online/offline indicators.</li>
+      <li>Support for multiple devices.</li>
+      <li>Push notifications.</li>
+    </ul>
+  </li>
+  <li><strong>Scale:</strong> Design for 50 million DAU.</li>
+  <li><strong>Storage:</strong> Permanent chat history.</li>
+</ol>
+
+<h3>Step 2: High-Level Design</h3>
+<h4>Communication Protocols</h4>
+<ol>
+  <li><strong>Sender Side:</strong> HTTP for sending messages, leveraging persistent connections for efficiency.
+    <img class="orig-img" src="12.%20Chat%20System/images/basic-design.png" alt="Basic Design">
+  </li>
+  <li><strong>Receiver Side:</strong>
+    <ul>
+      <li><strong>Polling:</strong>
+        <ul>
+          <li>Client periodically asks the server if there are messages available.</li>
+          <li>Inefficient due to frequent, redundant requests.</li>
+        </ul>
+        <img class="orig-img" src="12.%20Chat%20System/images/polling.png" alt="Polling">
+      </li>
+      <li><strong>Long Polling:</strong>
+        <ul>
+          <li>Keeps the connection open until messages arrive.</li>
+          <li>Inefficient for inactive users.</li>
+        </ul>
+        <img class="orig-img" src="12.%20Chat%20System/images/long-polling.png" alt="Long Polling">
+      </li>
+      <li><strong>WebSocket:</strong>
+        <ul>
+          <li>A bi-directional, persistent connection for real-time communication, chosen for both sending and receiving messages.</li>
+          <li>Uses WebSockets (ws) protocol for sending and recieving messages.</li>
+        </ul>
+        <img class="orig-img" src="12.%20Chat%20System/images/websocket.png" alt="Websocket">
+      </li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Components</h4>
+<img class="orig-img" src="12.%20Chat%20System/images/high-level-stateless-arch.png" alt="High Level Architecture">
+<img class="orig-img" src="12.%20Chat%20System/images/high-level-statefull-arch.png" alt="High Level Architecture">
+<ol>
+  <li><strong>Stateless Services:</strong>
+    <ul>
+      <li>Handle signup, login, and user profile management.</li>
+      <li>Integrated with service discovery to recommend the best chat server.</li>
+    </ul>
+  </li>
+  <li><strong>Stateful Services:</strong>
+    <ul>
+      <li>Chat servers maintain persistent WebSocket connections.</li>
+      <li>Responsible for message delivery and synchronization.</li>
+    </ul>
+  </li>
+  <li><strong>Third-Party Integration:</strong>
+    <ul>
+      <li>Push notification services notify users about new messages.</li>
+      <li>Refer Notification System chapter for notifications implementation.</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Design</h4>
+<p>The client maintains a persistent WebSocket connection to a chat server for real-time messaging.</p>
+<img class="orig-img" src="12.%20Chat%20System/images/high-level-design.png" alt="High Level Design">
+<ul>
+  <li>Chat servers facilitate message sending/receiving.</li>
+  <li>Presence servers manage online/offline status.</li>
+  <li>API servers handle everything including user login, signup, change profile, etc.</li>
+  <li>Notification servers send push notifications.</li>
+  <li>Finally, the key-value store is used to store chat history. Key-value stores for the database of the chat history data for following reasons:
+    <ul>
+      <li>It allows easy horizontal scaling.</li>
+      <li>KV stores provide very low latency to access data.</li>
+      <li>Relational databases do not handle long tail of data well. When the indexes grow large, random access is expensive.</li>
+      <li>KV stores are adopted by other proven reliable chat applications. For example, both Facebook messenger and Discord.</li>
+    </ul>
+  </li>
+</ul>
+<p>Following are the data models for one-to-one chat and group chat.</p>
+<ul>
+  <li>The primary key is message id, which helps to decide message sequence.</li>
+  <li>For the group chat the composite primary key is (channel_id, message_id).
+    <ul>
+      <li>IDs can be generated using a global 64-bit sequence number generator like Snowflake.</li>
+      <li>A better approach is to use local sequence number generator. Local means IDs are only unique within a group.</li>
+      <li>The reason why local IDs work is that maintaining message sequence within one-on-one channel or a group channel is sufficient.</li>
+    </ul>
+  </li>
+</ul>
+<img class="orig-img" src="12.%20Chat%20System/images/one-to-one-chat.png" alt="One to one chat design">
+<img class="orig-img" src="12.%20Chat%20System/images/group-chat.png" alt="Group chat design">
+
+<h3>Step 3: Design Deep Dive</h3>
+<h4>Service Discovery</h4>
+<img class="orig-img" src="12.%20Chat%20System/images/zookeeper.png" alt="Zookeeper">
+<ul>
+  <li>The primary role of service discovery is to recommend the best chat server for a client based on the criteria like geographical location, server capacity.</li>
+  <li>Uses <strong>Apache Zookeeper</strong> to allocate chat servers based on criteria like geographic location and server capacity.</li>
+  <li>Ensures efficient load distribution and minimizes latency.</li>
+</ul>
+
+<h4>Messaging Flows</h4>
+<h4>One-on-One Chat</h4>
+<ol>
+  <li>User A sends a message to Chat Server 1.</li>
+  <li>Chat Server 1 assigns a unique message ID and stores the message in a key-value store.</li>
+  <li>If User B is online, the message is forwarded to Chat Server 2, maintaining a persistent WebSocket connection.</li>
+  <li>If User B is offline, a push notification is sent.</li>
+</ol>
+
+<h4>Group Chat</h4>
+<img class="orig-img" src="12.%20Chat%20System/images/group-chat-flow.png" alt="Group Chat Flow">
+<ul>
+  <li>Messages are copied to individual inboxes for each recipient in the group.</li>
+  <li>Simplifies synchronization but becomes expensive for larger groups.</li>
+  <li>On the recipient side, a recipient can receive messages from multiple users. Each recipient has an inbox (message sync queue) which contains messages from different senders.</li>
+</ul>
+
+<h4>Message Synchronization</h4>
+<p>Many users have multiple devices. We need to synchronize the message across the devices. Each device maintains a variable called cur_max_message_id, which keeps track of the latest message ID on the device. Messages that satisfy the following two conditions are considered as news messages:</p>
+<img class="orig-img" src="12.%20Chat%20System/images/message-synchronization.png" alt="Message Synchronization">
+<ul>
+  <li>The recipient ID is equal to the currently logged-in user ID.</li>
+  <li>Message ID in the key-value store is larger than cur_max_message_id</li>
+</ul>
+
+<h4>Online Presence</h4>
+<ol>
+  <li><strong>Heartbeat Mechanism:</strong>
+    <img class="orig-img" src="12.%20Chat%20System/images/heartbeat-mechanism.png" alt="Heartbeat Mechanism">
+    <ul>
+      <li>Clients send periodic heartbeats to presence servers to indicate they are online.</li>
+      <li>If no heartbeat is received within a threshold (for eg x = 30), the user is marked offline.</li>
+    </ul>
+  </li>
+  <li><strong>Fanout Model:</strong>
+    <img class="orig-img" src="12.%20Chat%20System/images/fanout-presence.png" alt="Fanout Presence">
+    <ul>
+      <li>Presence updates are pushed to friends using a publish-subscribe model in which each friend pair maintains a channel.</li>
+      <li>When User A's online status changes, it publishes the event to three channels, channel A-B, A-C, and A-D.</li>
+      <li>Those three channels are subscribed by User B, C, and D, respectively which get the online status updates.</li>
+      <li>The above design is effective for a small user groups.</li>
+    </ul>
+  </li>
+</ol>
+
+<h3>Additional Considerations</h3>
+<h4>Scalability</h4>
+<ul>
+  <li><strong>Horizontal Scaling:</strong> Add servers as user count increases.</li>
+  <li><strong>Load Balancing:</strong> Distribute traffic evenly across servers.</li>
+  <li><strong>Caching:</strong> Reduce database load and improve latency.</li>
+</ul>
+
+<h4>Error Handling</h4>
+<ul>
+  <li><strong>Retry Mechanisms:</strong> Handle message delivery failures with retries and queuing.</li>
+  <li><strong>Server Failures:</strong> Use service discovery to allocate new servers in case of failures.</li>
+</ul>
+
+<h4>Future Extensions</h4>
+<ol>
+  <li><strong>Media Support:</strong> Add handling for photos and videos, including compression and cloud storage.</li>
+  <li><strong>End-to-End Encryption:</strong> Ensure message privacy.</li>
+  <li><strong>Client-Side Caching:</strong> Reduce data transfer for better performance.</li>
+  <li><strong>Improved Load Times:</strong> Use geographically distributed caching networks.</li>
+</ol>

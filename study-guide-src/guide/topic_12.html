@@ -1,0 +1,211 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You type "running 5 min late" and hit send on your phone. Before you have locked the screen, your friend's phone buzzes across the city, the little green dot next to your name tells them you are online, and when you open your laptop that evening the same message is waiting there too. It feels effortless, but behind it 50 million daily users are holding open live connections, messages must arrive in the right order, and history must be kept forever. The chat system is a switchboard that never hangs up: it has to know where everyone is plugged in, route each message to the right socket in milliseconds, and remember everything that was ever said.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The system hangs on four hubs: the live connection, the servers split by whether they hold state, the message store with its ID scheme, and the presence machinery. Read the tree top-down; peripheral items are nice-to-know.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Real-time connection (WebSocket)</span> <span class="why">— without a live, two-way pipe, the server cannot push messages to the receiver</span>
+      <ul>
+        <li>Receiver-side options compared: polling, long polling, WebSocket
+          <ul><li><span class="peripheral">polling wastes requests; long polling wastes held connections for inactive users</span></li></ul>
+        </li>
+        <li>WebSocket chosen for both sending and receiving</li>
+        <li>Service discovery (Apache Zookeeper) picks the chat server
+          <ul><li><span class="peripheral">based on geography and server capacity</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Stateless vs stateful services</span> <span class="why">— the architectural split that decides how each part scales</span>
+      <ul>
+        <li>Stateless: API servers for signup, login, profile, behind a load balancer</li>
+        <li>Stateful: chat servers holding persistent WebSocket connections</li>
+        <li>Presence servers (online/offline) and notification servers (push)
+          <ul><li><span class="peripheral">notifications reuse the Notification System design</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Message storage &amp; ordering</span> <span class="why">— chat history is permanent and must stay in sequence</span>
+      <ul>
+        <li>Key-value store for chat history
+          <ul><li><span class="peripheral">easy horizontal scaling, low latency, used by Facebook Messenger and Discord</span></li></ul>
+        </li>
+        <li>Message ID decides order; group key is (channel_id, message_id)
+          <ul><li><span class="peripheral">Snowflake global IDs vs local per-channel sequence numbers</span></li></ul>
+        </li>
+        <li>Multi-device sync with cur_max_message_id</li>
+      </ul>
+    </li>
+    <li><span class="hub">Message flows &amp; presence</span> <span class="why">— how messages and green dots actually move</span>
+      <ul>
+        <li>One-on-one: store, then forward or push-notify</li>
+        <li>Group chat: copy to each member's inbox (message sync queue)
+          <ul><li><span class="peripheral">max 100 members keeps copying affordable</span></li></ul>
+        </li>
+        <li>Heartbeats for online status; pub-sub channels per friend pair</li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The WebSocket is the precondition for everything real-time, and it is what makes chat servers stateful. That stateful/stateless split then shapes scaling and discovery. The KV store and its ID scheme guarantee order and history, and the message and presence flows are the traffic running over this foundation.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Here is the chain of boxes a message passes through, from login to delivery. For each, notice what goes in and what comes out.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>API servers (stateless, over HTTP)</h4>
+      <p><strong>Input:</strong> Login, signup, profile requests via the load balancer.</p>
+      <p><strong>Output:</strong> An authenticated user, and a recommended chat server to connect to.</p>
+      <p class="io-story">The reception desk. Interchangeable clerks check you in and hand you a room number.</p>
+      <p class="io-arrow">&rarr; feeds into: Service discovery</p>
+    </div>
+    <div class="io-block">
+      <h4>Service discovery (Zookeeper)</h4>
+      <p><strong>Input:</strong> The user's location plus the load on each chat server.</p>
+      <p><strong>Output:</strong> The best chat server for this client.</p>
+      <p class="io-story">The seating host at a busy restaurant, sending you to a nearby table that is not already overcrowded.</p>
+      <p class="io-arrow">&rarr; feeds into: WebSocket connection to that chat server</p>
+    </div>
+    <div class="io-block">
+      <h4>Chat server (stateful)</h4>
+      <p><strong>Input:</strong> Messages arriving over the sender's WebSocket.</p>
+      <p><strong>Output:</strong> A message with a unique ID, stored in the KV store and routed toward the recipient.</p>
+      <p class="io-story">A switchboard operator with your line plugged in. It stamps each message with a sequence number and patches it through.</p>
+      <p class="io-arrow">&rarr; feeds into: KV store, then the recipient's chat server or the notification servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Key-value store</h4>
+      <p><strong>Input:</strong> Messages keyed by message ID, or by (channel_id, message_id) for groups.</p>
+      <p><strong>Output:</strong> Permanent, ordered history that any device can query.</p>
+      <p class="io-story">The ever-growing ledger. Every message is written once, in order, and kept forever.</p>
+      <p class="io-arrow">&rarr; feeds into: Message sync on each device</p>
+    </div>
+    <div class="io-block">
+      <h4>Presence servers</h4>
+      <p><strong>Input:</strong> Periodic heartbeats from clients.</p>
+      <p><strong>Output:</strong> Online/offline status, published to friends' channels.</p>
+      <p class="io-story">The lobby attendant who marks you "in the building" while you keep waving, and "gone" once you have not waved for a while.</p>
+      <p class="io-arrow">&rarr; feeds into: Friends' presence indicators</p>
+    </div>
+    <div class="io-block">
+      <h4>Notification servers</h4>
+      <p><strong>Input:</strong> Messages for users who are offline.</p>
+      <p><strong>Output:</strong> A push notification to the user's device.</p>
+      <p class="io-story">The note slipped under the door when nobody answers the phone.</p>
+      <p class="io-arrow">&rarr; feeds into: The offline user's device</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one message</h4>
+    <ol class="journey-steps">
+      <li>Asha logs in on her phone over HTTP. The API servers authenticate her, and service discovery (Zookeeper) recommends Chat Server 1, which is nearby and lightly loaded.</li>
+      <li>Her phone opens a persistent WebSocket to Chat Server 1 and starts sending heartbeats to the presence servers. Her friends see her go online.</li>
+      <li>She sends "running 5 min late" to Ben. The message travels over her open WebSocket to Chat Server 1.</li>
+      <li>Chat Server 1 assigns it the next message ID for their one-on-one channel and stores it in the key-value store.</li>
+      <li>Ben is online, connected to Chat Server 2. The message is forwarded there, and Chat Server 2 pushes it down Ben's WebSocket instantly.</li>
+      <li>Ben's phone updates its cur_max_message_id to the new message's ID.</li>
+      <li>That evening Ben opens his laptop, whose cur_max_message_id is older. It asks for messages where the recipient is Ben and the message ID is larger than its value, and "running 5 min late" appears there too.</li>
+      <li>Had Ben been offline, step 5 would instead send a push notification via the notification servers.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A chat system keeps a persistent WebSocket between each client and a stateful chat server, stores every message permanently in a key-value store ordered by per-channel IDs, and layers presence and push notifications on top.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine an old-fashioned telephone exchange for a whole city. The front office where you register and update your details is the stateless API tier: any clerk can help you. When you are ready to talk, a dispatcher (Zookeeper service discovery) assigns you to an operator near you, and that operator keeps your line physically plugged in (the WebSocket on a stateful chat server). Every call is transcribed into a permanent ledger with numbered lines (the KV store and message IDs), so any of your extensions at home or at work can catch up by asking "give me everything after line 653" (cur_max_message_id). A light on the switchboard stays lit while you keep tapping the line (heartbeats), and if you are not home, a note goes in your letterbox (push notification).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">50M DAU, permanent history</span><span class="beacon-def">Storage grows forever; it needs a store that scales horizontally.</span></div>
+    <div class="beacon"><span class="beacon-term">Group max 100 members</span><span class="beacon-def">Small enough that copying each message to every inbox is acceptable.</span></div>
+    <div class="beacon"><span class="beacon-term">Polling</span><span class="beacon-def">Client keeps asking "anything new?"; mostly wasted requests.</span></div>
+    <div class="beacon"><span class="beacon-term">Long polling</span><span class="beacon-def">Server holds the request open until data arrives; wasteful for inactive users.</span></div>
+    <div class="beacon"><span class="beacon-term">WebSocket</span><span class="beacon-def">Bi-directional, persistent; the server can push at any time.</span></div>
+    <div class="beacon"><span class="beacon-term">Stateful chat servers</span><span class="beacon-def">They hold live connections, so clients must be routed to a specific one.</span></div>
+    <div class="beacon"><span class="beacon-term">Zookeeper service discovery</span><span class="beacon-def">Chooses the best chat server by geography and capacity.</span></div>
+    <div class="beacon"><span class="beacon-term">Key-value store</span><span class="beacon-def">Low latency, easy horizontal scaling, handles the long tail of old data.</span></div>
+    <div class="beacon"><span class="beacon-term">(channel_id, message_id)</span><span class="beacon-def">Composite key for group messages; ordering is per channel.</span></div>
+    <div class="beacon"><span class="beacon-term">Local sequence IDs</span><span class="beacon-def">Unique only within a channel, which is all ordering needs.</span></div>
+    <div class="beacon"><span class="beacon-term">cur_max_message_id</span><span class="beacon-def">Each device's bookmark; fetch anything newer to sync.</span></div>
+    <div class="beacon"><span class="beacon-term">Heartbeat, x = 30s</span><span class="beacon-def">No heartbeat within the threshold means the user is marked offline.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The connection protocol, the storage and ID scheme, multi-device sync and presence are where the real reasoning lives. Master these four and the rest of the chapter follows.</p>
+
+  <div class="drill">
+    <h4>Choosing the connection: polling, long polling, WebSocket</h4>
+    <p>Sending is easy: the client just makes a request to the server. Receiving is the hard part, because the server has something to say and the client did not ask for it. HTTP is client-initiated, so the question becomes: how does the server reach the receiver?</p>
+    <p><strong>Polling</strong> has the client ask at intervals, "any new messages?" Most answers are "no," so it burns requests. <strong>Long polling</strong> improves on this: the client asks, and the server holds the connection open until a message arrives. But for inactive users, those held connections sit idle and still cost resources.</p>
+    <p><strong>WebSocket</strong> opens a single, persistent, two-way connection. Either side can send whenever it likes. The design uses it for both sending and receiving, which is why the chat servers become stateful.</p>
+    <div class="anim" data-anim="realtime-transports"></div>
+    <table class="compare">
+      <thead><tr><th>Technique</th><th>How it works</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Polling</td><td>Client asks periodically</td><td>Frequent, redundant requests</td></tr>
+        <tr><td>Long polling</td><td>Connection held open until a message arrives</td><td>Inefficient for inactive users</td></tr>
+        <tr><td>WebSocket</td><td>Persistent bi-directional connection</td><td>Chosen; makes servers stateful</td></tr>
+      </tbody>
+    </table>
+    <figure class="guide-fig"><img src="12.%20Chat%20System/images/high-level-design.png" alt="High-level chat design: user connects over http to load balancer and API servers, and over ws to chat and presence servers; notification servers; KV stores"><figcaption>Two doors into the system. The http arrow goes through the load balancer to stateless API servers; the ws arrow goes straight to the real-time service (chat and presence servers). Everything lands in the KV stores at the bottom.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> Putting chat servers behind the same load balancer as API servers and treating them as interchangeable. They hold live connections, so a client must stay with its assigned chat server; that is why service discovery exists.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Storage and message IDs</h4>
+    <p>Chat history is permanent, so the data only ever grows, and most reads hit recent messages while a vast "long tail" of old messages sits mostly untouched. The notes choose a <strong>key-value store</strong> because it scales horizontally, gives very low latency, and avoids a weakness of relational databases: when indexes grow large, random access becomes expensive. Facebook Messenger and Discord both use KV stores.</p>
+    <p>Order matters: messages must show up in the sequence they were sent. The <strong>message ID</strong> is the primary key and decides that sequence. For group chat the key is the composite <strong>(channel_id, message_id)</strong>.</p>
+    <p>Where do IDs come from? One option is a global 64-bit generator like Snowflake. The better option in the notes is a <strong>local sequence number generator</strong>: IDs are unique only within one channel. That is enough, because you only ever need order within a one-on-one conversation or a single group, never across the whole system.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Local IDs are simpler to generate than a global sequence; the KV store scales out cheaply and serves recent messages fast.</p></div>
+      <div class="con"><strong>Costs</strong><p>IDs are not comparable across channels; a KV store gives up the rich querying of a relational database.</p></div>
+    </div>
+    <div class="pitfall"><strong>Common trap:</strong> Insisting on globally unique, globally ordered IDs. Ordering only needs to hold within a channel, so local sequences are sufficient.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Group chat and multi-device sync</h4>
+    <p>In group chat, when User A sends a message, the chat server copies it into a separate <strong>inbox (message sync queue)</strong> for each recipient. Each recipient's inbox collects messages from every sender they talk to, so a client only has to check one place.</p>
+    <figure class="guide-fig"><img src="12.%20Chat%20System/images/group-chat-flow.png" alt="User A sends to Chat server 1, which copies the message into separate message sync queues for User B and User C"><figcaption>One message in, many copies out. Each recipient has their own sync queue. Cheap to read and simple to sync, but the number of copies grows with group size, which is why groups are capped at 100.</figcaption></figure>
+    <p>Multi-device sync solves a different problem: the same user on a phone and a laptop. Each device keeps a bookmark, <strong>cur_max_message_id</strong>, the latest message ID it has seen. A message is new for that device when both conditions hold:</p>
+    <ol class="steps">
+      <li>The recipient ID equals the logged-in user's ID.</li>
+      <li>The message ID in the KV store is larger than that device's cur_max_message_id.</li>
+    </ol>
+    <figure class="guide-fig"><img src="12.%20Chat%20System/images/message-synchronization.png" alt="User A's phone with cur_max_message_id 653 and laptop with 842, both with sessions on Chat server 1 and backed by KV store"><figcaption>Same user, two bookmarks. The phone at 653 is behind the laptop at 842; on reconnect it fetches everything above 653 from the KV store and catches up.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> Thinking inbox copying scales to huge groups. The notes flag it as expensive for larger groups; it works here because of the 100-member cap.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Online presence: heartbeats and fanout</h4>
+    <p>How do you know someone is online? You could mark them offline the instant their connection drops, but mobile connections flicker constantly, and the green dot would blink on and off. Instead, clients send a <strong>heartbeat</strong> to the presence servers at regular intervals. As long as heartbeats keep arriving, the user is online. If none arrives within a threshold (x = 30 seconds in the diagram), they are marked offline.</p>
+    <figure class="guide-fig"><img src="12.%20Chat%20System/images/heartbeat-mechanism.png" alt="Sequence diagram of client sending heartbeats every 5 seconds; after 30 seconds without a heartbeat server changes status to offline"><figcaption>Heartbeats every 5 seconds keep the status green. Only after a 30-second silence does the server flip the user to offline, so a brief blip does not count.</figcaption></figure>
+    <p>Once status changes, friends must hear about it. The notes use <strong>publish-subscribe</strong> with one channel per friend pair. When User A's status changes, it is published to channels A-B, A-C and A-D, which Users B, C and D subscribe to. This works well for small groups; the cost grows with the number of friends.</p>
+    <table class="compare">
+      <thead><tr><th>Mechanism</th><th>Answers</th><th>Key parameter</th></tr></thead>
+      <tbody>
+        <tr><td>Heartbeat</td><td>Is this user online?</td><td>Threshold x = 30s</td></tr>
+        <tr><td>Pub-sub fanout</td><td>Who needs to know?</td><td>One channel per friend pair</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Answer each one in the margin with your stylus before you tap to check.</p>
+  <details class="qa"><summary>Why was WebSocket chosen over polling and long polling?</summary><div class="qa-answer"><p>Polling floods the server with redundant requests, and long polling wastes held connections on inactive users. WebSocket is a persistent, bi-directional connection, so the server can push messages the instant they arrive, and it is used for both sending and receiving.</p></div></details>
+  <details class="qa"><summary>Compare stateless and stateful services in this design.</summary><div class="qa-answer"><p>Stateless API servers handle signup, login and profiles; any server can serve any request behind a load balancer. Stateful chat servers hold persistent WebSocket connections, so each client is tied to one server, chosen by service discovery.</p></div></details>
+  <details class="qa"><summary>Why use a key-value store for chat history instead of a relational database?</summary><div class="qa-answer"><p>KV stores scale horizontally easily and provide very low latency. Relational databases do not handle the long tail of data well: when indexes grow large, random access becomes expensive. Facebook Messenger and Discord both use KV stores.</p></div></details>
+  <details class="qa"><summary>Why are local, per-channel message IDs good enough?</summary><div class="qa-answer"><p>Message order only needs to be maintained within a one-on-one channel or a group channel. IDs unique within the channel, combined with channel_id as a composite key, give that ordering without a global sequence generator.</p></div></details>
+  <details class="qa"><summary>A user's phone has cur_max_message_id = 653. Which messages does it fetch when it reconnects?</summary><div class="qa-answer"><p>Every message in the KV store whose recipient ID is the logged-in user and whose message ID is greater than 653. After fetching, the phone updates its bookmark to the newest ID.</p></div></details>
+  <details class="qa"><summary>What happens if a client stops sending heartbeats?</summary><div class="qa-answer"><p>If no heartbeat arrives within the threshold (30 seconds in the example), the presence server marks the user offline and publishes the change to each friend-pair channel, so subscribed friends see the update.</p></div></details>
+  <details class="qa"><summary>What happens when User A messages User B, who is offline?</summary><div class="qa-answer"><p>Chat Server 1 still assigns a message ID and stores the message in the KV store. Because B is offline, a push notification is sent instead of forwarding over a WebSocket. When B reconnects, sync fetches the message using cur_max_message_id.</p></div></details>
+</div>

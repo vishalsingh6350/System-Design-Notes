@@ -1,0 +1,213 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 09:30 and the opening bell rings. In the first seconds, orders flood in at five times the day's average &mdash; over 200,000 per second &mdash; from retail brokers, institutional algorithms and colocated servers humming in racks a few metres from the exchange. Each order must be risk-checked, funded, placed in a precise queue, and matched fairly against the other side, with every participant seeing the resulting price at the same instant. A hiccup of a few milliseconds is a lifetime here, and losing a single trade is unacceptable. The exchange's whole job is to match buyers and sellers &mdash; deterministically, fairly and in microseconds.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">Split the exchange into one sacred critical path (the trading flow) and everything else. Hubs are the pieces that sit on, or directly protect, that path.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Trading flow (critical path)</span> <span class="why">&mdash; every order must pass through, so every microsecond counts</span>
+      <ul>
+        <li>Client gateway: validates, rate limits, authenticates
+          <ul><li><span class="peripheral">Kept lightweight; multiple gateways incl. colo engines for brokers</span></li></ul>
+        </li>
+        <li>Order manager: risk checks, wallet funds check, order state
+          <ul><li><span class="peripheral">Example rule: at most 1M Apple shares per user per day</span></li></ul>
+        </li>
+        <li>Brokers (Robinhood, Fidelity) sit in front; REST or FIX for most, proprietary protocol for institutions</li>
+      </ul>
+    </li>
+    <li><span class="hub">Matching engine &amp; order book</span> <span class="why">&mdash; the heart: where a trade actually happens</span>
+      <ul>
+        <li>One order book per symbol, buy and sell sides by price level
+          <ul><li><span class="peripheral">Doubly-linked list per level + orderMap for O(1) place/match/cancel</span></li></ul>
+        </li>
+        <li>FIFO matching at a price level; each match emits two fills
+          <ul><li><span class="peripheral">Limit orders only in this design</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Sequencer &amp; determinism</span> <span class="why">&mdash; one ordering of events makes replay, recovery and failover possible</span>
+      <ul>
+        <li>Stamps inbound orders and outbound fills with sequence IDs
+          <ul><li><span class="peripheral">Timeliness &amp; fairness, fast recovery/replay, exactly-once</span></li></ul>
+        </li>
+        <li>Event sourcing: store immutable transitions, not current state
+          <ul><li><span class="peripheral">In deep dive, the sequencer becomes a single writer in front of the event store</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Single-server low-latency design</span> <span class="why">&mdash; from tens of ms to tens of microseconds</span>
+      <ul>
+        <li>All components on one server, communicating over an mmap event store
+          <ul><li><span class="peripheral">File in /dev/shm: shared memory, no disk access</span></li></ul>
+        </li>
+        <li>Application loop pinned to one CPU
+          <ul><li><span class="peripheral">No context switching, no lock contention</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Availability, fault tolerance &amp; side flows</span> <span class="why">&mdash; keeping the heart beating and the world informed</span>
+      <ul>
+        <li>Hot/warm replicas, heartbeats, Raft leader election, 99.99% target</li>
+        <li>Market data flow: publisher builds order book and candlesticks
+          <ul><li><span class="peripheral">Ring buffers, multicast over reliable UDP, colocation, L1/L2/L3 data</span></li></ul>
+        </li>
+        <li><span class="peripheral">Reporting flow: accuracy over latency (tax, compliance, settlements)</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The matching engine is the reason the exchange exists, but it cannot be trusted without the sequencer: sequencing is what makes matching deterministic, and determinism is what lets a backup replay the same events and take over. The single-server design is the performance answer for that critical path, and the availability hub protects it. Market data and reporting hang off the execution stream but are deliberately kept off the critical path.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow cause and effect from a broker's order to a trade and its ripples. The first five boxes are the critical path; the last is fed by it but never slows it down.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Client gateway</h4>
+      <p><strong>Input:</strong> POST /v1/order (symbol, side, price, orderType, quantity) from a broker, or FIX messages.</p>
+      <p><strong>Output:</strong> A validated, authenticated, rate-limited order for the order manager.</p>
+      <p class="io-story">The security desk at the trading floor entrance: check badges quickly, turn away troublemakers, and never slow the line with paperwork.</p>
+      <p class="io-arrow">&rarr; feeds into: Order manager</p>
+    </div>
+    <div class="io-block">
+      <h4>Order manager (+ risk manager + wallet)</h4>
+      <p><strong>Input:</strong> A new or cancel order.</p>
+      <p><strong>Output:</strong> An order that passed risk rules and has sufficient, withheld funds; trimmed to the essentials for the matching engine.</p>
+      <p class="io-story">The compliance officer and cashier in one: "Are you allowed to trade this much?" and "Can you afford it?" &mdash; with the money set aside until the order is final.</p>
+      <p class="io-arrow">&rarr; feeds into: Sequencer</p>
+    </div>
+    <div class="io-block">
+      <h4>Sequencer</h4>
+      <p><strong>Input:</strong> Inbound orders and outbound fills.</p>
+      <p><strong>Output:</strong> The same messages, each stamped with a sequence ID, in one global order.</p>
+      <p class="io-story">The deli-counter ticket machine. Whoever holds number 1,000,001 is served before 1,000,002, no matter when their paperwork was physically written.</p>
+      <p class="io-arrow">&rarr; feeds into: Matching engine (orders in), order manager (fills out)</p>
+    </div>
+    <div class="io-block">
+      <h4>Matching engine (cross engine)</h4>
+      <p><strong>Input:</strong> Sequenced orders for a symbol.</p>
+      <p><strong>Output:</strong> An updated order book and, on a match, two executions (fills) &mdash; one for the buyer, one for the seller.</p>
+      <p class="io-story">The auctioneer holding two queues of hands at each price. When a buyer meets a seller, the one who has waited longest at that price gets served first.</p>
+      <p class="io-arrow">&rarr; feeds into: Sequencer &rarr; order manager &rarr; client gateway &rarr; broker; also market data publisher and reporter</p>
+    </div>
+    <div class="io-block">
+      <h4>Market data publisher &amp; data service</h4>
+      <p><strong>Input:</strong> The execution stream.</p>
+      <p><strong>Output:</strong> Rebuilt order books (L1/L2/L3) and candlestick charts, multicast to subscribers; stored in an in-memory columnar DB (e.g. KDB).</p>
+      <p class="io-story">The stadium's giant screen: it replays what happened on the field so every spectator sees the same score at the same moment.</p>
+      <p class="io-arrow">&rarr; feeds into: Brokers and subscribers; historical DB after market close</p>
+    </div>
+    <div class="io-block">
+      <h4>Reporter</h4>
+      <p><strong>Input:</strong> Orders and executions.</p>
+      <p><strong>Output:</strong> Rows with client_id, price, quantity, order_type, filled_quantity, remaining_quantity.</p>
+      <p class="io-story">The court stenographer: slow and careful is fine, but every word must be right for tax, compliance and settlement.</p>
+      <p class="io-arrow">&rarr; feeds into: Reporting database</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one order</h4>
+    <ol class="journey-steps">
+      <li>At 09:30:01 a retail client asks their broker to buy 200 shares of a symbol with a limit price of $150. The broker sends POST /v1/order with symbol, side=buy, price, orderType=limit and quantity=200.</li>
+      <li>The client gateway authenticates the broker, validates the fields and applies rate limiting, then passes the order on.</li>
+      <li>The order manager checks the risk rules (the client is well below their daily volume cap) and confirms the wallet holds enough funds, withholding them for this pending order.</li>
+      <li>The sequencer stamps the order with the next sequence ID. If the matching engine ever sees an ID that is not the next expected one, it returns an OUT_OF_ORDER error rather than guessing.</li>
+      <li>The matching engine looks up the $150 level in the sell book. It walks the queue from the head: the oldest resting sell for 120 shares fills first, then the next for 80 &mdash; FIFO at that price.</li>
+      <li>Each match emits two fills (buy side and sell side). Filled sell orders are removed from the head of the list in O(1).</li>
+      <li>Fills are sequenced on the way out, returned to the order manager, and sent through the client gateway to the broker. The response shows filledQuantity=200, remainingQuantity=0, status=filled.</li>
+      <li>Meanwhile the market data publisher updates the order book and the current candlestick, and multicasts them so every subscriber receives them at the same time.</li>
+      <li>The reporter writes the order and executions to the database for trading history, tax and compliance reporting.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">An exchange matches buyers and sellers deterministically and fairly at microsecond latency: strip the critical path to its bones, sequence every event, and build everything else &mdash; recovery, market data, reporting &mdash; from that single ordered stream.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine an old-fashioned auction house squeezed into one soundproof room. At the door, a guard checks credentials (client gateway); next to him, a cashier confirms you can pay and holds your deposit (order manager and wallet). A ticket machine stamps every bid with a number (sequencer), and the auctioneer (matching engine) keeps a ladder of price rungs, each with a neat line of waiting bidders (the order book), always serving the front of the line first. Everyone in the room passes notes on one shared chalkboard rather than shouting across town (mmap in shared memory on one server), and the auctioneer never leaves the podium (application loop pinned to a CPU). A stenographer (reporter) writes everything down, a loudspeaker announces prices to everyone at once (multicast market data), and an understudy auctioneer reads the same numbered tickets, ready to take over the instant the first one falters (hot/warm replica with leader election).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">43,000 QPS / 215,000 peak</span><span class="beacon-def">1B orders over a 6.5-hour session; peak is 5x, concentrated at the open.</span></div>
+    <div class="beacon"><span class="beacon-term">Limit order</span><span class="beacon-def">Buy or sell at a fixed price; may rest in the book or be partially filled. The only type supported here.</span></div>
+    <div class="beacon"><span class="beacon-term">Bid / Ask</span><span class="beacon-def">Highest price a buyer will pay / lowest price a seller will accept; the spread between them is the market.</span></div>
+    <div class="beacon"><span class="beacon-term">L1 / L2 / L3</span><span class="beacon-def">Best bid/ask only / more price levels / levels plus queued quantity at each level.</span></div>
+    <div class="beacon"><span class="beacon-term">Fill (execution)</span><span class="beacon-def">A match produces two: one for the buy side, one for the sell side.</span></div>
+    <div class="beacon"><span class="beacon-term">Sequencer</span><span class="beacon-def">Stamps inbound orders and outbound fills; the source of determinism, fairness, replay and exactly-once.</span></div>
+    <div class="beacon"><span class="beacon-term">O(1) order book</span><span class="beacon-def">Doubly-linked list per price level plus orderMap: add at tail, match at head, cancel by reference.</span></div>
+    <div class="beacon"><span class="beacon-term">FIFO matching</span><span class="beacon-def">At a price level, the earliest resting order is matched first.</span></div>
+    <div class="beacon"><span class="beacon-term">mmap in /dev/shm</span><span class="beacon-def">Shared-memory event bus between processes on one server; no network, no disk.</span></div>
+    <div class="beacon"><span class="beacon-term">Application loop on a pinned CPU</span><span class="beacon-def">A tight while-loop on one core: no context switches, no lock contention.</span></div>
+    <div class="beacon"><span class="beacon-term">99.99% = 8.64 s/day</span><span class="beacon-def">The downtime budget that forces hot standbys and automated failover.</span></div>
+    <div class="beacon"><span class="beacon-term">Multicast over reliable UDP</span><span class="beacon-def">Market data reaches all subscribers at once; retransmission patches UDP's unreliability.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Four ideas carry this chapter: the shape of the trading flow, the order book data structure, the sequencer-driven determinism that underpins recovery, and the one-server latency tricks. Everything else is decoration around these.</p>
+
+  <div class="drill">
+    <h4>The three flows and why only one is critical</h4>
+    <p>The high-level design has three flows sharing one source of truth. The <strong>trading flow</strong> carries an order from broker to client gateway, order manager, sequencer and matching engine, and brings fills back. The <strong>market data flow</strong> (M1&ndash;M3) turns executions into order books and candlesticks for brokers. The <strong>reporting flow</strong> (R1&ndash;R2) writes orders and executions to a database for history, tax and compliance.</p>
+    <figure class="guide-fig"><img src="28.%20Stock%20Exchange/images/high-level-design.png" alt="Stock exchange high-level design with trading, market data and reporting flows"><figcaption>Find the numbered trading path first, then notice that the market data (M) and reporting (R) branches both hang off the matching engine's output without feeding back into it.</figcaption></figure>
+    <p>Latency requirements differ sharply. The trading flow is stripped of everything non-essential &mdash; even logging &mdash; while the reporter can take its time as long as it is accurate. The order manager also trims orders to only the fields the matching engine needs, to save bandwidth.</p>
+    <table class="compare"><thead><tr><th>Flow</th><th>On critical path?</th><th>What matters most</th></tr></thead><tbody>
+      <tr><td>Trading</td><td>Yes</td><td>Low, predictable latency (99th percentile and beyond)</td></tr>
+      <tr><td>Market data</td><td>No</td><td>Timely and fair distribution to all subscribers</td></tr>
+      <tr><td>Reporting</td><td>No</td><td>Accuracy and compliance</td></tr>
+    </tbody></table>
+    <div class="pitfall"><strong>Common trap:</strong> Putting reporting or database writes on the trading path. Orders and executions on the critical path live in memory and are recovered from the sequencer; the database is the reporter's business.</div>
+  </div>
+
+  <div class="drill">
+    <h4>The order book: O(1) at every step</h4>
+    <p>An order book is a list of buy and sell orders for one symbol, organized by price level. It must give constant-time lookup of volume at a price, fast add/execute/cancel, quick access to the best bid and ask, and iteration through price levels.</p>
+    <p>The structure: an OrderBook holds a buy Book and a sell Book, pointers to bestBid and bestOffer, and an orderMap from order ID to order. Each Book maps a price to a PriceLevel, and each PriceLevel holds its limit price, total volume and a list of orders. Making that list <strong>doubly linked</strong> is the trick that turns every operation into O(1).</p>
+    <div class="anim" data-anim="order-book"></div>
+    <figure class="guide-fig"><img src="28.%20Stock%20Exchange/images/order-book-impl.png" alt="Order book implementation with price levels and doubly-linked order lists"><figcaption>Notice each price level is a queue: new orders join the tail, matches consume from the head, and the orderMap points straight at any order so it can be unlinked without walking the list.</figcaption></figure>
+    <ol class="steps">
+      <li><strong>Place:</strong> append to the tail of the price level's list &mdash; O(1).</li>
+      <li><strong>Match:</strong> remove from the head, the oldest order at that price (FIFO) &mdash; O(1).</li>
+      <li><strong>Cancel:</strong> find the order through orderMap, then unlink it using its reference to the previous element &mdash; O(1) lookup and O(1) delete.</li>
+      <li><strong>Cancel after match:</strong> if the order is no longer in orderMap, return CANNOT_CANCEL_ALREADY_MATCHED.</li>
+    </ol>
+    <p>A large order can sweep through several levels; after it fills, the price moves as the bid/ask spread widens. The same data structure is reused by the market data services to reconstruct the book from executions.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Using a plain list per level. Cancels then need a search, which is exactly the operation the doubly-linked list plus orderMap was designed to make constant-time.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Sequencer, event sourcing and determinism</h4>
+    <p>The sequencer stamps every inbound order and outbound fill with a sequence ID. That single act buys three things: timeliness and fairness (a clear first-come order), fast recovery and replay (re-run the numbered stream), and exactly-once (duplicates and gaps are detectable). Conceptually Kafka could play this role, but the design builds its own for lower latency.</p>
+    <p>With event sourcing, the system stores immutable state transitions instead of current state. In the deep-dive design, the gateway speaks FIX to the outside world, the order manager validates new-order events and adds them to its state, the matching core emits an OrderFilledEvent over mmap, and other components subscribe to the event store. Every component embeds the order manager as a library to avoid extra calls. The sequencer becomes a single writer that orders events before they reach the event store.</p>
+    <p><strong>Functional determinism</strong> follows: when events are processed in sequence order, the outcome is the same regardless of the wall-clock time they physically arrived. <strong>Latency determinism</strong> is different &mdash; it must be monitored at the 99th or 99.99th percentile, watching for spikes such as Java garbage collection pauses.</p>
+    <figure class="guide-fig"><img src="28.%20Stock%20Exchange/images/determinism.png" alt="Events processed in sequence order produce the same result regardless of actual timing"><figcaption>Compare the timelines: the gaps between events differ, but the sequence is the same, so the resulting state is identical. That is why a replica replaying the log can take over seamlessly.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> Confusing the two kinds of determinism. Sequencing guarantees the same result; it does not guarantee the same speed &mdash; that needs percentile monitoring.</div>
+  </div>
+
+  <div class="drill">
+    <h4>From milliseconds to microseconds on one big server</h4>
+    <p>Two levers reduce latency: do fewer things on the critical path, and make each thing faster by cutting network, disk and execution time. A conventional multi-service design pays network hops between services and disk writes in the sequencer, landing at tens of milliseconds end to end. The target is tens of microseconds.</p>
+    <p>So, unlike most modern software, the exchange puts everything on one gigantic server. Processes talk through mmap, a UNIX syscall that maps a file into an application's memory; creating that file in /dev/shm (shared memory) means there is no disk access at all. Mission-critical work runs in an application loop &mdash; a tight while-loop pinned to one CPU &mdash; which avoids context switching and, as a bonus, eliminates lock contention because no threads compete for the same resource.</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>No network hops or disk on the critical path, no context switches, no locks: latency drops by orders of magnitude and becomes more predictable.</p></div><div class="con"><strong>Costs</strong><p>The server becomes a critical single point of failure, so availability must come from standby instances, heartbeats, whole-server hot/warm replicas and leader election.</p></div></div>
+    <p>For availability, stateless gateways scale horizontally. Stateful components run as replicas that process inbound events but only publish outbound events if they are the leader. Heartbeats detect a dead primary; across servers, the event store is replicated with reliable UDP and Raft elects a new leader. Early on, failovers can be manual until failure modes are well understood, and chaos engineering helps surface bugs that could take down primary and replicas alike. Data loss is unacceptable, so backups are frequent and Raft replication lowers the risk further.</p>
+    <p>The market data publisher applies similar ideas: pre-allocated, lock-free ring buffers hold candlesticks, with padding so the sequence number never shares a cache line; only part of the history stays in memory. Multicast over reliable UDP delivers data to all subscribers at the same time, so nobody gains an unfair head start.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Assuming "one server" means "no high availability". The design pairs it with standby instances and Raft-based leader election, and some exchanges (and cloud-based or AMM-based ones) choose differently altogether.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Answer in the margin with your stylus first, then tap to reveal.</p>
+  <details class="qa"><summary>Why does the sequencer stamp both inbound orders and outbound fills?</summary><div class="qa-answer"><p>A single global order provides timeliness and fairness, lets the system recover and replay quickly, and supports an exactly-once guarantee. It is also what makes the matching engine deterministic, so replicas processing the same stream reach the same state.</p></div></details>
+  <details class="qa"><summary>How does the order book achieve O(1) cancels?</summary><div class="qa-answer"><p>orderMap gives O(1) lookup of any order by ID, and because each order in the doubly-linked list holds a reference to its previous element, it can be unlinked in O(1) without walking the list.</p></div></details>
+  <details class="qa"><summary>What happens if the matching engine receives an order whose sequence ID is not the next expected one?</summary><div class="qa-answer"><p>It returns an OUT_OF_ORDER error with the expected next sequence rather than processing it. Processing out of order would break determinism.</p></div></details>
+  <details class="qa"><summary>Compare functional determinism and latency determinism.</summary><div class="qa-answer"><p>Functional determinism means the same sequenced events always produce the same results regardless of actual arrival times, guaranteed by the sequencer. Latency determinism means consistently low latency, which must be tracked at the 99th or 99.99th percentile and can be disrupted by things like garbage-collection pauses.</p></div></details>
+  <details class="qa"><summary>Why run everything on one server, and how is the resulting risk handled?</summary><div class="qa-answer"><p>Removing network hops and disk access (mmap in /dev/shm, a pinned application loop) cuts latency from tens of milliseconds to tens of microseconds. The single point of failure is mitigated with standby instances, heartbeats, whole-server hot/warm replicas, reliable-UDP replication of the event store and Raft leader election.</p></div></details>
+  <details class="qa"><summary>Why publish market data with multicast?</summary><div class="qa-answer"><p>If some subscribers received data earlier than others, they would gain market insight they could exploit. Multicast sends one stream to many hosts so they receive it at about the same time, and retransmissions make the underlying UDP reliable.</p></div></details>
+  <details class="qa"><summary>What does 99.99% availability mean for an exchange in practice?</summary><div class="qa-answer"><p>About 8.64 seconds of downtime per day. That budget rules out slow manual recovery as the long-term plan and requires aggressive automated failure detection and failover to backup instances.</p></div></details>
+</div>

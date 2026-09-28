@@ -1,0 +1,209 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is Saturday evening and ten million phones are awake at once, each one quietly whispering "here I am" to the backend every 30 seconds. Somewhere downtown, you open the app and, within seconds, dots appear: your college roommate is 1.2 miles away, a colleague is 3 miles out, and the dot for your cousin just slid a little closer. Unlike a restaurant finder, where the addresses sit still for years, every dot here is moving, and every move must be relayed to the handful of friends who care. That is roughly 334,000 location updates arriving each second, each fanning out to about 40 online friends. The hard part is not finding friends; it is being a tireless, real-time switchboard at that volume.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">From 10,000 feet this is a fan-out machine: updates come in over persistent connections, get stored briefly, and are broadcast to friends. Read each hub as a load-bearing wall; everything nested under it collapses if the hub is misunderstood.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">WebSocket servers (stateful, persistent connections)</span> <span class="why">— the only path by which updates reach phones in real time; every other component is fed by or feeds these</span>
+      <ul>
+        <li>Periodic location update routine (client sends location every 30s)
+          <ul><li><span class="peripheral">Other routines: client init, receive update, subscribe / unsubscribe a friend</span></li></ul>
+        </li>
+        <li>Distance filter: forward only if friend is within the 5-mile threshold
+          <ul><li><span class="peripheral">Server keeps each connected user's latest location in memory for this math</span></li></ul>
+        </li>
+        <li>Scaling by "draining" a server in the load balancer before removal
+          <ul><li><span class="peripheral">REST API servers handle auxiliary work (friends, profiles) and scale trivially</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Redis Pub/Sub (one channel per user)</span> <span class="why">— the switchboard that routes one user's update to all servers holding that user's friends</span>
+      <ul>
+        <li>WebSocket servers subscribe to channels of each connected user's friends
+          <ul><li><span class="peripheral">Channels are pre-allocated; idle channels consume no memory</span></li></ul>
+        </li>
+        <li>Distributed cluster sized for CPU: ~14M pushes/s ÷ ~100k per server = 140+ servers
+          <ul><li><span class="peripheral">Memory need is only ~200GB (2 servers of 100GB would do)</span></li></ul>
+        </li>
+        <li>Consistent hash ring stored in ZooKeeper / etcd
+          <ul><li><span class="peripheral">Ring cached in memory on each WebSocket server</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Redis location cache (latest location + TTL)</span> <span class="why">— the "who is active and where" snapshot that seeds new clients and defines activity itself</span>
+      <ul>
+        <li>Maps <code>user_id</code> to <code>lat, long, timestamp</code>
+          <ul><li><span class="peripheral">TTL expiry = user is inactive (friends disappear after ~10 min)</span></li></ul>
+        </li>
+        <li>Sharded across several Redis nodes to absorb the write load</li>
+      </ul>
+    </li>
+    <li><span class="hub">Durable stores (User DB + Location history DB)</span> <span class="why">— the slow, permanent side: who your friends are, and where everyone has been</span>
+      <ul>
+        <li>User DB: users + friendships, sharded by <code>user_id</code>
+          <ul><li><span class="peripheral">Could be its own service owned by a dedicated team</span></li></ul>
+        </li>
+        <li>Location history in Cassandra (write-heavy), used for analytics / ML
+          <ul><li><span class="peripheral">Not on the hot path of the nearby feature</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">WebSocket servers are the hub because they own the live connection and the distance calculation. Redis Pub/Sub is the second hub because it replaces a brute-force "look up all 400 friends" query with a push-based broadcast. The location cache and durable stores are supporting actors: the cache answers "where is everyone right now" at startup, and the databases hold the slow-changing friend graph and the history nobody reads in real time.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Treat each component as a sealed box: know what goes in and what comes out, and the whole update pipeline becomes a chain of cause and effect.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Mobile client</h4>
+      <p><strong>Input:</strong> GPS reading, a 30-second timer.</p>
+      <p><strong>Output:</strong> A location update (lat, long, timestamp) over its persistent WebSocket.</p>
+      <p class="io-story">A lighthouse that flashes its position every half minute. Walking speed is slow, so more frequent flashes would waste battery for little gain.</p>
+      <p class="io-arrow">&rarr; feeds into: Load balancer &rarr; the client's WebSocket server</p>
+    </div>
+    <div class="io-block">
+      <h4>WebSocket server (sender side)</h4>
+      <p><strong>Input:</strong> The user's location update.</p>
+      <p><strong>Output:</strong> A row in location history, a fresh entry in the location cache, an in-memory copy, and a publish to the user's own Pub/Sub channel.</p>
+      <p class="io-story">A post office clerk who files a copy, updates the "last seen" board, and then drops the letter into the user's personal outgoing chute.</p>
+      <p class="io-arrow">&rarr; feeds into: Location history DB, Location cache, Redis Pub/Sub</p>
+    </div>
+    <div class="io-block">
+      <h4>Redis Pub/Sub channel</h4>
+      <p><strong>Input:</strong> One published message on channel <code>user_X</code>.</p>
+      <p><strong>Output:</strong> A copy delivered to every subscriber, i.e. each WebSocket server holding one of X's online friends.</p>
+      <p class="io-story">A megaphone with a subscriber list. It does not know who is near whom; it just repeats the message to everyone who signed up.</p>
+      <p class="io-arrow">&rarr; feeds into: Subscribed WebSocket servers</p>
+    </div>
+    <div class="io-block">
+      <h4>WebSocket server (receiver side)</h4>
+      <p><strong>Input:</strong> Friend X's new location, plus its own connected user's last known location held in memory.</p>
+      <p><strong>Output:</strong> Either a pushed update (distance + timestamp) to the phone, or silence if beyond 5 miles.</p>
+      <p class="io-story">The bouncer at the door: it calculates the distance and only lets the update through if the friend is close enough to matter.</p>
+      <p class="io-arrow">&rarr; feeds into: Friend's mobile client</p>
+    </div>
+    <div class="io-block">
+      <h4>Client initialization</h4>
+      <p><strong>Input:</strong> A newly opened connection with the user's location.</p>
+      <p><strong>Output:</strong> Friend list fetched, subscriptions to every friend's channel, friends' current locations pulled from cache and sent down.</p>
+      <p class="io-story">Walking into a party: you get the guest list, tune into everyone's conversation, and glance at where each person is standing right now.</p>
+      <p class="io-arrow">&rarr; feeds into: Steady-state periodic update loop</p>
+    </div>
+    <div class="io-block">
+      <h4>Location cache TTL</h4>
+      <p><strong>Input:</strong> Silence from a user (no updates).</p>
+      <p><strong>Output:</strong> The cache entry expires; the user is treated as inactive.</p>
+      <p class="io-story">A candle that burns out unless someone keeps relighting it. No explicit "logout" is needed.</p>
+      <p class="io-arrow">&rarr; feeds into: Future client initializations (friend no longer shown)</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one location update</h4>
+    <ol class="journey-steps">
+      <li>Maya's phone, 30 seconds after its last ping, sends (37.77, -122.41, t=20:00:30) over its open WebSocket.</li>
+      <li>The load balancer routes it along the persistent connection to WebSocket server WS-7, which owns Maya's connection.</li>
+      <li>WS-7 appends the point to the Cassandra location history table (for later analytics).</li>
+      <li>WS-7 overwrites Maya's entry in the Redis location cache and resets its TTL; it also stores the point in its own memory.</li>
+      <li>WS-7 hashes the channel name "maya" on the cached consistent-hash ring, finds Pub/Sub server p_3, and publishes.</li>
+      <li>Maya has 400 friends; about 10% (40) are online. Their WebSocket servers all subscribed to "maya" during init, so p_3 pushes 40 copies out.</li>
+      <li>On WS-2, friend Leo's last location is in memory: 1.8 miles from Maya. Within 5 miles, so WS-2 pushes "Maya, 1.8 mi, 20:00:30" to Leo's phone.</li>
+      <li>On WS-9, friend Priya is 11 miles away. WS-9 drops the update silently.</li>
+      <li>Multiply by 334k updates per second and you get ~14 million pushes per second through the Pub/Sub layer.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Build a real-time fan-out backend that relays each active user's constantly changing location to nearby friends within seconds, tolerating occasional lost points but never falling over.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Imagine a vast radio network. Every user owns a personal radio frequency: that is their Redis Pub/Sub channel. The WebSocket servers are receiving stations that tune in to the frequencies of every friend of the listeners they serve. When you speak your location into your frequency, every tuned-in station hears it, but each station has a filter: it only relays your voice to its listener if you are within 5 miles. The big bulletin board by the door that shows "last heard from, and where" is the Redis location cache, and chalk marks on it fade after a few minutes (TTL). The archive room recording every broadcast forever is the Cassandra location history database.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">10M concurrent / 30s = ~334k QPS</span><span class="beacon-def">The inbound update rate; tells you writes dominate and the refresh interval is the main dial.</span></div>
+    <div class="beacon"><span class="beacon-term">400 friends x 10% online = 40</span><span class="beacon-def">Fan-out factor per update; multiplies inbound QPS into ~14M pushes/s.</span></div>
+    <div class="beacon"><span class="beacon-term">WebSocket</span><span class="beacon-def">Bidirectional persistent connection; lets the server push without polling, but makes servers stateful.</span></div>
+    <div class="beacon"><span class="beacon-term">One channel per user</span><span class="beacon-def">Publisher does not need to know who listens; subscribers manage their own interest.</span></div>
+    <div class="beacon"><span class="beacon-term">Idle channels cost nothing</span><span class="beacon-def">So channels can be pre-allocated for every user of the feature; no setup dance when someone comes online.</span></div>
+    <div class="beacon"><span class="beacon-term">CPU-bound, not memory-bound</span><span class="beacon-def">200GB memory fits on 2 servers, but ~100k pushes/s per server forces 140+ servers.</span></div>
+    <div class="beacon"><span class="beacon-term">TTL = activity</span><span class="beacon-def">Expiry in the cache automatically removes inactive users; memory is naturally capped.</span></div>
+    <div class="beacon"><span class="beacon-term">Consistent hashing</span><span class="beacon-def">Maps channels to Pub/Sub servers so adding/removing a server moves only a slice of channels.</span></div>
+    <div class="beacon"><span class="beacon-term">ZooKeeper / etcd</span><span class="beacon-def">Service discovery holding the hash ring; WebSocket servers cache it locally.</span></div>
+    <div class="beacon"><span class="beacon-term">Draining</span><span class="beacon-def">Stop new connections to a WebSocket server before removal; graceful scale-down of stateful nodes.</span></div>
+    <div class="beacon"><span class="beacon-term">Eventual consistency</span><span class="beacon-def">A few seconds of lag between replicas is fine; losing an occasional point is acceptable.</span></div>
+    <div class="beacon"><span class="beacon-term">Geohash channels</span><span class="beacon-def">Extension for "nearby random person": subscribe to your area's channel plus its neighbors.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviews on this problem live or die on three things: the fan-out path, scaling the Pub/Sub cluster, and what state the WebSocket layer holds. Drill those; skim the rest.</p>
+
+  <div class="drill">
+    <h4>The periodic update and fan-out path</h4>
+    <p>The core insight is to flip the question. Instead of each user asking "where are my 400 friends?", each user announces "here I am" once, and the system pushes that announcement to the ~40 friends who are online. Redis Pub/Sub is the lightweight message bus that makes this cheap: one publish, many deliveries.</p>
+    <p>Notice where the distance check happens: on the receiving WebSocket server, not in Redis. Pub/Sub delivers blindly to every subscriber; the receiving server compares the friend's new point against its own user's in-memory location and decides whether to push. This keeps Redis dumb and fast.</p>
+    <div class="anim" data-anim="pubsub-location"></div>
+    <figure class="guide-fig"><img src="17.%20Nearby%20Friends/images/detailed-periodic-location-update.png" alt="Detailed periodic location update through Redis Pub/Sub channels"><figcaption>User 1 publishes once into their own channel; the servers for Users 2, 3 and 4 each receive a copy. Note User 4's server subscribes to both User 1 and User 5 &mdash; a single connection listens to many friends' channels.</figcaption></figure>
+    <ol class="steps">
+      <li>Client sends location to its WebSocket server.</li>
+      <li>Server writes to location history DB and to the location cache (plus its own memory).</li>
+      <li>Server publishes to the user's channel.</li>
+      <li>Pub/Sub broadcasts to every subscribed WebSocket server.</li>
+      <li>Each receiver computes distance and pushes only if within the threshold.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> proposing peer-to-peer between phones. The notes reject it: mobile connections are flaky and battery-constrained, so a shared backend acting as a fan-out hub is the practical choice.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Scaling Redis Pub/Sub: a CPU problem in disguise</h4>
+    <p>The memory math is surprisingly small: around 200GB for all channels, which two 100GB servers could hold. But the push rate tells a different story. Roughly 14 million location pushes per second, at about 100k pushes per server, demands at least 140 Redis servers. The bottleneck is CPU, so the cluster must be distributed.</p>
+    <p>To know which server owns which channel, the channel names are placed on a consistent hash ring stored in a service discovery system (ZooKeeper or etcd). Each WebSocket server caches that ring in memory and hashes a channel name to find its home. When a server is added or removed, consistent hashing ensures only the channels in the affected arc move.</p>
+    <figure class="guide-fig"><img src="17.%20Nearby%20Friends/images/channel-distribution-data.png" alt="Consistent hash ring of Redis Pub/Sub servers"><figcaption>Channels hash onto the ring and belong to the next server clockwise; the shaded arc is p_1's territory. Add a server inside that arc and only those channels relocate.</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Horizontal scaling of push throughput; minimal channel movement on resize; lookups are local (cached ring).</p></div>
+      <div class="con"><strong>Costs</strong><p>The cluster is effectively stateful: resizing triggers a storm of resubscriptions and may drop some updates, so do it at the daily traffic low, driven by a scheduled job, and overprovision for spikes.</p></div>
+    </div>
+    <div class="pitfall"><strong>Common trap:</strong> sizing the cluster by memory alone and concluding "two servers is enough." Always compute both memory and operations per second; here CPU wins by a factor of 70.</div>
+  </div>
+
+  <div class="drill">
+    <h4>What each store holds, and why Redis twice</h4>
+    <p>Redis appears in two roles and it is easy to blur them. The location cache stores just the latest point per user with a TTL: it answers "where is my friend right now?" during initialization and naturally forgets inactive users. Redis Pub/Sub stores no location at all; it is purely a routing fabric.</p>
+    <table class="compare">
+      <thead><tr><th>Store</th><th>Holds</th><th>Why this tech</th></tr></thead>
+      <tbody>
+        <tr><td>Redis location cache</td><td><code>user_id &rarr; lat, long, timestamp</code></td><td>Only current location matters; built-in TTL eviction</td></tr>
+        <tr><td>Redis Pub/Sub</td><td>Per-user channels and subscriber lists</td><td>Lightweight bus; idle channels are free</td></tr>
+        <tr><td>Location history (Cassandra)</td><td>Same four columns, every point</td><td>Optimized for heavy writes; for analytics/ML</td></tr>
+        <tr><td>User DB</td><td>Users and friendships</td><td>Relational or NoSQL, sharded by <code>user_id</code></td></tr>
+      </tbody>
+    </table>
+    <p>Adding or removing a friend is handled by a client callback: the app tells the WebSocket server, which subscribes to or unsubscribes from that friend's channel. "Whale" users with many friends are capped (Facebook's cap is 5000), and their extra load is absorbed by having enough WebSocket servers.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Extension: nearby random people via geohash channels</h4>
+    <p>If the interviewer asks to show strangers nearby, swap "one channel per user" for "one channel per geohash cell." Everyone inside a cell publishes to and subscribes to that cell's channel, so you hear about anyone in your square of the map.</p>
+    <figure class="guide-fig"><img src="17.%20Nearby%20Friends/images/geohash-borders.png" alt="Geohash grid with users near cell borders"><figcaption>A user in 9q8zn9 may be meters from someone in 9q8zn8 or 9q8zn3. Subscribing to your own cell plus its neighbors catches people just across the border.</figcaption></figure>
+    <p>An alternative to Redis Pub/Sub entirely is Erlang: millions of lightweight processes can handle both WebSocket connections and channels in one distributed application. The catch is people, not technology: Erlang is niche and strong developers are hard to hire.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin with your stylus before tapping to reveal.</p>
+  <details class="qa"><summary>Why is the location refresh interval 30 seconds rather than 1 second?</summary><div class="qa-answer"><p>Human walking speed is slow, so position barely changes in a second. With 10M concurrent users, 30s gives ~334k QPS; 1s would be 10M QPS inbound and 30x the fan-out, with little user-visible benefit and much worse battery drain.</p></div></details>
+  <details class="qa"><summary>Where does the 5-mile distance check happen, and why there?</summary><div class="qa-answer"><p>On the receiving WebSocket server, which holds its connected user's latest location in memory. Pub/Sub just broadcasts to all subscribers; doing the math at the edge keeps Redis simple and avoids extra lookups.</p></div></details>
+  <details class="qa"><summary>Memory says 2 Redis servers; why do we need 140+?</summary><div class="qa-answer"><p>The channels fit in ~200GB, but pushing ~14M updates per second at ~100k pushes per server needs at least 140 servers. The workload is CPU-bound, so the cluster size is set by throughput, not storage.</p></div></details>
+  <details class="qa"><summary>What happens when a Redis Pub/Sub server is added to the cluster?</summary><div class="qa-answer"><p>Some channels move to the new server per the consistent hash ring. WebSocket servers see the updated ring and must resubscribe those channels, causing a burst of resubscription requests and possibly a few missed updates. Consistent hashing limits how many move; doing it at the daily traffic low limits the damage.</p></div></details>
+  <details class="qa"><summary>How does the system know a friend has gone inactive?</summary><div class="qa-answer"><p>Each location cache entry has a TTL. If a user stops sending updates, the entry expires and they are treated as inactive, so they no longer appear when friends initialize. The TTL also caps the cache's maximum memory.</p></div></details>
+  <details class="qa"><summary>Compare the Redis location cache with the Cassandra location history table.</summary><div class="qa-answer"><p>Both hold user_id, lat, long, timestamp. The cache keeps only the latest point with a TTL for real-time lookups; Cassandra keeps every point permanently for analytics and machine learning, chosen because it handles heavy write loads well.</p></div></details>
+  <details class="qa"><summary>Why can Pub/Sub channels be pre-allocated for every user?</summary><div class="qa-answer"><p>Channels that exist but have no activity consume no memory in Redis Pub/Sub. Pre-allocating avoids the complexity of creating a channel when a user comes online and notifying all interested WebSocket servers.</p></div></details>
+</div>

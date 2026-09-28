@@ -1,0 +1,204 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>A creator finishes editing a 300 MB clip on a train and taps "Upload" on a patchy mobile connection. Minutes later someone on a smart TV across the world presses play and it starts instantly, crisp in HD, then quietly drops to a lower resolution when their Wi-Fi stutters, without buffering. Between those two moments the raw file was chopped up, inspected, re-encoded into many resolutions and formats, thumbnailed, watermarked and pushed to edge servers near every viewer. Do that for millions of daily users, adding 150 TB of new video a day, while CDN bills alone run around $150,000 a day, and you see why the hard problems here are heavy processing and heavy bandwidth.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">YouTube is two pipelines joined by storage: an upload pipeline that turns one raw file into many streamable versions, and a streaming pipeline that serves those versions from the CDN. Read the map top-down: flows first, the transcoding engine second, the optimisations last.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Video Upload Flow</span> <span class="why">— everything starts with getting the raw file and its metadata in safely</span>
+      <ul>
+        <li>Two parallel paths: file &rarr; original storage, metadata &rarr; API servers &rarr; metadata DB</li>
+        <li>Completion queue + completion handler update metadata and inform the user</li>
+        <li>Upload hardening
+          <ul><li><span class="peripheral">Pre-signed URLs for authorised uploads</span></li><li><span class="peripheral">Chunked, resumable parallel uploads; CDNs as upload centres</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Video Transcoding (DAG engine)</span> <span class="why">— the expensive heart that makes one upload playable everywhere</span>
+      <ul>
+        <li>Why: smaller storage, device compatibility, quality that adapts to network
+          <ul><li><span class="peripheral">Container (MP4, AVI) vs codec (H.264, VP9)</span></li></ul>
+        </li>
+        <li>Preprocessor &rarr; DAG scheduler &rarr; resource manager &rarr; task workers</li>
+        <li>Temporary storage for retries
+          <ul><li><span class="peripheral">GOP (Group of Pictures) splitting</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Video Streaming Flow</span> <span class="why">— the part viewers actually feel; must be fast and cheap</span>
+      <ul>
+        <li>CDN edge servers stream directly to clients</li>
+        <li>Streaming protocols
+          <ul><li><span class="peripheral">MPEG-DASH, Apple HLS, Adobe HDS</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Optimisations &amp; Error Handling</span> <span class="why">— the levers for speed, safety and the huge CDN bill</span>
+      <ul>
+        <li>Speed: parallel uploads, message queues between modules</li>
+        <li>Safety: pre-signed URLs, DRM, AES encryption, watermarking</li>
+        <li>Cost: CDN only for popular videos, on-demand encoding, regional distribution
+          <ul><li><span class="peripheral">Custom CDNs and ISP partnerships</span></li></ul>
+        </li>
+        <li>Recoverable errors retry; non-recoverable errors stop with an error code</li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Upload feeds transcoding; transcoding feeds transcoded storage and the CDN; the CDN feeds streaming. The optimisations are not a separate system but dials on each of those three hubs. The transcoding engine is the deepest hub because it decides how fast a video becomes watchable and how much compute it burns.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the file as it moves from the creator's phone to the viewer's screen. Each box transforms it in one specific way.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>API Servers (upload gatekeeper)</h4>
+      <p><strong>Input:</strong> A <code>POST /upload</code> request plus video metadata (file name, size, format).</p>
+      <p><strong>Output:</strong> A pre-signed URL for the client, and a metadata record saved in the metadata DB.</p>
+      <p class="io-story">A front desk that checks your ID and hands you a one-time key to the storage room, instead of carrying your luggage itself.</p>
+      <p class="io-arrow">&rarr; feeds into: client uploads directly to Original Storage</p>
+    </div>
+    <div class="io-block">
+      <h4>Original Storage (blob)</h4>
+      <p><strong>Input:</strong> The raw video, often in parallel chunks.</p>
+      <p><strong>Output:</strong> A durable raw copy ready for processing.</p>
+      <p class="io-story">The loading dock where unprocessed crates are stacked before the factory opens them.</p>
+      <p class="io-arrow">&rarr; feeds into: Transcoding servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Preprocessor + DAG Scheduler</h4>
+      <p><strong>Input:</strong> Raw video and configuration files written by client programmers.</p>
+      <p><strong>Output:</strong> GOP-aligned chunks cached in temporary storage, and a DAG split into stages of tasks.</p>
+      <p class="io-story">The planner who cuts the job into pieces and writes the recipe: split into video, audio, metadata first, then encode and thumbnail.</p>
+      <p class="io-arrow">&rarr; feeds into: Resource Manager's task queue</p>
+    </div>
+    <div class="io-block">
+      <h4>Resource Manager + Task Workers</h4>
+      <p><strong>Input:</strong> Prioritised tasks and worker-utilisation info.</p>
+      <p><strong>Output:</strong> Each task executed on the best available worker; encoded video assembled.</p>
+      <p class="io-story">A dispatcher matching jobs to free, capable hands, then tracking who is doing what.</p>
+      <p class="io-arrow">&rarr; feeds into: Transcoded Storage and the Completion Queue (in parallel)</p>
+    </div>
+    <div class="io-block">
+      <h4>Transcoded Storage &rarr; CDN</h4>
+      <p><strong>Input:</strong> Encoded versions of the video in multiple resolutions and formats.</p>
+      <p><strong>Output:</strong> Copies distributed to CDN edge servers close to viewers.</p>
+      <p class="io-story">The finished goods warehouse ships stock to corner shops in every neighbourhood.</p>
+      <p class="io-arrow">&rarr; feeds into: streaming to clients</p>
+    </div>
+    <div class="io-block">
+      <h4>Completion Queue + Completion Handler</h4>
+      <p><strong>Input:</strong> Transcoding-complete events.</p>
+      <p><strong>Output:</strong> Updated metadata (video is ready) and a notification to the creator.</p>
+      <p class="io-story">The bell that rings when the order is done, so the front desk can update the ticket and call the customer.</p>
+      <p class="io-arrow">&rarr; feeds into: Metadata DB / cache; user sees "ready"</p>
+    </div>
+    <div class="io-block">
+      <h4>CDN Edge Streaming</h4>
+      <p><strong>Input:</strong> A viewer's play request.</p>
+      <p><strong>Output:</strong> A stream in a protocol such as MPEG-DASH or Apple HLS, at a quality suited to their device and network.</p>
+      <p class="io-story">The corner shop hands you the video immediately; nobody drives to the central warehouse.</p>
+      <p class="io-arrow">&rarr; feeds into: the viewer's player</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one upload</h4>
+    <ol class="journey-steps">
+      <li>The creator's app sends <code>POST /upload</code> to the API servers. In parallel it sends metadata: file name, size (300 MB), format.</li>
+      <li>API servers authorise the user, store the metadata, and return a pre-signed URL granting temporary permission to write to original storage.</li>
+      <li>The client splits the 300 MB file into smaller chunks and uploads them in parallel to the nearest upload centre (a CDN edge acting as an upload hub). If the train enters a tunnel, only the missing chunks are resent.</li>
+      <li>Once the raw video lands in original storage, the preprocessor splits it by GOP alignment, builds the DAG from configuration files, and caches the GOPs and metadata in temporary storage.</li>
+      <li>The DAG scheduler emits stage 1 (split into video, audio, metadata) and then stage 2 (video encoding and thumbnail, alongside audio encoding) into the task queue.</li>
+      <li>The resource manager's task scheduler pops the highest-priority task, picks the best worker from the worker queue, records the pair in the running queue, and dispatches. An encoding worker fails halfway? The task is retried from the data in temporary storage.</li>
+      <li>Encoded outputs are assembled. In parallel, they go to transcoded storage (then out to the CDN) and a completion event goes to the completion queue.</li>
+      <li>The completion handler marks the video ready in the metadata DB and notifies the creator.</li>
+      <li>A viewer on a smart TV presses play; the nearest CDN edge streams it, switching resolution if the network weakens.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">The design turns one raw upload into many device-ready versions through a parallel, retryable DAG pipeline, then serves them from the edge while aggressively controlling bandwidth cost.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of a film-processing factory with a network of corner kiosks. The front desk (API servers) issues you a stamped pass (pre-signed URL) so you can drop your reels straight at the loading dock (original storage). Inside, a planner (preprocessor and DAG scheduler) cuts the reel into short segments (GOPs) and writes a recipe of steps that can run side by side. A dispatcher (resource manager) assigns each step to the best free technician (task workers), keeping spare copies in a back room (temporary storage) in case someone spills chemicals. Finished prints go to a warehouse (transcoded storage) and then out to kiosks on every street (CDN edges), while a bell (completion queue) tells the front desk the order is ready.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">5M DAU, 300 MB avg, 1 GB max</span><span class="beacon-def">Uploads are large; they must be chunked and resumable, not single requests.</span></div>
+    <div class="beacon"><span class="beacon-term">150 TB/day storage</span><span class="beacon-def">Storage grows relentlessly; blob storage, not databases, holds video.</span></div>
+    <div class="beacon"><span class="beacon-term">5M &times; 5 &times; 0.3 GB &times; $0.02 = $150,000/day</span><span class="beacon-def">CDN is the dominant cost, which is why cost optimisations target serving, not compute.</span></div>
+    <div class="beacon"><span class="beacon-term">Transcoding</span><span class="beacon-def">Re-encoding into many resolutions and formats: saves storage, fits every device, adapts to bandwidth.</span></div>
+    <div class="beacon"><span class="beacon-term">Container vs codec</span><span class="beacon-def">Container (MP4, AVI) is the box holding video, audio and metadata; codec (H.264, VP9) is the compression algorithm.</span></div>
+    <div class="beacon"><span class="beacon-term">DAG model</span><span class="beacon-def">Tasks as a directed acyclic graph: dependencies are explicit, independent tasks run in parallel.</span></div>
+    <div class="beacon"><span class="beacon-term">GOP (Group of Pictures)</span><span class="beacon-def">A self-contained chunk of frames; the natural unit to split video for parallel work.</span></div>
+    <div class="beacon"><span class="beacon-term">Task / worker / running queue</span><span class="beacon-def">The resource manager's three queues: what to run, who is free, what is in flight.</span></div>
+    <div class="beacon"><span class="beacon-term">Temporary storage</span><span class="beacon-def">Persisted intermediate data so a failed encode retries instead of restarting from scratch.</span></div>
+    <div class="beacon"><span class="beacon-term">Pre-signed URL</span><span class="beacon-def">A time-limited upload permission; clients write straight to blob storage but only if authorised.</span></div>
+    <div class="beacon"><span class="beacon-term">Completion queue</span><span class="beacon-def">Decouples "encoding finished" from "update metadata and notify user".</span></div>
+    <div class="beacon"><span class="beacon-term">MPEG-DASH / HLS / HDS</span><span class="beacon-def">Streaming protocols; different ones support different encodings and players.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers probe three things: the upload flow's parallel paths, the DAG transcoding architecture, and how you tame the CDN bill. Master those and the rest is vocabulary.</p>
+
+  <div class="drill">
+    <h4>The upload flow: two parallel paths and a completion bell</h4>
+    <p>Uploading is really two things happening at once. The heavy path pushes the video bytes into original storage. The light path sends metadata (file name, size, format) to the API servers, which write it to the metadata database. Separating them means the metadata record exists even while hundreds of megabytes are still in flight.</p>
+    <p>After the file lands, transcoding servers produce the encoded versions. Then two things happen in parallel again: the encoded files go to transcoded storage and on to the CDN (3a, 3a.1), and a completion event is placed on the completion queue so completion handlers can update metadata and tell the user (3b, 3b.1). The queue means a slow metadata update never holds up distribution, and vice versa.</p>
+    <figure class="guide-fig"><img src="14.%20Youtube/images/video-uploading-flow.png" alt="Video uploading flow with transcoding, completion queue and CDN"><figcaption>Trace the numbered arrows: 1 upload, 2 transcode, then the fork into 3a (storage and CDN) and 3b (completion queue and handler). The fork is the point to remember.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> routing video bytes through the API servers. The API servers only hand out pre-signed URLs and handle metadata; bytes go straight to blob storage.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Transcoding as a DAG: split, parallelise, assemble</h4>
+    <p>Transcoding is computationally expensive and slow if done as one long job. The DAG model breaks it into tasks with explicit dependencies. First the original video is split into video, audio and metadata. The video branch fans out into tasks such as inspection, video transcoding (resolutions, codecs, bitrates), thumbnail generation (user-supplied or automatic) and watermarking (an identifying overlay). The audio branch goes through audio encoding. Finally everything is assembled.</p>
+    <p>Because the graph is acyclic and the branches are independent, many tasks run simultaneously. Different creators can also get different DAGs, because the preprocessor builds the graph from configuration files that client programmers write.</p>
+    <div class="anim" data-anim="transcode-dag"></div>
+    <figure class="guide-fig"><img src="14.%20Youtube/images/dag-video-transcoding.png" alt="DAG splitting original video into video, audio and metadata tasks"><figcaption>Notice the fan-out after "Video" into a column of independent tasks, and the fan-in at "Assemble". The width of that column is your parallelism.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>High parallelism, flexible per-video pipelines, and each task can fail and retry independently.</p></div><div class="con"><strong>Costs</strong><p>Needs orchestration: a scheduler to stage tasks, a resource manager to place them, and temporary storage to hold intermediate results.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Inside the transcoding architecture</h4>
+    <p>Five components turn the DAG into running work. Think of them as planner, foreman, dispatcher, crew and safety locker.</p>
+    <ol class="steps">
+      <li><strong>Preprocessor:</strong> splits video into GOP-aligned chunks (also for old clients), generates the DAG from config files, and caches GOPs and metadata in temporary storage for retries.</li>
+      <li><strong>DAG scheduler:</strong> splits the graph into stages (stage 1: video, audio, metadata; stage 2: video encoding and thumbnail) and pushes tasks into the resource manager's task queue.</li>
+      <li><strong>Resource manager:</strong> holds a task queue (priority queue of tasks), a worker queue (priority queue of worker utilisation), and a running queue (current task/worker pairs). Its task scheduler picks the optimal task and worker and instructs the worker.</li>
+      <li><strong>Task workers:</strong> execute the work; different workers may specialise in different tasks.</li>
+      <li><strong>Temporary storage:</strong> holds intermediate data; the store type depends on data type, size, access frequency and lifespan.</li>
+    </ol>
+    <figure class="guide-fig"><img src="14.%20Youtube/images/video-transcoding-architecture.png" alt="Preprocessor to DAG scheduler to resource manager to task workers to encoded video, with temporary storage"><figcaption>The main line runs left to right to "Encoded video". The two arrows up to temporary storage (from preprocessor and workers) are the retry safety net.</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> describing the resource manager as "a queue". It is three queues plus a scheduler; the worker queue is what lets it pick the least-loaded capable worker.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Speed, safety and the $150,000-a-day bill</h4>
+    <p>Speed comes from parallelism everywhere. Uploads are split into chunks by GOP so they are faster and resumable; CDNs serve as distributed upload centres near users; and message queues sit between modules so, for example, encoding does not wait for downloading to finish before it can take the next job.</p>
+    <p>Safety uses pre-signed URLs so only authorised users can upload, and protects content with DRM (Apple FairPlay, Google Widevine), AES encryption and visual watermarking.</p>
+    <table class="compare"><thead><tr><th>Cost lever</th><th>Idea</th></tr></thead><tbody>
+      <tr><td>Popularity-based serving</td><td>Only popular videos go through the CDN; the long tail is served from high-capacity video servers.</td></tr>
+      <tr><td>On-demand encoding</td><td>Rarely watched videos are encoded only when needed, not into every format up front.</td></tr>
+      <tr><td>Regional distribution</td><td>Videos popular in one region are not pushed to every other region.</td></tr>
+      <tr><td>Own CDN and ISP partners</td><td>Building a custom CDN and partnering with ISPs cuts bandwidth costs.</td></tr>
+    </tbody></table>
+    <p>Errors split into two families: recoverable ones (a failed upload chunk, transcoding task or resource allocation) are retried; non-recoverable ones (a malformed video) stop processing and return an error code.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch or jot your answer in the margin first, then tap to check.</p>
+  <details class="qa"><summary>Why is transcoding necessary at all?</summary><div class="qa-answer"><p>Raw video is huge, so encoding reduces storage. Different devices and browsers support different formats, so multiple encodings ensure compatibility. And multiple resolutions and bitrates let playback adapt to the viewer's network.</p></div></details>
+  <details class="qa"><summary>What does a pre-signed URL solve, and who issues it?</summary><div class="qa-answer"><p>The API servers issue it after a <code>POST /upload</code>. It gives the client time-limited permission to upload straight to original storage, so only authorised users can write, and the video bytes never pass through the API servers.</p></div></details>
+  <details class="qa"><summary>What happens if a task worker crashes midway through encoding?</summary><div class="qa-answer"><p>It is a recoverable error, so the task is retried. The preprocessor and workers persisted GOPs and intermediate data in temporary storage, so the retry resumes from that data instead of reprocessing the whole upload.</p></div></details>
+  <details class="qa"><summary>Compare the task queue, worker queue and running queue.</summary><div class="qa-answer"><p>The task queue is a priority queue of work waiting to run. The worker queue is a priority queue of worker utilisation, used to pick the best worker. The running queue records which tasks are currently executing on which workers.</p></div></details>
+  <details class="qa"><summary>Why put a completion queue between transcoding and metadata updates?</summary><div class="qa-answer"><p>It decouples the two: transcoded files can flow to storage and the CDN in parallel while completion handlers update metadata and notify users at their own pace. A slow or failed handler does not block distribution.</p></div></details>
+  <details class="qa"><summary>The CDN bill is too high. Name three changes from the notes.</summary><div class="qa-answer"><p>Serve only popular videos via the CDN and the rest from high-capacity servers; encode rarely watched videos on demand; distribute regionally by popularity. Longer term, build a custom CDN and partner with ISPs.</p></div></details>
+  <details class="qa"><summary>How does chunked upload help the creator on a patchy connection?</summary><div class="qa-answer"><p>The video is split (by GOP) into smaller chunks uploaded in parallel, which is faster, and if the connection drops only the unfinished chunks need resending, making the upload resumable.</p></div></details>
+</div>

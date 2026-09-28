@@ -1,0 +1,195 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>You fix one typo in a 40-page report on your laptop at 11 pm, close the lid, and the next morning your phone already shows the corrected version. Meanwhile a colleague edited the same file at the same moment, and instead of one of you silently losing work, the system shows both copies and lets them choose. Now multiply that by 10 million daily users, each storing up to 10 GB, adding up to 500 PB in total, with a flat rule that losing data is unacceptable. The challenge is to move as few bytes as possible, keep every device in agreement, and never drop a file even when servers, networks or whole regions fail.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The system is split into two planes: a <em>data plane</em> that moves file bytes as blocks, and a <em>metadata plane</em> that records what exists, which version is current, and who needs to hear about it. Almost every design choice follows from keeping those two planes separate.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Block Servers &amp; Cloud Storage</span> <span class="why">— the data plane; files become 4 MB blocks that are stored, synced and deduplicated independently</span>
+      <ul>
+        <li>Split into blocks (max 4 MB), each with a unique hash
+          <ul><li><span class="peripheral">Compressed and encrypted before upload</span></li></ul>
+        </li>
+        <li>Stored in cloud storage (e.g. S3) with cross-region replication
+          <ul><li><span class="peripheral">Cold storage (S3 Glacier) for inactive files</span></li></ul>
+        </li>
+        <li>Delta sync: only changed blocks travel</li>
+      </ul>
+    </li>
+    <li><span class="hub">Metadata DB &amp; API Servers</span> <span class="why">— the metadata plane; the source of truth for files, blocks and versions</span>
+      <ul>
+        <li>Tables: User, File, Block, File Version</li>
+        <li>API servers handle auth, profiles and every non-upload workflow
+          <ul><li><span class="peripheral">Metadata cache for hot entries</span></li><li><span class="peripheral">Sharding and replication; promote a replica on failure</span></li></ul>
+        </li>
+        <li>Upload status: <code>pending</code> &rarr; <code>uploaded</code></li>
+      </ul>
+    </li>
+    <li><span class="hub">Notification Service</span> <span class="why">— tells every other device that something changed, so sync can begin</span>
+      <ul>
+        <li>Publisher/subscriber over long polling</li>
+        <li>Offline backup queue holds changes for disconnected clients
+          <ul><li><span class="peripheral">Clients reconnect to another server if one fails</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Sync &amp; Conflict Resolution</span> <span class="why">— the rules that keep multiple writers from destroying each other's work</span>
+      <ul>
+        <li>First processed version wins</li>
+        <li>Losing version saved separately; user merges or overrides</li>
+        <li>Revision history
+          <ul><li><span class="peripheral">Limit saved revisions; prioritise recent versions</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Blocks are the hub of the data plane: delta sync, deduplication, compression and reconstruction all depend on files being chunks with hashes. The metadata DB is the hub of the control plane: it knows which blocks form which version. The notification service links the two by telling clients when to go and fetch. Conflict resolution is what happens when two clients race through that loop at once.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Every file change travels the same loop: bytes go one way, metadata goes another, and a notification closes the loop for other devices.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Client (browser / mobile app)</h4>
+      <p><strong>Input:</strong> A local file created or edited by the user.</p>
+      <p><strong>Output:</strong> Two parallel streams: file data toward block servers, file metadata toward API servers.</p>
+      <p class="io-story">You post the parcel and, separately, update the shipping register saying a parcel is on its way.</p>
+      <p class="io-arrow">&rarr; feeds into: Block Servers and API Servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Block Servers</h4>
+      <p><strong>Input:</strong> File bytes.</p>
+      <p><strong>Output:</strong> Blocks of up to 4 MB, each hashed, compressed and encrypted, written to cloud storage.</p>
+      <p class="io-story">A packing station that cuts a long roll of fabric into labelled squares and seals each in its own envelope.</p>
+      <p class="io-arrow">&rarr; feeds into: Cloud Storage</p>
+    </div>
+    <div class="io-block">
+      <h4>Cloud Storage (S3) + Cold Storage</h4>
+      <p><strong>Input:</strong> Encrypted, compressed blocks.</p>
+      <p><strong>Output:</strong> Durable, cross-region-replicated blocks; a callback when upload completes. Inactive files later migrate to cold storage.</p>
+      <p class="io-story">A vault with branches in several cities; rarely touched boxes get moved to a cheaper basement.</p>
+      <p class="io-arrow">&rarr; feeds into: API Servers (completion callback)</p>
+    </div>
+    <div class="io-block">
+      <h4>API Servers + Metadata DB/Cache</h4>
+      <p><strong>Input:</strong> File metadata from the client; completion callback from storage.</p>
+      <p><strong>Output:</strong> File and version records, first with status <code>pending</code>, then <code>uploaded</code>.</p>
+      <p class="io-story">The register clerk who first writes "expected" and later ticks "received".</p>
+      <p class="io-arrow">&rarr; feeds into: Notification Service</p>
+    </div>
+    <div class="io-block">
+      <h4>Notification Service</h4>
+      <p><strong>Input:</strong> A change event (add, edit, delete, share).</p>
+      <p><strong>Output:</strong> A message to every online subscriber over long polling; an entry in the offline backup queue for disconnected clients.</p>
+      <p class="io-story">A town crier who shouts to everyone in the square and leaves a note on the door of anyone who is away.</p>
+      <p class="io-arrow">&rarr; feeds into: other clients start the download flow</p>
+    </div>
+    <div class="io-block">
+      <h4>Download Flow (other clients)</h4>
+      <p><strong>Input:</strong> A change notification (or queued changes on reconnect).</p>
+      <p><strong>Output:</strong> Updated metadata fetched from API servers, then the needed blocks downloaded and the file reconstructed.</p>
+      <p class="io-story">Read the new register entry first, then collect only the envelopes that changed, and stitch the fabric back together.</p>
+      <p class="io-arrow">&rarr; feeds into: an up-to-date local copy</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one file edit</h4>
+    <ol class="journey-steps">
+      <li>You edit a 40 MB presentation on your laptop. Split into 4 MB blocks, it is 10 blocks; your edit touched blocks 2 and 5.</li>
+      <li>Your client sends the new file metadata to the API servers, which record the new version in the metadata DB with status <code>pending</code>.</li>
+      <li>The notification service immediately tells your other devices that a change is underway.</li>
+      <li>In parallel, the client sends the data to the block servers. Using block hashes, they detect that only blocks 2 and 5 changed. Those two are compressed, encrypted and uploaded to cloud storage; the other 8 are untouched (delta sync).</li>
+      <li>Cloud storage fires a callback to the API servers, which flip the status to <code>uploaded</code> and record which blocks make up the new version.</li>
+      <li>The notification service pushes "file updated" to your phone, which is holding an open long-poll connection.</li>
+      <li>Your phone asks the API servers for the new metadata, sees it needs blocks 2 and 5, downloads just those from the block servers, and rebuilds the file.</li>
+      <li>Your tablet was offline all day. The change waits in the offline backup queue; when the tablet reconnects it pulls the latest changes and runs the same download flow.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Google Drive keeps many devices in agreement about a user's files by moving bytes as small, hashed blocks and coordinating everything through a strongly managed metadata record plus change notifications.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a jigsaw library. Every document is a jigsaw cut into numbered pieces of at most 4 MB (blocks), each stamped with a fingerprint (hash) and sealed in a tamper-proof bag (compression and encryption). The pieces live in a vault with branches in several cities (S3 with cross-region replication), and old puzzles are moved to the cellar (cold storage). A head librarian keeps the master catalogue of which pieces make up which edition of which puzzle (metadata DB via API servers). When a puzzle changes, a messenger runs to every reading room (notification service over long polling), and leaves notes for readers who are out (offline backup queue). Readers then swap only the pieces whose fingerprints changed (delta sync).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">10M DAU, 10 GB free, 500 PB total</span><span class="beacon-def">Storage-heavy system; storage cost and durability dominate the design.</span></div>
+    <div class="beacon"><span class="beacon-term">Avg file 500 KB, 2 uploads/user/day</span><span class="beacon-def">Most files are small, but max file size is 10 GB, so resumable upload is required.</span></div>
+    <div class="beacon"><span class="beacon-term">"Data loss is unacceptable"</span><span class="beacon-def">Reliability is non-negotiable: replication, status tracking, retries everywhere.</span></div>
+    <div class="beacon"><span class="beacon-term">4 MB block + hash</span><span class="beacon-def">The unit of storage, sync and dedup; changing a file only changes some blocks.</span></div>
+    <div class="beacon"><span class="beacon-term">Delta sync</span><span class="beacon-def">Transfer only modified blocks: the key to bandwidth efficiency and fast sync.</span></div>
+    <div class="beacon"><span class="beacon-term">Resumable upload</span><span class="beacon-def">Get a resumable URL, upload, monitor state, resume after interruption.</span></div>
+    <div class="beacon"><span class="beacon-term">pending &rarr; uploaded</span><span class="beacon-def">Metadata is written first; the storage callback confirms completion.</span></div>
+    <div class="beacon"><span class="beacon-term">Long polling</span><span class="beacon-def">Clients hold a request open so the server can answer the instant something changes.</span></div>
+    <div class="beacon"><span class="beacon-term">Offline backup queue</span><span class="beacon-def">Changes wait here until a disconnected client comes back and pulls them.</span></div>
+    <div class="beacon"><span class="beacon-term">First processed version wins</span><span class="beacon-def">Conflict rule: the loser gets both copies and chooses to merge or override.</span></div>
+    <div class="beacon"><span class="beacon-term">Namespace + relative path</span><span class="beacon-def">In the single-server design, a file is uniquely identified by its user namespace plus path.</span></div>
+    <div class="beacon"><span class="beacon-term">Block-level deduplication</span><span class="beacon-def">Identical hashes within an account are stored once, saving space.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The marks concentrate on four ideas: the improved architecture, the block model with delta sync, the upload/download choreography, and conflict handling. Everything else (failure handling, storage savings) plugs into these.</p>
+
+  <div class="drill">
+    <h4>From one server to the improved design</h4>
+    <p>The starting point is almost comically simple: one web server, one metadata database, and a <code>drive/</code> directory containing a namespace folder per user. A file is identified by namespace plus relative path. It works for a demo, but one disk fills up, one server is a single point of failure, and nothing is replicated.</p>
+    <p>The first fixes are familiar: shard storage by <code>user_id</code>, move files to Amazon S3 with cross-region replication, put a load balancer in front of multiple web servers, and shard and replicate the metadata database. The improved design then separates concerns into distinct services, shown below.</p>
+    <figure class="guide-fig"><img src="15.%20Google%20Drive/images/high-level-design.png" alt="Improved Google Drive architecture"><figcaption>Three lanes leave the user: left to block servers and cloud storage (bytes), centre through the load balancer to API servers and metadata DB/cache (metadata), right via long polling to the notification service and offline backup queue (change events).</figcaption></figure>
+    <div class="pitfall"><strong>Common trap:</strong> sending file bytes through the API servers. API servers handle every workflow <em>except</em> uploading; bytes go through block servers.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Blocks, hashes and delta sync</h4>
+    <p>Block servers cut every file into blocks of at most 4 MB, give each block a unique hash, compress it with an algorithm suited to the file type, encrypt it, and store it independently in cloud storage. The file itself is just an ordered list of block references in the metadata DB, and reconstruction means joining blocks in that order.</p>
+    <p>This single idea pays off three times. Delta sync: when you edit a file, only blocks whose hashes changed are transferred. Deduplication: identical blocks within an account are stored once. Reliability: a failed block upload can be retried on its own, and a failed block server simply has its pending tasks reassigned.</p>
+    <div class="anim" data-anim="delta-sync"></div>
+    <figure class="guide-fig"><img src="15.%20Google%20Drive/images/delta-sync.png" alt="Only changed blocks 2 and 5 are sent to cloud storage"><figcaption>Of ten blocks, only the two dark ones (2 and 5) changed, and only they cross to cloud storage. That arrow labelled "changed only" is the entire bandwidth story.</figcaption></figure>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Far less bandwidth per edit, faster sync, storage savings from dedup, and fine-grained retries.</p></div><div class="con"><strong>Costs</strong><p>More metadata: a Block table and File Version table must track which blocks make up each version, and clients must reassemble files.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Upload and download choreography</h4>
+    <p>Upload runs two tracks at once. On the metadata track, the client sends file metadata to the API servers, which store it with status <code>pending</code> and trigger a notification that a change is coming. On the data track, the client uploads to block servers, which push blocks to cloud storage. When storage finishes, it calls back the API servers, which set the status to <code>uploaded</code> and trigger a second notification.</p>
+    <figure class="guide-fig"><img src="15.%20Google%20Drive/images/upload-flow.png" alt="Upload sequence diagram between clients, block servers, cloud storage, API servers, metadata DB and notification service"><figcaption>Read the two numbered tracks: 1&ndash;4 is metadata and the early "pending" notification; 2.1&ndash;2.6 is the byte upload ending with "uploaded" and a final notification to client 2.</figcaption></figure>
+    <p>Download is the mirror image, triggered by a change elsewhere. An online client hears about it via the notification service; an offline client finds changes waiting when it reconnects. Either way, it fetches metadata from the API servers first, then downloads only the needed blocks and rebuilds the file.</p>
+    <ol class="steps">
+      <li>Trigger: notification (online) or queued changes (on reconnect).</li>
+      <li>Fetch updated metadata via API servers.</li>
+      <li>Download the changed blocks from block servers.</li>
+      <li>Reconstruct the file locally.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> thinking notifications carry the file. They only say "something changed"; the client then pulls metadata and blocks itself.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Sync conflicts and failure handling</h4>
+    <p>When two users modify the same file at the same time, the version the system processes first wins. User 1's update goes through; user 2 gets a sync conflict. Nothing is thrown away: the system presents user 2 with both their local copy and the latest server version, and user 2 chooses to merge them or override one with the other.</p>
+    <table class="compare"><thead><tr><th>Component fails</th><th>Recovery</th></tr></thead><tbody>
+      <tr><td>Load balancer</td><td>Secondary load balancer becomes active.</td></tr>
+      <tr><td>Block server</td><td>Pending tasks are reassigned to other servers.</td></tr>
+      <tr><td>Metadata DB</td><td>Promote a replica (slave) to master; redirect traffic to remaining replicas.</td></tr>
+      <tr><td>Cloud storage</td><td>Fetch files from another region via cross-region replication.</td></tr>
+      <tr><td>Notification service</td><td>Clients reconnect to alternative servers.</td></tr>
+    </tbody></table>
+    <p>Storage costs are controlled three ways: block-level dedup by hash, limiting the number of saved revisions while favouring recent ones for frequently edited files, and moving rarely accessed files to cold storage such as S3 Glacier.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Answer in the margin with your stylus before you reveal each one.</p>
+  <details class="qa"><summary>Why split files into 4 MB blocks instead of storing whole files?</summary><div class="qa-answer"><p>Blocks with hashes enable delta sync (only changed blocks travel), deduplication (identical blocks stored once) and independent retries. Whole-file storage would force re-uploading an entire 10 GB file for a one-byte change.</p></div></details>
+  <details class="qa"><summary>What does the <code>pending</code> status protect against?</summary><div class="qa-answer"><p>Metadata is written before the bytes have finished uploading. Marking it <code>pending</code> means the file is known but not yet complete; only the cloud storage callback moves it to <code>uploaded</code>, so no client treats a half-uploaded file as ready.</p></div></details>
+  <details class="qa"><summary>A laptop is offline for two days while files change. What happens when it reconnects?</summary><div class="qa-answer"><p>Change information was kept in the offline backup queue. On reconnecting, the client pulls the latest changes, fetches updated metadata from the API servers, and downloads only the blocks it needs.</p></div></details>
+  <details class="qa"><summary>Two users save the same file at the same moment. Walk through the outcome.</summary><div class="qa-answer"><p>Whichever update the system processes first wins and becomes the latest version. The other user gets a sync conflict and is shown both their local copy and the server version, then chooses to merge or override.</p></div></details>
+  <details class="qa"><summary>Compare the roles of block servers and API servers.</summary><div class="qa-answer"><p>Block servers handle file bytes: splitting, hashing, compressing, encrypting and storing blocks. API servers handle everything else: authentication, profiles, and metadata updates in the metadata DB.</p></div></details>
+  <details class="qa"><summary>Why long polling for the notification service?</summary><div class="qa-answer"><p>Clients hold a connection open so the server can respond as soon as a file is added, edited or deleted, giving near-instant change notification without constant repeated requests.</p></div></details>
+  <details class="qa"><summary>The primary metadata database dies. What happens?</summary><div class="qa-answer"><p>A replica is promoted to master and traffic is redirected to the remaining replicas, so metadata stays available.</p></div></details>
+</div>

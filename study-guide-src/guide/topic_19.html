@@ -1,0 +1,228 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is a Friday-night flash sale. Checkout services are firing order events by the thousands per second, while the inventory system, the email sender, the fraud checker and the analytics pipeline all need to read those same events &mdash; each at its own pace. If checkout had to call every downstream service directly and wait, one slow email server would stall every purchase. So you drop a conveyor belt in the middle: producers place messages on it and walk away, and consumers pick them up when ready. Now make that belt survive disk failures, keep every message in order for two weeks, let many teams replay it independently, and let each team choose whether a lost or duplicated message is worse. That belt is a distributed message queue.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">At the top sits one abstraction &mdash; the partitioned, append-only log &mdash; and everything else is about writing to it fast, reading from it in groups, keeping copies of it, and choosing guarantees on top. Read hubs first; the grey peripheral items are safe to skim.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Topics, partitions and brokers</span> <span class="why">— the unit of scaling and ordering; every other decision is "per partition"</span>
+      <ul>
+        <li>Partition = ordered FIFO log; position is the <strong>offset</strong>
+          <ul><li><span class="peripheral">Message located by (topic, partition, offset)</span></li></ul>
+        </li>
+        <li>Partition key: <code>hash(key) % numPartitions</code>, e.g. <code>user_id</code> keeps one user's events ordered
+          <ul><li><span class="peripheral">Keys need not be unique, may even be missing; producer can override routing</span></li></ul>
+        </li>
+        <li>Adding / removing partitions
+          <ul><li><span class="peripheral">New partitions take only new messages; decommissioned ones linger until retention expires</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Storage: write-ahead log on disk + batching</span> <span class="why">— how the system hits high throughput with two-week retention</span>
+      <ul>
+        <li>Append-only WAL split into segments; only the newest segment is writable
+          <ul><li><span class="peripheral">Sequential access makes HDDs fast; OS disk cache does the rest</span></li></ul>
+        </li>
+        <li>Immutable message schema shared by producer, broker, consumer (no extra copying)
+          <ul><li><span class="peripheral">Fields: key, value, topic, partition, offset, timestamp, size, CRC</span></li></ul>
+        </li>
+        <li>Batching everywhere: throughput vs latency dial</li>
+      </ul>
+    </li>
+    <li><span class="hub">Consumer groups and rebalancing</span> <span class="why">— how many readers share work without breaking order</span>
+      <ul>
+        <li>Each group keeps its own offset; one consumer per partition within a group</li>
+        <li>Pull model (consumer controls rate), long polling for idle periods</li>
+        <li>Coordinator broker (found by hashing group name) + group leader builds partition plan
+          <ul><li><span class="peripheral">Triggered by join, leave, missed heartbeats, partition changes</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Replication, ISR and acks</span> <span class="why">— durability and availability; the knob between speed and safety</span>
+      <ul>
+        <li>One leader replica per partition; followers pull from it</li>
+        <li>In-sync replicas (ISR) defined by <code>replica.lag.max.messages</code></li>
+        <li><code>ACK=0 / 1 / all</code>
+          <ul><li><span class="peripheral">Broker failure: new leader elected, partitions redistributed; replicas across brokers (and ideally DCs)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Delivery semantics</span> <span class="why">— the user-facing contract built from ack settings and offset-commit order</span>
+      <ul>
+        <li>At-most-once, at-least-once, exactly-once</li>
+        <li><span class="peripheral">Advanced: tag-based filtering, delayed / scheduled messages, retry topics, archive to HDFS/S3</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">Partitions are the root: they are what brokers host, what gets replicated, what consumers are assigned, and the only scope in which order is guaranteed. Storage explains how a single partition is fast; consumer groups explain how many partitions are read; replication explains how partitions survive; and delivery semantics are simply the combination of replication acks on the write side and offset-commit timing on the read side. ZooKeeper sits beside all of them as the keeper of metadata, consumer state and leader election.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the causal chain from producer to consumer; each box transforms something concrete and hands it to the next.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Producer (with embedded routing + buffer)</h4>
+      <p><strong>Input:</strong> Application events, the cached replica plan from metadata storage.</p>
+      <p><strong>Output:</strong> Batches of messages sent directly to the leader broker of each target partition.</p>
+      <p class="io-story">A mail sorter who bundles letters by destination before driving to the right post office, instead of dropping each letter at a central depot.</p>
+      <p class="io-arrow">&rarr; feeds into: Leader replica of the partition</p>
+    </div>
+    <div class="io-block">
+      <h4>Leader broker + WAL</h4>
+      <p><strong>Input:</strong> A batch for Topic-A Partition-1.</p>
+      <p><strong>Output:</strong> Messages appended sequentially to the active segment, each assigned the next offset.</p>
+      <p class="io-story">A ship's logbook written only at the last line in ink; old pages are never erased, just shelved.</p>
+      <p class="io-arrow">&rarr; feeds into: Follower replicas</p>
+    </div>
+    <div class="io-block">
+      <h4>Follower replicas (ISR)</h4>
+      <p><strong>Input:</strong> Fetch requests pulling new messages from the leader.</p>
+      <p><strong>Output:</strong> Copies of the log; once all ISR members have a message, it is committed.</p>
+      <p class="io-story">Apprentice scribes copying the master logbook; a page counts as official only when every up-to-date scribe has it.</p>
+      <p class="io-arrow">&rarr; feeds into: Acknowledgment to producer (per ACK setting); committed offset</p>
+    </div>
+    <div class="io-block">
+      <h4>Group coordinator</h4>
+      <p><strong>Input:</strong> Join / leave requests and heartbeats from a consumer group.</p>
+      <p><strong>Output:</strong> A partition dispatch plan (built by the elected group leader) broadcast to members.</p>
+      <p class="io-story">A shift manager who reassigns checkout lanes whenever a cashier arrives, leaves, or stops answering.</p>
+      <p class="io-arrow">&rarr; feeds into: Consumers' partition assignments</p>
+    </div>
+    <div class="io-block">
+      <h4>Consumer (pull)</h4>
+      <p><strong>Input:</strong> Its assigned partition and last committed offset from state storage.</p>
+      <p><strong>Output:</strong> Processed messages and a newly committed offset.</p>
+      <p class="io-story">A reader with a bookmark: open to the bookmark, read a chapter, move the bookmark. When you move it decides whether you might skip or re-read a page.</p>
+      <p class="io-arrow">&rarr; feeds into: State storage (ZooKeeper) &mdash; offsets</p>
+    </div>
+    <div class="io-block">
+      <h4>ZooKeeper (metadata + state + coordination)</h4>
+      <p><strong>Input:</strong> Topic configs, replica distribution plans, consumer offsets, broker liveness.</p>
+      <p><strong>Output:</strong> Consistent answers to "who leads this partition?", "where did group 1 stop?", "which brokers are alive?"</p>
+      <p class="io-story">The harbor master's office: it does not carry cargo, but every ship checks in there.</p>
+      <p class="io-arrow">&rarr; feeds into: Brokers, producers' routing cache, consumers</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one message</h4>
+    <ol class="journey-steps">
+      <li>Checkout emits <code>order_placed</code> for user 4821. The producer computes <code>hash("4821") % 4</code> = partition 2 of topic <code>orders</code>, so all of this user's events stay in order.</li>
+      <li>The message waits a few milliseconds in the producer's in-memory buffer until a batch forms, then is sent in one request to Broker-1, the leader for partition 2 per the cached replica plan.</li>
+      <li>Broker-1 appends the batch to the active segment of partition 2's WAL; our message gets offset 15.</li>
+      <li>Followers on Broker-2 and Broker-3 fetch it. Both are in the ISR, so once both have offset 15 it is committed.</li>
+      <li>The producer used <code>ACK=all</code>, so only now does it receive its acknowledgment. Had it used <code>ACK=1</code>, it would have been acknowledged right after step 3.</li>
+      <li>Consumer group "inventory" has three consumers; the coordinator assigned partition 2 to consumer C2. C2 pulls from its last committed offset, 13, and receives offsets 13&ndash;15 in one chunk.</li>
+      <li>C2 decrements stock, then commits offset 16 to state storage. Processing before committing gives at-least-once delivery.</li>
+      <li>Independently, group "analytics" reads the same message from the same partition with its own offset &mdash; possibly days later, since retention is two weeks.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Decouple producers from consumers with a durable, ordered, replayable log that scales horizontally and lets each use case tune its own balance of throughput, latency and delivery guarantees.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Picture a railway freight yard. Each topic is a destination line, split into several parallel tracks &mdash; the partitions &mdash; so more trains can load at once. Cars are coupled only at the end of a track and never removed mid-line: that is the append-only WAL with offsets as car numbers. Station depots holding the tracks are brokers, and each track has one master depot (the leader) with backup depots mirroring it (followers, the ISR). Unloading crews are consumer groups: within one crew, each worker owns a whole track so cars come off in order, while a different crew can unload copies of the same cars on its own schedule. The yard office with the timetable, crew rosters and "last car unloaded" ledger is ZooKeeper.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Offset</span><span class="beacon-def">A message's position in a partition; consumers track progress by offset, not by deleting messages.</span></div>
+    <div class="beacon"><span class="beacon-term">Order only within a partition</span><span class="beacon-def">Choose the partition key (e.g. user_id) around what must stay ordered.</span></div>
+    <div class="beacon"><span class="beacon-term">Consumers per group &le; partitions</span><span class="beacon-def">One consumer per partition per group preserves order; extra consumers sit idle.</span></div>
+    <div class="beacon"><span class="beacon-term">WAL + segments</span><span class="beacon-def">Append-only, sequential I/O; old segments read-only, easy to truncate by retention.</span></div>
+    <div class="beacon"><span class="beacon-term">Sequential HDD is fast</span><span class="beacon-def">Disk slowness is about random access; sequential writes plus OS page cache are enough.</span></div>
+    <div class="beacon"><span class="beacon-term">Batch size dial</span><span class="beacon-def">Bigger batches = higher throughput, higher latency; smaller = the reverse.</span></div>
+    <div class="beacon"><span class="beacon-term">Pull model</span><span class="beacon-def">Consumer sets its pace and can fetch big batches; long polling hides idle-period cost.</span></div>
+    <div class="beacon"><span class="beacon-term">Coordinator = hash(group name)</span><span class="beacon-def">All consumers in a group meet at the same broker for rebalancing.</span></div>
+    <div class="beacon"><span class="beacon-term">ISR</span><span class="beacon-def">Replicas within <code>replica.lag.max.messages</code> of the leader; a message commits when all ISR have it.</span></div>
+    <div class="beacon"><span class="beacon-term">ACK = 0 / 1 / all</span><span class="beacon-def">Fastest-least durable to slowest-most durable producer acknowledgment.</span></div>
+    <div class="beacon"><span class="beacon-term">Commit-then-process vs process-then-commit</span><span class="beacon-def">At-most-once vs at-least-once on the consumer side.</span></div>
+    <div class="beacon"><span class="beacon-term">ZooKeeper</span><span class="beacon-def">Holds metadata and consumer state, does service discovery and leader election; brokers keep only messages.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">These five sections carry most interview weight: why a log on disk is fast, how consumer groups keep order, how replication and acks trade speed for safety, what each delivery guarantee really means, and why routing lives inside the producer.</p>
+
+  <div class="drill">
+    <h4>Storage: the append-only log and why disks are not slow</h4>
+    <p>Message traffic has a distinctive shape: heavy writes, heavy reads, no updates or deletes, and overwhelmingly sequential access. A general-purpose database handles that combination poorly. A write-ahead log &mdash; a file you can only append to &mdash; fits it perfectly.</p>
+    <figure class="guide-fig"><img src="19.%20Distributed%20Message%20Queue/images/wal-example.png" alt="Partition log split into segments"><figcaption>Offsets 0&ndash;9 live in segment-1, now read-only; offsets 10&ndash;14 are in segment-2, and the next record (15) is appended at the tail. Retention can drop whole old segments cheaply.</figcaption></figure>
+    <p>The common belief that hard drives are slow is really about random access: moving the disk head around. When writes stream sequentially, HDDs deliver ample throughput, and the operating system aggressively caches disk data in memory, so recent messages are often served from RAM. Keeping messages immutable and using the same schema from producer to broker to consumer avoids re-copying bytes along the way.</p>
+    <p>Batching amplifies all of this. Grouping messages amortizes network round trips and turns many small writes into large sequential ones. The cost is latency: a message waits for its batch to fill.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Large batches</strong><p>Higher throughput, fewer requests, better disk and cache efficiency &mdash; ideal for log aggregation.</p></div>
+      <div class="con"><strong>Small batches</strong><p>Lower latency for traditional queue use cases, but lower throughput; you may need more partitions per topic to compensate.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Consumer groups, pull, and rebalancing</h4>
+    <p>A consumer group is a team sharing the work of reading a topic. Messages are delivered once per group, not once per consumer, and each group keeps its own offset. Reading in parallel boosts throughput but threatens order, so the rule is: within a group, a partition is read by only one consumer. Hence a group can never usefully have more consumers than there are partitions.</p>
+    <div class="anim" data-anim="consumer-group"></div>
+    <figure class="guide-fig"><img src="19.%20Distributed%20Message%20Queue/images/consumer-groups.png" alt="Two consumer groups reading Topic-A and Topic-B"><figcaption>Group-1 splits Topic-A: Consumer-1 owns Partition-1, Consumer-2 owns Partition-2. Group-2 reads the same Topic-A partitions independently, and Consumer-4 also reads Topic-B. Same data, separate offsets.</figcaption></figure>
+    <p>Consumers pull rather than being pushed to. Push gives lower latency but can overwhelm a slow consumer, since the broker sets the pace. Pull lets each consumer fetch as much as it can handle, which suits batch processing; the downside of empty polls is softened by long polling.</p>
+    <ol class="steps">
+      <li>A consumer joins, leaves, or misses heartbeats (or partitions change).</li>
+      <li>The coordinator broker &mdash; chosen by hashing the group name &mdash; tells members to rebalance in its heartbeat responses.</li>
+      <li>All members rejoin; the coordinator elects a group leader.</li>
+      <li>The leader computes a new partition dispatch plan (round-robin, range, etc.) and sends it to the coordinator.</li>
+      <li>The coordinator broadcasts the plan; consumers resume from the committed offsets in state storage.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> confusing the group coordinator (a broker) with the coordination service (ZooKeeper). The notes explicitly separate them: the coordinator manages consumer group membership; ZooKeeper handles broker discovery, metadata and leader election.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Replication, ISR and the ACK knob</h4>
+    <p>Each partition is copied to several brokers. One copy is the leader: producers write to it and, in the simplest design, consumers read from it too. Followers pull new messages from the leader. The leader creates the replica distribution plan and stores it in ZooKeeper, and it tracks how far behind each follower is.</p>
+    <figure class="guide-fig"><img src="19.%20Distributed%20Message%20Queue/images/in-sync-replicas-example.png" alt="In-sync replicas example with committed offset 13"><figcaption>The leader has offsets 10&ndash;15 but only up to 13 is committed. Replica-2 and replica-3 have caught up to the committed point and stay in the ISR; replica-4 holds only 10&ndash;11 and has been dropped from the ISR until it catches up.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Setting</th><th>Producer acknowledged when</th><th>Speed</th><th>Durability</th></tr></thead>
+      <tbody>
+        <tr><td><code>ACK=0</code></td><td>Never waits</td><td>Fastest</td><td>Lowest</td></tr>
+        <tr><td><code>ACK=1</code></td><td>Leader has the message</td><td>Fast</td><td>Low (lost if leader dies before followers copy)</td></tr>
+        <tr><td><code>ACK=all</code></td><td>All ISR replicas have it</td><td>Slowest</td><td>Highest</td></tr>
+      </tbody>
+    </table>
+    <p>The ISR concept is itself a trade-off. Requiring every replica to sync guarantees nothing is lost, but one sluggish replica would stall the partition; letting laggards drop out of the ISR keeps writes flowing. When a broker fails, a new leader is elected and the failed broker's partitions are redistributed; new replicas act as followers until they catch up and join the ISR. When a broker is added, the system can temporarily run with extra replicas until the newcomer is caught up, then remove the surplus.</p>
+    <div class="pitfall"><strong>Common trap:</strong> placing all replicas of a partition on one broker. That wastes resources and protects nothing; replicas must sit on different brokers, and ideally in different data centers (at a latency cost, or via data mirroring).</div>
+  </div>
+
+  <div class="drill">
+    <h4>Delivery semantics: where you place the commit</h4>
+    <p>The three guarantees are not magic modes; they fall out of two choices: how the producer handles acknowledgments and retries, and whether the consumer commits its offset before or after processing.</p>
+    <table class="compare">
+      <thead><tr><th>Guarantee</th><th>Producer</th><th>Consumer</th><th>Risk</th></tr></thead>
+      <tbody>
+        <tr><td>At-most-once</td><td>Async send, no retry</td><td>Commit offset immediately, then process</td><td>Loss if crash before processing</td></tr>
+        <tr><td>At-least-once</td><td><code>ack=1</code> or <code>all</code>, retries on failure</td><td>Process, then commit</td><td>Duplicates if crash after processing, before commit</td></tr>
+        <tr><td>Exactly-once</td><td colspan="2">Friendliest for users, extremely costly for the system</td><td>Complexity and cost</td></tr>
+      </tbody>
+    </table>
+    <p>At-least-once is the requirement the notes insist on: nothing is left unprocessed, but duplicates can appear on both the producer-to-queue and queue-to-consumer hops. It fits use cases where duplication is acceptable or where consumers can deduplicate.</p>
+    <div class="pitfall"><strong>Common trap:</strong> assuming acks alone decide the guarantee. A producer on <code>ACK=all</code> still yields at-most-once behavior if the consumer commits its offset before processing.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Why routing moves inside the producer</h4>
+    <p>A producer must send each message to the leader of its partition. A separate routing layer could look up the replica plan and forward messages, but that adds a network hop and prevents batching. Embedding routing and a buffer in the producer library fixes both.</p>
+    <figure class="guide-fig"><img src="19.%20Distributed%20Message%20Queue/images/routing-layer-producer.png" alt="Producer with embedded buffer and routing"><figcaption>The producer buffers, routes straight to Broker-1 (the green leader of Topic-A Partition-1), and Broker-2's follower copies from the leader before the acknowledgment returns.</figcaption></figure>
+    <p>Benefits: fewer hops mean lower latency, producers control which partition a message lands in, and the buffer enables larger batches for throughput. Around the edges, the notes add advanced features: tag-based filtering so consumers skip irrelevant messages without extra topics, delayed messages parked in temporary topics and released by delay queues or a hierarchical time wheel, retry topics, and archiving old data to HDFS or S3.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Answer in the margin with your stylus before revealing each one.</p>
+  <details class="qa"><summary>Why can a consumer group not benefit from more consumers than partitions?</summary><div class="qa-answer"><p>To preserve order, each partition is read by only one consumer within a group. With more consumers than partitions, the extras have nothing assigned and sit idle. To scale further, add partitions.</p></div></details>
+  <details class="qa"><summary>Why is a WAL on HDD fast enough, despite HDDs' reputation?</summary><div class="qa-answer"><p>HDD slowness comes from random access. Message queues write and read sequentially, which HDDs handle well, and the OS caches disk data in memory aggressively. Batching makes the writes even larger and more sequential.</p></div></details>
+  <details class="qa"><summary>What happens if a consumer crashes after processing a message but before committing its offset?</summary><div class="qa-answer"><p>A replacement consumer resumes from the last committed offset and processes the message again, producing a duplicate. That is the at-least-once trade-off; downstream must tolerate or deduplicate.</p></div></details>
+  <details class="qa"><summary>Compare ACK=1 and ACK=all.</summary><div class="qa-answer"><p>ACK=1 acknowledges once the leader has the message: fast, but a leader crash before followers copy it loses the message. ACK=all waits for every ISR replica: slower, but highest durability.</p></div></details>
+  <details class="qa"><summary>A follower replica falls far behind the leader. What happens?</summary><div class="qa-answer"><p>If it lags more than <code>replica.lag.max.messages</code>, the leader removes it from the ISR, so commits no longer wait for it. It rejoins once it catches up. This prevents one slow replica from making the partition unavailable.</p></div></details>
+  <details class="qa"><summary>Why is decreasing partitions harder than adding them?</summary><div class="qa-answer"><p>A decommissioned partition still holds unconsumed messages, so it cannot be deleted immediately. Producers stop writing to it while consumers keep reading until the retention period expires; only then is data truncated and consumers rebalanced.</p></div></details>
+  <details class="qa"><summary>Why do most message queues choose pull over push for consumers?</summary><div class="qa-answer"><p>Pull lets each consumer control its rate, so slow consumers are not overwhelmed and can be scaled to catch up, and it allows aggressive large-batch fetching. The cost &mdash; latency and empty polls &mdash; is reduced by long polling.</p></div></details>
+</div>

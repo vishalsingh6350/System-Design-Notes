@@ -1,0 +1,144 @@
+<h3>Introduction</h3>
+<p>A <strong>notification system</strong> is essential for modern applications, providing timely updates like product notifications, events, offers, and alerts. Notifications can be sent through:</p>
+<ol>
+  <li><strong>Push notifications</strong> (mobile or desktop),</li>
+  <li><strong>SMS messages</strong>, and</li>
+  <li><strong>Emails</strong>.</li>
+</ol>
+<p>The chapter focuses on designing a scalable system capable of sending millions of notifications daily.</p>
+
+<h3>Step 1: Understanding the Problem</h3>
+<h4>Requirements</h4>
+<ul>
+  <li><strong>Notification Types:</strong> Push notifications, SMS, and Emails.</li>
+  <li><strong>Delivery:</strong> Soft real-time system with minimal delays.</li>
+  <li><strong>Platforms:</strong> iOS, Android, and desktop.</li>
+  <li><strong>Triggers:</strong> Notifications can be triggered by client applications or scheduled on servers.</li>
+  <li><strong>Scale:</strong>
+    <ul>
+      <li><strong>Push Notifications:</strong> 10 million/day,</li>
+      <li><strong>SMS:</strong> 1 million/day,</li>
+      <li><strong>Emails:</strong> 5 million/day.</li>
+    </ul>
+  </li>
+  <li><strong>Opt-out Support:</strong> Users can disable specific notification types.</li>
+</ul>
+
+<h3>Step 2: High-Level Design</h3>
+<h4>Components</h4>
+<ol>
+  <li><strong>Notification Types:</strong>
+    <ul>
+      <li><strong>iOS Push Notifications:</strong> Use <strong>Apple Push Notification Service (APNS)</strong>.</li>
+      <li><strong>Android Push Notifications:</strong> Use <strong>Firebase Cloud Messaging (FCM)</strong>.</li>
+      <li><strong>SMS Messages:</strong> Third-party services like Twilio or Nexmo.</li>
+      <li><strong>Emails:</strong> Commercial email services like SendGrid or Mailchimp.</li>
+    </ul>
+  </li>
+  <li><strong>Contact Info Gathering:</strong>
+    <img class="orig-img" src="10.%20Notification%20System/images/contact-info-gathering.png" alt="Contact Info Gathering">
+    <ul>
+      <li>Collect device tokens, phone numbers, or email addresses during app installation or signup.</li>
+      <li>Store contact info in the database:
+        <ul>
+          <li><strong>Device Tokens Table:</strong> For push notifications.</li>
+          <li><strong>User Table:</strong> For emails and phone numbers.</li>
+        </ul>
+      </li>
+    </ul>
+  </li>
+  <li><strong>Notification Sending Flow:</strong>
+    <img class="orig-img" src="10.%20Notification%20System/images/high-level-design.png" alt="High Level Design">
+    <ul>
+      <li><strong>Trigger Services:</strong>
+        <ul>
+          <li>Generate events to initiate notifications (e.g., billing reminders, shipping updates).</li>
+          <li>A service can be a micro-service, a cron job, or a distributed system that triggers notification sending events.</li>
+        </ul>
+      </li>
+      <li><strong>Notification Server:</strong>
+        <ul>
+          <li>Provide APIs for services to send notifications.</li>
+          <li>Carry out basic validations to verify emails, phone numbers.</li>
+          <li>Query the database or cache to fetch data needed to render a notification.</li>
+        </ul>
+      </li>
+      <li><strong>Third-Party Services:</strong> Deliver notifications to users.</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Challenges in Initial Design</h4>
+<ul>
+  <li><strong>Single Point of Failure (SPOF):</strong> One notification server can crash the entire system.</li>
+  <li><strong>Scalability Issues:</strong> Hard to scale databases, caches, and processing components independently.</li>
+  <li><strong>Performance Bottlenecks:</strong> High resource demands for sending notifications.</li>
+</ul>
+
+<h4>Improved Design</h4>
+<img class="orig-img" src="10.%20Notification%20System/images/improved-design.png" alt="Improved Design">
+<ul>
+  <li>Move databases and caches out of the notification server.</li>
+  <li>Introduce <strong>horizontal scaling</strong> with multiple notification servers.</li>
+  <li>Use <strong>message queues</strong> to decouple system components.
+    <ul><li>Message queues serve as buffers when high volumes of notifications are to be sent out.</li></ul>
+  </li>
+  <li>Add workers that pull notification events from message queues and send them to corresponding third party services.</li>
+</ul>
+
+<h3>Step 3: Design Deep Dive</h3>
+<h4>Reliability</h4>
+<ol>
+  <li><strong>Prevent Data Loss:</strong>
+    <img class="orig-img" src="10.%20Notification%20System/images/data-loss.png" alt="Data Loss">
+    <ul>
+      <li>Persist notification data in a database and implement a retry mechanism.</li>
+      <li>The Notification log database is included for data persistence.</li>
+    </ul>
+  </li>
+  <li><strong>Deduplication:</strong>
+    <ul>
+      <li>Check event IDs to avoid sending duplicate notifications.</li>
+      <li>When a notification event first arrives, check if it is seen before by checking the event ID. If seen before discard it, otherwise send out the notification.</li>
+    </ul>
+  </li>
+</ol>
+
+<h4>Additional Components</h4>
+<img class="orig-img" src="10.%20Notification%20System/images/events-tracking.png" alt="Events Tracking">
+<ol>
+  <li><strong>Notification Templates:</strong> Preformatted templates for consistent and efficient notifications.</li>
+  <li><strong>Notification Settings:</strong>
+    <ul>
+      <li>Users can opt-in or opt-out for specific channels (push, SMS, or email).</li>
+      <li>Stored in a dedicated notification settings table.</li>
+    </ul>
+  </li>
+  <li><strong>Rate Limiting:</strong> Cap the frequency of notifications sent to users.</li>
+  <li><strong>Retry Mechanism:</strong> Retry sending notifications if third-party services fail.</li>
+  <li><strong>Monitoring Queues:</strong> Track queued notifications to scale workers dynamically.</li>
+  <li><strong>Event Tracking:</strong> Collect metrics like open rate, click rate, and engagement.</li>
+</ol>
+
+<h4>Security</h4>
+<ul>
+  <li>Use <strong>AppKey</strong> and <strong>AppSecret</strong> to authenticate and secure APIs for push notifications.</li>
+</ul>
+
+<h4>Notification Flow</h4>
+<img class="orig-img" src="10.%20Notification%20System/images/updated-design.png" alt="Updated Design">
+<ol>
+  <li>Trigger services call APIs to send notifications.</li>
+  <li>Notification servers validate requests and fetch metadata from caches or databases.</li>
+  <li>Notification events are sent to message queues.</li>
+  <li>Workers process events and interact with third-party services.</li>
+  <li>Third-party services deliver notifications to users.</li>
+</ol>
+
+<h3>Key Optimizations</h3>
+<ol>
+  <li><strong>Horizontal Scaling:</strong> Add more notification servers for load distribution.</li>
+  <li><strong>Message Queues:</strong> Decouple processing to handle high volumes.</li>
+  <li><strong>Caching:</strong> Reduce latency by caching frequently accessed data.</li>
+  <li><strong>Distributed Crawling:</strong> Optimize message delivery geographically for better performance.</li>
+</ol>

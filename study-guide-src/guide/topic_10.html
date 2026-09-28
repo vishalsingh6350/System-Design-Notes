@@ -1,0 +1,192 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>It is 9 a.m. and a dozen services all want to talk to your users at once: billing wants to send payment reminders, shipping wants to say "your parcel is out for delivery," marketing wants to announce a sale. Some messages must reach an iPhone, some an Android phone, some an inbox, some a plain old SMS. Every day that adds up to 10 million push notifications, 1 million texts and 5 million emails. If one server hiccups, a reminder vanishes; if a retry fires twice, a customer gets the same text two times and rolls their eyes. The notification system is the post office that sits between all those eager senders and the user's pocket, and it has to be fast, reliable, and never annoying.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">At the highest level there are senders on the left, delivery providers on the right, and a pipeline in the middle. Read the map as four hubs: the channels you deliver through, the pipeline that carries events, the reliability guarantees, and the user-facing controls.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Delivery channels &amp; third-party providers</span> <span class="why">— you never talk to a phone directly; everything is handed to a provider</span>
+      <ul>
+        <li>iOS push via APNS; Android push via FCM</li>
+        <li>SMS via Twilio or Nexmo; email via SendGrid or Mailchimp</li>
+        <li>Contact info gathering
+          <ul><li><span class="peripheral">device tokens table for push; user table for email and phone</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Decoupled sending pipeline</span> <span class="why">— the backbone that turns "please notify" into delivered messages at scale</span>
+      <ul>
+        <li>Trigger services (micro-service, cron job, distributed system)</li>
+        <li>Notification servers (APIs, validation, fetch render data)
+          <ul><li><span class="peripheral">horizontally scaled; DB and cache moved out</span></li></ul>
+        </li>
+        <li>Message queues as buffers
+          <ul><li><span class="peripheral">monitor queue depth to scale workers</span></li></ul>
+        </li>
+        <li>Workers pull events and call providers</li>
+      </ul>
+    </li>
+    <li><span class="hub">Reliability</span> <span class="why">— a notification must not be lost, and must not be sent twice</span>
+      <ul>
+        <li>Notification log database for persistence</li>
+        <li>Retry mechanism when providers fail</li>
+        <li>Deduplication by event ID</li>
+      </ul>
+    </li>
+    <li><span class="hub">User-facing controls &amp; polish</span> <span class="why">— what keeps the system respectful and measurable</span>
+      <ul>
+        <li>Notification settings (opt-in / opt-out per channel)</li>
+        <li>Rate limiting per user</li>
+        <li>Templates for consistent formatting</li>
+        <li><span class="peripheral">event tracking: open rate, click rate, engagement</span></li>
+        <li><span class="peripheral">security: AppKey and AppSecret on push APIs</span></li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">The channels define the destination and the pipeline defines the route. Reliability is layered onto the pipeline, since queues and workers are exactly where messages can be lost or duplicated. The user controls sit at the front of the pipeline, deciding whether a message should be sent at all.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Each box below receives something and hands something on. Chain them together and you have the final design from the notes.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Trigger service</h4>
+      <p><strong>Input:</strong> A business event (a bill is due, a parcel shipped) or a scheduled job.</p>
+      <p><strong>Output:</strong> An API call to the notification servers saying "notify user X about Y."</p>
+      <p class="io-story">The customer walking into the post office with a letter. It knows what to say, but not how to deliver it.</p>
+      <p class="io-arrow">&rarr; feeds into: Notification servers</p>
+    </div>
+    <div class="io-block">
+      <h4>Notification server</h4>
+      <p><strong>Input:</strong> The API request.</p>
+      <p><strong>Output:</strong> A validated, fully rendered notification event, placed on the right queue.</p>
+      <p class="io-story">The counter clerk. It authenticates the sender, applies rate limits, checks the email or phone number is valid, and looks up the device token, settings and user info from cache or database.</p>
+      <p class="io-arrow">&rarr; feeds into: Message queue for that channel</p>
+    </div>
+    <div class="io-block">
+      <h4>Message queue</h4>
+      <p><strong>Input:</strong> Notification events.</p>
+      <p><strong>Output:</strong> The same events, released at the pace workers can handle.</p>
+      <p class="io-story">A holding bay. During a flood of notifications it absorbs the surge, so a busy SMS provider cannot slow down iOS pushes.</p>
+      <p class="io-arrow">&rarr; feeds into: Workers</p>
+    </div>
+    <div class="io-block">
+      <h4>Worker</h4>
+      <p><strong>Input:</strong> One event from the queue.</p>
+      <p><strong>Output:</strong> A request to the third-party provider, a record in the notification log, and a retry if the provider fails.</p>
+      <p class="io-story">The courier who actually takes the parcel to the delivery company, writes it in the logbook, and tries again if the depot is closed.</p>
+      <p class="io-arrow">&rarr; feeds into: APNS / FCM / SMS / email provider</p>
+    </div>
+    <div class="io-block">
+      <h4>Third-party provider</h4>
+      <p><strong>Input:</strong> A formatted notification plus the device token, phone number or address.</p>
+      <p><strong>Output:</strong> The message on the user's device or inbox.</p>
+      <p class="io-story">The national postal network. You do not own it, so you must plan for it being slow or unavailable.</p>
+      <p class="io-arrow">&rarr; feeds into: User device, and back to analytics via click tracking</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one notification</h4>
+    <ol class="journey-steps">
+      <li>The shipping service (a trigger service) sees an order leave the warehouse and calls the notification API: "tell this user their parcel is on its way."</li>
+      <li>A notification server authenticates the caller and checks the rate limit for that user.</li>
+      <li>It reads the user's notification settings from cache: push is opted in. It fetches the user's iOS device token (gathered when the app was installed).</li>
+      <li>The server builds the event, with a unique event ID, and puts it on the iOS push queue. Analytics records "send pending."</li>
+      <li>A worker pulls the event, checks the event ID has not been seen before, fills in the "Your order has shipped" template, and writes it to the notification log.</li>
+      <li>The worker calls APNS. APNS returns an error; the worker puts the event back for retry.</li>
+      <li>On the second attempt APNS accepts it and delivers the push to the phone. Analytics records "sent."</li>
+      <li>The user taps the notification. Click tracking reports back to analytics, feeding the open and click-rate metrics.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A notification system is a decoupled, queue-buffered pipeline that turns internal events into messages delivered by third-party providers, without losing them, duplicating them, or spamming the user.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of a busy regional post office. Customers at the front counter are the trigger services; the counter clerks are the notification servers, checking the address book (cache and database) and refusing anyone who sends too much (rate limiting). Behind them are four sorting bins, one per channel: these are the message queues. Couriers (workers) take letters from their bin, log each one in a ledger (the notification log), and hand them to outside carriers like APNS or an SMS company. If a carrier's depot is shut, the courier puts the letter back in the bin and tries later, and a stamp with a unique serial number (the event ID) makes sure nobody delivers the same letter twice.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">10M push / 1M SMS / 5M email per day</span><span class="beacon-def">Volume varies per channel, so each channel gets its own queue and workers.</span></div>
+    <div class="beacon"><span class="beacon-term">Soft real-time</span><span class="beacon-def">A small delay is acceptable, which is what makes queueing a good fit.</span></div>
+    <div class="beacon"><span class="beacon-term">APNS / FCM</span><span class="beacon-def">Apple and Google own the last mile for push; you must go through them.</span></div>
+    <div class="beacon"><span class="beacon-term">Device token</span><span class="beacon-def">The address for a push notification, collected at app install.</span></div>
+    <div class="beacon"><span class="beacon-term">Single point of failure</span><span class="beacon-def">The flaw of the first design: one notification server does everything.</span></div>
+    <div class="beacon"><span class="beacon-term">Message queue as buffer</span><span class="beacon-def">Decouples producers from senders and absorbs traffic spikes.</span></div>
+    <div class="beacon"><span class="beacon-term">Notification log</span><span class="beacon-def">Persistence layer that stops data loss and enables retries.</span></div>
+    <div class="beacon"><span class="beacon-term">Event ID dedup</span><span class="beacon-def">"Seen this ID before? Discard it." Prevents double sends.</span></div>
+    <div class="beacon"><span class="beacon-term">Opt-in / opt-out settings</span><span class="beacon-def">Checked before sending; users control each channel.</span></div>
+    <div class="beacon"><span class="beacon-term">Rate limiting</span><span class="beacon-def">Caps how often a user is notified, so they do not switch you off.</span></div>
+    <div class="beacon"><span class="beacon-term">Queue monitoring</span><span class="beacon-def">A growing queue means you need more workers.</span></div>
+    <div class="beacon"><span class="beacon-term">AppKey + AppSecret</span><span class="beacon-def">Only authenticated clients may call the push APIs.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">The heart of this chapter is the evolution from a fragile single server to a queue-based design, plus the reliability tricks that make it trustworthy. Drill those first.</p>
+
+  <div class="drill">
+    <h4>From the naive design to the decoupled design</h4>
+    <p>The first sketch is simple: trigger services call one notification server, which reads the database and calls the providers directly. It works on a whiteboard, but it has three cracks. It is a <strong>single point of failure</strong>: if that server crashes, nothing is sent. It is <strong>hard to scale</strong>, because database, cache and sending logic are bundled together. And it is a <strong>performance bottleneck</strong>, because rendering and sending notifications is resource-hungry.</p>
+    <p>The improved design attacks each crack. Databases and caches move out of the notification server. Several notification servers run side by side (horizontal scaling). Message queues sit between the servers and the sending logic, and workers pull from those queues and call the providers.</p>
+    <figure class="guide-fig"><img src="10.%20Notification%20System/images/improved-design.png" alt="Improved notification design with services, notification servers, cache and DB, per-channel queues, workers and third-party services"><figcaption>Trace the numbered arrows: services call notification servers (1), which read cache and DB (2) and fan events into separate queues for iOS, Android, SMS and email (3). Workers drain each queue (4) and hand off to APNS, FCM, SMS or email providers (5), which reach the device (6). Note the "retry on error" loop from workers back to the queue.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Problem in first design</th><th>Fix in improved design</th></tr></thead>
+      <tbody>
+        <tr><td>Single point of failure</td><td>Multiple notification servers</td></tr>
+        <tr><td>Hard to scale parts independently</td><td>DB and cache moved out; servers, queues and workers scale separately</td></tr>
+        <tr><td>Performance bottleneck</td><td>Queues buffer load; workers do the heavy sending</td></tr>
+      </tbody>
+    </table>
+    <div class="pitfall"><strong>Common trap:</strong> Putting one shared queue for all channels. The diagram gives each channel its own queue, so an outage at one provider only backs up its own queue and leaves the others flowing.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Reliability: no loss, no duplicates</h4>
+    <p>Two opposite failures haunt a notification system. The first is <strong>loss</strong>: a worker crashes or a provider errors, and the notification simply disappears. The second is <strong>duplication</strong>: a retry succeeds but the original also went through, and the user gets the same message twice.</p>
+    <p>To prevent loss, workers persist notification data in a <strong>notification log</strong> database and use a <strong>retry mechanism</strong>. If a provider fails, the event is retried rather than dropped.</p>
+    <figure class="guide-fig"><img src="10.%20Notification%20System/images/data-loss.png" alt="Worker pulling from iOS PN queue, writing to notification log and sending to APNs"><figcaption>Notice the worker writes to the notification log as well as calling APNS. The log is the safety net: if something fails, the record still exists to retry from.</figcaption></figure>
+    <p>To prevent duplicates, every event carries an <strong>event ID</strong>. When an event arrives, the system checks whether that ID has been seen before. Seen: discard. New: send.</p>
+    <ol class="steps">
+      <li>Event arrives at worker.</li>
+      <li>Look up event ID. Already seen? Drop it.</li>
+      <li>Otherwise, record it in the notification log and send to the provider.</li>
+      <li>Provider error? Put it back for retry.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> Treating retries and dedup as separate features. They are a pair: retries make duplicates more likely, and event-ID dedup is what makes retrying safe.</div>
+  </div>
+
+  <div class="drill">
+    <h4>The final flow and the supporting cast</h4>
+    <p>The updated design adds the components that make the system respectful and measurable. Notification servers now perform <strong>authentication</strong> and <strong>rate limiting</strong> at the door. Workers use <strong>notification templates</strong> so messages are consistent and quick to build. An <strong>analytics service</strong> records "send pending", "sent" and click tracking, producing open rate, click rate and engagement metrics.</p>
+    <figure class="guide-fig"><img src="10.%20Notification%20System/images/updated-design.png" alt="Updated design with authentication, rate limit, iOS PN queue, workers, templates, notification log and analytics service"><figcaption>Three arrows lead up to the analytics service: "send pending" from the notification servers, "sent" from the workers, and "click tracking" from the device. Together they trace a notification's whole life.</figcaption></figure>
+    <p><strong>Notification settings</strong> live in a dedicated table, and are checked before anything is sent: a user who opted out of SMS should never receive one. <strong>Queue monitoring</strong> watches how many notifications are waiting; a growing backlog is the signal to add workers.</p>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Queues let each tier scale on its own and absorb bursts; the log and retries give durability; settings and rate limits protect the user experience.</p></div>
+      <div class="con"><strong>Costs</strong><p>More moving parts to operate; delivery is soft real-time rather than instant; you still depend on third parties you cannot control.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>Contact info gathering</h4>
+    <p>You cannot notify someone without an address. Contact details are collected when the user installs the app or signs up. Device tokens, needed for push, go into a <strong>device tokens table</strong>; email addresses and phone numbers live in the <strong>user table</strong>.</p>
+    <p>A single user can have several device tokens, one per device, which is why push tokens get their own table rather than a single column on the user record.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Forgetting that iOS and Android need different providers. The device token is only useful when sent to the right one: APNS for iOS, FCM for Android.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Jot your answer in the margin with your stylus first, then tap to reveal.</p>
+  <details class="qa"><summary>What were the three problems with the initial single-server design?</summary><div class="qa-answer"><p>It was a single point of failure, it was hard to scale the database, cache and processing independently, and it was a performance bottleneck because sending notifications is resource-intensive.</p></div></details>
+  <details class="qa"><summary>Why put message queues between notification servers and workers?</summary><div class="qa-answer"><p>Queues decouple the parts of the system and act as buffers when a large volume of notifications must go out. Servers can accept requests quickly while workers drain the queues at their own pace, and each tier can scale separately.</p></div></details>
+  <details class="qa"><summary>What happens if APNS is down for a few minutes?</summary><div class="qa-answer"><p>Workers get errors and use the retry mechanism, returning events to the queue to try again. The notification log keeps the data safe. Because each channel has its own queue, Android, SMS and email keep flowing.</p></div></details>
+  <details class="qa"><summary>How does the system avoid sending the same notification twice?</summary><div class="qa-answer"><p>Each notification event has an event ID. When an event arrives, the system checks whether that ID has been seen before; if so it is discarded, otherwise the notification is sent.</p></div></details>
+  <details class="qa"><summary>Compare notification settings and rate limiting.</summary><div class="qa-answer"><p>Settings are the user's choice: opt in or out of each channel, stored in a notification settings table. Rate limiting is the system's choice: a cap on how often any user is notified, to avoid overwhelming them.</p></div></details>
+  <details class="qa"><summary>What signal tells you to add more workers?</summary><div class="qa-answer"><p>The number of queued notifications. Monitoring queues shows when the backlog is growing, meaning workers cannot keep up.</p></div></details>
+</div>

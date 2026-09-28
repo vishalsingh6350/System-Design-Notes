@@ -1,0 +1,212 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>A shopper on an Amazon-style marketplace clicks "Place order" for three items from three different sellers. The Wi-Fi on the train drops for a second, the spinner hangs, and they click the button again. Somewhere, a card network is mid-authorization, a third-party processor is waiting on a 3D Secure check, and your wallet service has not yet heard a thing. The customer must be charged exactly once, each seller must be credited exactly once, and at the end of the night every cent must line up with the processor's books. That is the payment system: not a speed problem, but a correctness problem under constant partial failure.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">At 10 transactions per second, throughput is not the enemy &mdash; uncertainty is. Read the map as four pillars: move the money, record it faithfully, never do it twice, and prove it afterwards.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">Pay-in orchestration</span> <span class="why">&mdash; the spine every payment travels along</span>
+      <ul>
+        <li>Payment service: accepts payment events, coordinates, runs risk checks
+          <ul><li><span class="peripheral">Third-party risk provider for AML violations or criminal activity</span></li></ul>
+        </li>
+        <li>Payment executor: executes one payment order via the PSP
+          <ul><li><span class="peripheral">One payment event may contain several payment orders</span></li></ul>
+        </li>
+        <li>PSP + card schemes move the actual money
+          <ul><li><span class="peripheral">Hosted payment page keeps card data out of our systems</span></li></ul>
+        </li>
+        <li>Wallet (merchant balances) and ledger (money-movement record) updated after success</li>
+      </ul>
+    </li>
+    <li><span class="hub">Correct record-keeping</span> <span class="why">&mdash; strong consistency beats performance for money</span>
+      <ul>
+        <li>payment_events and payment_orders tables in a traditional ACID SQL database
+          <ul><li><span class="peripheral">payment_order_status: NOT_STARTED, EXECUTING, SUCCESS, FAILED</span></li></ul>
+        </li>
+        <li>Double-entry ledger: every movement debits one account and credits another
+          <ul><li><span class="peripheral">Sum of all entries is always zero</span></li></ul>
+        </li>
+        <li>Amounts as strings, never double
+          <ul><li><span class="peripheral">Replicas only for failover, or consensus DBs (YugabyteDB, CockroachDB)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Exactly-once processing</span> <span class="why">&mdash; retries without double-charging</span>
+      <ul>
+        <li>At-least-once: retry with exponential back-off
+          <ul><li><span class="peripheral">Server hints via Retry-After header</span></li></ul>
+        </li>
+        <li>At-most-once: idempotency key + unique constraint
+          <ul><li><span class="peripheral">payment_order_id forwarded to PSP as the dedupe key (nonce)</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Failure handling &amp; reconciliation</span> <span class="why">&mdash; the safety net for every unhappy path</span>
+      <ul>
+        <li>Nightly settlement file from PSP compared with internal state
+          <ul><li><span class="peripheral">Mismatches: auto-adjustable, manual-but-classifiable, unclassifiable</span></li></ul>
+        </li>
+        <li>Retry queue and dead-letter queue for failed payments</li>
+        <li>Pending status, webhooks or polling for slow payments
+          <ul><li><span class="peripheral">Delays from manual risk review or 3D Secure</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="peripheral">Pay-out flow, async messaging, security controls</span> <span class="why">&mdash; mirror images and hardening around the core</span></li>
+  </ul>
+  <p class="phase-note">Orchestration is the spine because every other concern hangs off a step in the pay-in flow. Record-keeping gives each step a durable status, which is what makes retries safe and reconciliation possible. Exactly-once and reconciliation then work as a pair: the first prevents duplicates in real time, the second catches whatever still slips through by comparing books overnight.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the money through each sealed box. Notice how every box writes down what it did before handing off &mdash; that habit is what lets the system recover from a crash at any arrow.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Payment service</h4>
+      <p><strong>Input:</strong> POST /v1/payments with buyer_info, checkout_id, credit_card_info and a list of payment_orders.</p>
+      <p><strong>Output:</strong> A stored payment event, a risk-check verdict, and one call to the executor per payment order.</p>
+      <p class="io-story">The conductor of the orchestra. It does not play an instrument itself; it makes sure each musician (executor, wallet, ledger) comes in at the right moment and remembers where everyone is.</p>
+      <p class="io-arrow">&rarr; feeds into: Payment executor</p>
+    </div>
+    <div class="io-block">
+      <h4>Payment executor</h4>
+      <p><strong>Input:</strong> A single payment order (seller_account, amount "3.15", currency "USD", payment_order_id).</p>
+      <p><strong>Output:</strong> A stored payment order and a call to the PSP.</p>
+      <p class="io-story">A specialist who handles exactly one invoice at a time. Splitting a cart into orders lets each seller's payment succeed, fail or retry independently.</p>
+      <p class="io-arrow">&rarr; feeds into: PSP</p>
+    </div>
+    <div class="io-block">
+      <h4>PSP (Stripe, Braintree, Square...) + card schemes</h4>
+      <p><strong>Input:</strong> A payment registration with amount, currency, expiration and a UUID for idempotency.</p>
+      <p><strong>Output:</strong> A token, a hosted payment page, the payment result via redirect and webhook, plus a nightly settlement file.</p>
+      <p class="io-story">The armoured truck company. It actually carries money between the buyer's card account and the site's bank, working with Visa or MasterCard, so we never touch raw card data.</p>
+      <p class="io-arrow">&rarr; feeds into: Payment service (webhook), reconciliation (settlement file)</p>
+    </div>
+    <div class="io-block">
+      <h4>Wallet service</h4>
+      <p><strong>Input:</strong> A successful payment result from the payment service.</p>
+      <p><strong>Output:</strong> An updated merchant balance in its database; wallet_updated flag set.</p>
+      <p class="io-story">Each seller's running tab: how much money we are holding for them.</p>
+      <p class="io-arrow">&rarr; feeds into: Pay-out flow, reconciliation</p>
+    </div>
+    <div class="io-block">
+      <h4>Ledger</h4>
+      <p><strong>Input:</strong> The money movements of the payment.</p>
+      <p><strong>Output:</strong> Double-entry records (debit one account, credit another); ledger_updated flag set.</p>
+      <p class="io-story">The accountant's bound book in permanent ink. Because every entry has a matching opposite, the columns always sum to zero and any missing cent stands out.</p>
+      <p class="io-arrow">&rarr; feeds into: Reconciliation, audits</p>
+    </div>
+    <div class="io-block">
+      <h4>Reconciliation + failure queues</h4>
+      <p><strong>Input:</strong> PSP settlement file, internal ledger and wallet state, failed payments.</p>
+      <p><strong>Output:</strong> Mismatch reports, adjustments by the finance team, retry-queue entries, dead-letter-queue entries.</p>
+      <p class="io-story">The night auditor with a flashlight. Whatever the day's happy path missed, this box finds and routes to a fix.</p>
+      <p class="io-arrow">&rarr; feeds into: Finance team, retry of payments, debugging</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one payment</h4>
+    <ol class="journey-steps">
+      <li>The buyer clicks "checkout" on a cart with three sellers. The client sends POST /v1/payments with a checkout_id and three payment_orders, one of them for "3.15" USD to a seller IBAN.</li>
+      <li>The payment service stores the event in payment_events (keyed by checkout_id) and runs a third-party risk check for AML or criminal activity.</li>
+      <li>For each order, the service sends a payment registration to the PSP, including the payment_order_id as the idempotency UUID. The PSP returns a token, which is stored in the database.</li>
+      <li>The buyer is shown the PSP-hosted payment page, initialized with the token and a success/failure redirect URL. They type their card details there &mdash; into the PSP, not into us.</li>
+      <li>The PSP processes the card with the card scheme and redirects the buyer back, e.g. to <code>https://your-company.com/?tokenID=JIOUIQ123NSF&amp;payResult=X324FSa</code>.</li>
+      <li>Asynchronously, the PSP calls our webhook with the result. The payment service records it and moves payment_order_status to SUCCESS.</li>
+      <li>The wallet adds the amount to the seller's balance (wallet_updated = true), and the ledger records the debit/credit pair (ledger_updated = true).</li>
+      <li>The panicked second click arrives with the same idempotency key. The insert hits a unique-constraint violation, so the server returns the existing payment instead of charging again.</li>
+      <li>That night, the PSP's settlement file is compared against our records; this payment matches and nothing needs adjusting. Later, the pay-out flow sends the seller's money to their bank.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">A payment system coordinates money movement across internal services and an external PSP so that every payment happens exactly once and every movement is traceable &mdash; trading raw speed for strong consistency, idempotency and reconciliation.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of a bank vault staffed by meticulous clerks. The head clerk (payment service) receives your purchase slip and splits it into envelopes, one per seller (payment orders). A courier (payment executor) takes each envelope to an armoured-truck company (the PSP), which alone is licensed to handle cash and card numbers. Every envelope carries a serial number stamped in red (the idempotency key); if a duplicate envelope with the same number shows up, the clerk just points to the first one. When cash arrives, one clerk updates each seller's tab (wallet) and another writes both sides of the transfer in the bound ledger. Each night an auditor compares the armoured-truck company's manifest (the settlement file) against the ledger and flags anything that does not match.</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">Pay-in vs pay-out</span><span class="beacon-def">Money in from buyers on behalf of merchants vs money out to sellers; same components, different direction.</span></div>
+    <div class="beacon"><span class="beacon-term">PSP</span><span class="beacon-def">Payment service provider that moves the money; we integrate rather than process cards ourselves.</span></div>
+    <div class="beacon"><span class="beacon-term">Hosted payment page</span><span class="beacon-def">PSP's widget collects card data, so we avoid storing it and most of the compliance burden.</span></div>
+    <div class="beacon"><span class="beacon-term">payment_order_id</span><span class="beacon-def">Globally unique ID forwarded to the PSP as the idempotency key &mdash; the anti-double-charge stamp.</span></div>
+    <div class="beacon"><span class="beacon-term">Amount as string</span><span class="beacon-def">double is inappropriate for money; strings avoid precision loss.</span></div>
+    <div class="beacon"><span class="beacon-term">Double-entry ledger</span><span class="beacon-def">Debit one account, credit another; all entries sum to zero, giving end-to-end traceability.</span></div>
+    <div class="beacon"><span class="beacon-term">Exactly-once = at-least-once + at-most-once</span><span class="beacon-def">Retries guarantee it happens; idempotency guarantees it happens only once.</span></div>
+    <div class="beacon"><span class="beacon-term">Exponential back-off</span><span class="beacon-def">Default retry strategy: double the wait each time; honour Retry-After if the server sends it.</span></div>
+    <div class="beacon"><span class="beacon-term">Reconciliation</span><span class="beacon-def">Nightly comparison with the PSP settlement file; the final line of defence for consistency.</span></div>
+    <div class="beacon"><span class="beacon-term">Dead-letter queue</span><span class="beacon-def">Where terminally failed payments go to be inspected and debugged.</span></div>
+    <div class="beacon"><span class="beacon-term">10 TPS</span><span class="beacon-def">1M transactions/day; throughput is not the design driver &mdash; correctness is.</span></div>
+    <div class="beacon"><span class="beacon-term">Webhook</span><span class="beacon-def">PSP calls us back asynchronously with the result; poll the API if no webhook exists.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Interviewers probe payments for one thing above all: what happens when something breaks halfway. These four drills &mdash; the pay-in pipeline, exactly-once, reconciliation and failure handling &mdash; cover nearly every follow-up question.</p>
+
+  <div class="drill">
+    <h4>The pay-in pipeline and why it is split into events and orders</h4>
+    <p>A checkout is a <strong>payment event</strong>; each seller's share of it is a <strong>payment order</strong>. The payment service owns events and coordinates; the payment executor owns orders and talks to the PSP. This split lets one seller's payment fail or retry without disturbing the others.</p>
+    <figure class="guide-fig"><img src="26.%20Payment%20System/images/payin-flow-high-level.png" alt="Pay-in flow: payment service, executor, PSP, card schemes, wallet, ledger"><figcaption>Trace the arrows left to right: payment service &rarr; executor &rarr; PSP &rarr; card schemes. Only after the money moves does the payment service update the wallet and then the ledger.</figcaption></figure>
+    <p>The data model mirrors this. payment_events is keyed by checkout_id and carries is_payment_done. payment_orders is keyed by payment_order_id, links back via checkout_id, and tracks payment_order_status (NOT_STARTED, EXECUTING, SUCCESS, FAILED) plus ledger_updated and wallet_updated flags. A background job watches in-flight payments and raises an alert if one is not processed in a reasonable time.</p>
+    <p>Why traditional SQL? Performance barely matters at 10 TPS, while ACID guarantees, a proven record at big financial institutions, rich tooling and an easy-to-hire DBA market all matter a lot.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Storing seller_info or card data where it is not needed. Seller info is only required for pay-out, and card data should never land in our systems &mdash; the hosted payment page and tokens keep it with the PSP.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Exactly-once: retries plus idempotency</h4>
+    <p>Exactly-once sounds magical, but it decomposes into two ordinary guarantees. <strong>At-least-once</strong> comes from retrying failed calls. <strong>At-most-once</strong> comes from idempotency &mdash; the property that repeating an operation has the same effect as doing it once. Together they give exactly-once.</p>
+    <table class="compare"><thead><tr><th>Retry strategy</th><th>Behaviour</th></tr></thead><tbody>
+      <tr><td>Immediate retry</td><td>Resend straight after failure</td></tr>
+      <tr><td>Fixed intervals</td><td>Wait the same amount each time</td></tr>
+      <tr><td>Incremental intervals</td><td>Increase the wait gradually</td></tr>
+      <tr><td>Exponential back-off (default)</td><td>Double the wait each time; respect a Retry-After header</td></tr>
+      <tr><td>Cancel</td><td>Stop on a terminal error or when the retry threshold is hit</td></tr>
+    </tbody></table>
+    <p>Retries create the risk of double processing: a user clicks "pay" twice, or the PSP succeeds but the ledger or wallet update fails and a retry sends the charge to the PSP again. The defence is an idempotency key &mdash; typically a UUID in a header such as <code>idempotency-key</code>.</p>
+    <div class="anim" data-anim="idempotency"></div>
+    <figure class="guide-fig"><img src="26.%20Payment%20System/images/idempotency-example.png" alt="Two requests with the same idempotency key; the second returns the existing result"><figcaption>Notice that the second request with the same key does not create a new charge; it gets back the result of the first.</figcaption></figure>
+    <ol class="steps">
+      <li>The server tries to insert a new row keyed by the idempotency key.</li>
+      <li>If the key already exists, the insert fails with a unique-constraint violation.</li>
+      <li>The server catches that error and returns the existing object to the client.</li>
+      <li>At the PSP side, the same payment_order_id (nonce) stops the PSP from processing the payment twice.</li>
+    </ol>
+    <div class="pitfall"><strong>Common trap:</strong> Relying on retries alone. Retries without idempotency turn "at-least-once" into "sometimes twice" &mdash; the exact double-charge you were trying to prevent.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Reconciliation: proving the books balance</h4>
+    <p>The happy path covers most payments, but services talk over networks and networks fail. Reconciliation is the background process that finds the leftovers. Every night the PSP sends a settlement file, and we compare it against our internal state. The same technique catches internal drift, such as the ledger and wallet disagreeing.</p>
+    <p>Mismatches fall into three buckets, all owned by the finance team: classifiable and automatable with a standard procedure; classifiable but requiring a manual adjustment; and unclassifiable, requiring manual investigation.</p>
+    <p>Consistency overall rests on two legs: exactly-once processing between services, and reconciliation to repair what slips through. For database replication, avoid replica lag by serving reads and writes from the primary (replicas only for redundancy and failover), or keep replicas in sync with Paxos or Raft, or use a consensus-based database such as YugabyteDB or CockroachDB.</p>
+    <div class="tradeoff"><div class="pro"><strong>Gains</strong><p>Eventual consistency across PSP, ledger, wallet and payment service, even when individual calls fail; an audit trail the finance team can act on.</p></div><div class="con"><strong>Costs</strong><p>Detection is delayed until the nightly run, and many mismatches still need human attention.</p></div></div>
+  </div>
+
+  <div class="drill">
+    <h4>Failed and slow payments, and how services talk</h4>
+    <p>Some payments take hours instead of seconds &mdash; a high-risk payment waiting for manual review, or a card requiring 3D Secure authentication. The system shows the user a "pending" status with a page to check back (optionally an email when done), and learns the outcome through the PSP webhook, or by polling if webhooks are unavailable.</p>
+    <p>For payments that genuinely fail, the tracked payment state decides whether to retry or refund. Retryable payments go onto a retry queue; terminally failed ones go to a dead-letter queue for inspection.</p>
+    <figure class="guide-fig"><img src="26.%20Payment%20System/images/failed-payments.png" alt="Failed payment routing to a retry queue or dead-letter queue"><figcaption>Follow the fork: retryable failures loop back through the retry queue, while terminal ones exit to the dead-letter queue for debugging.</figcaption></figure>
+    <p>Synchronous HTTP between services is simple but suffers at scale: long call chains, poor failure isolation (a PSP outage leaves the user hanging), tight coupling and no buffer for traffic spikes. Asynchronous messaging comes in two shapes: single-receiver (each message processed once) and multiple-receiver (every subscriber gets the message). Multiple-receiver suits payments, since one payment triggers several side effects in different services.</p>
+    <div class="pitfall"><strong>Common trap:</strong> Assuming async is free. It trades simplicity and consistency for scalability and resilience &mdash; which is exactly why reconciliation is still needed.</div>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Sketch your answer in the margin with your stylus before you tap to reveal.</p>
+  <details class="qa"><summary>Why is exactly-once described as "at-least-once plus at-most-once"?</summary><div class="qa-answer"><p>Retries ensure the payment eventually goes through (at least once), and idempotency ensures repeated attempts have no extra effect (at most once). Only when both hold is the payment processed exactly once.</p></div></details>
+  <details class="qa"><summary>What happens if the PSP charges the card but the wallet update fails, and the system retries?</summary><div class="qa-answer"><p>Without idempotency, the retry could send the charge to the PSP again and double-charge the buyer. Because the payment_order_id is forwarded as the PSP's dedupe key, the PSP will not process it twice, and reconciliation later catches any remaining internal mismatch.</p></div></details>
+  <details class="qa"><summary>How does a unique key constraint implement idempotency?</summary><div class="qa-answer"><p>The server inserts a row keyed by the idempotency key. A duplicate request triggers a unique-constraint violation, which the server detects and answers by returning the existing object instead of creating a new payment.</p></div></details>
+  <details class="qa"><summary>Why use a hosted payment page instead of collecting card details ourselves?</summary><div class="qa-answer"><p>It keeps credit card data inside the PSP, so we avoid storing it and the heavy regulations that come with it. We only store the PSP-issued token that identifies the payment registration.</p></div></details>
+  <details class="qa"><summary>Compare synchronous HTTP and asynchronous messaging for internal payment communication.</summary><div class="qa-answer"><p>Synchronous calls are simpler but suffer from long call chains, poor failure isolation, tight coupling and no buffering for spikes. Asynchronous multiple-receiver messaging lets one payment trigger several independent side effects and scales better, at the cost of simplicity and immediate consistency.</p></div></details>
+  <details class="qa"><summary>What does the double-entry ledger give you that a simple balance column does not?</summary><div class="qa-answer"><p>Every movement is recorded as a debit on one account and a credit on another, so all entries sum to zero. That gives end-to-end traceability of every money movement and makes discrepancies visible.</p></div></details>
+  <details class="qa"><summary>A payment is stuck for hours. What might be going on, and what does the user see?</summary><div class="qa-answer"><p>It may be flagged high-risk and awaiting manual review, or the card may require 3D Secure. The user sees a "pending" status and a page to check back (and possibly an email), while the system waits for the PSP webhook or polls the PSP.</p></div></details>
+</div>

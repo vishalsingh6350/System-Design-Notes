@@ -1,0 +1,219 @@
+<div class="hook">
+  <span class="hook-label">Picture this</span>
+  <p>A shopper in Mumbai adds sneakers to a cart at the exact moment a fibre cable between two of your data centres is cut. One replica heard about the sneakers; two did not. Should the next <code>get(cart)</code> refuse to answer until the network heals, or answer now with possibly stale data? A single-server hash table never faces this question, but the moment you spread <code>put</code> and <code>get</code> across many machines, you are negotiating with the CAP theorem on every request. This chapter builds a store that stays up, scales out, and lets you tune how strict "consistent" needs to be.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">1</span> Macro Structure &amp; Dependency Map</h3>
+  <p class="phase-lede">The whole design is a stack of answers to one question: how do you keep small key-value pairs (under 10 KB) available and correct when they live on many fallible machines? Read the hubs in order &mdash; each exists because the previous one created a new problem.</p>
+  <ul class="dep-tree">
+    <li><span class="hub">CAP trade-off</span> <span class="why">— sets the rules of the game before any component is chosen</span>
+      <ul>
+        <li>Consistency, Availability, Partition tolerance: pick two
+          <ul><li><span class="peripheral">CA cannot exist in practice because network partitions are unavoidable</span></li></ul>
+        </li>
+        <li>So the real choice during a partition: CP (block writes) or AP (serve possibly stale data)
+          <ul><li><span class="peripheral">CP example: banking systems</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Partitioning &amp; replication on the ring</span> <span class="why">— where data lives and how many copies exist</span>
+      <ul>
+        <li>Consistent hashing spreads keys; virtual nodes proportional to server capacity
+          <ul><li><span class="peripheral">Automatic scaling as servers join or leave</span></li></ul>
+        </li>
+        <li>Replicate to the first N servers clockwise
+          <ul><li><span class="peripheral">Place replicas in distinct data centres</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Quorum consistency &amp; conflict resolution</span> <span class="why">— the dial between speed and correctness</span>
+      <ul>
+        <li>N, W, R and the rule W + R &gt; N
+          <ul><li><span class="peripheral">Typical: N = 3, W = R = 2</span></li></ul>
+        </li>
+        <li>Consistency models: strong, weak, eventual</li>
+        <li>Vector clocks detect concurrent (sibling) versions
+          <ul><li><span class="peripheral">Clients reconcile; clocks may need trimming</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Failure handling</span> <span class="why">— detect, survive, and heal</span>
+      <ul>
+        <li>Detection: gossip protocol with heartbeat counters</li>
+        <li>Temporary failures: sloppy quorum + hinted handoff</li>
+        <li>Permanent failures: Merkle trees for anti-entropy sync
+          <ul><li><span class="peripheral">Data-centre outages: replicate across data centres</span></li></ul>
+        </li>
+      </ul>
+    </li>
+    <li><span class="hub">Storage engine: write &amp; read paths</span> <span class="why">— what one node does with a single request</span>
+      <ul>
+        <li>Write: commit log &rarr; memory cache &rarr; flush to SSTable</li>
+        <li>Read: memory cache &rarr; Bloom filter &rarr; SSTable
+          <ul><li><span class="peripheral">Based on Cassandra's architecture</span></li></ul>
+        </li>
+      </ul>
+    </li>
+  </ul>
+  <p class="phase-note">CAP decides the philosophy; the ring decides placement; quorums and vector clocks decide what "correct" means; failure handling keeps the promises when machines die; the storage engine is the local plumbing on each node. If you remember the order &ldquo;choose, place, agree, heal, store&rdquo;, you can rebuild the chapter.</p>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">2</span> Black-Box Cause &amp; Effect Flow</h3>
+  <p class="phase-lede">Follow the machinery from the client's API call down to the disk and back out. Each box consumes what the previous box produced.</p>
+  <div class="io-flow">
+    <div class="io-block">
+      <h4>Client API + coordinator</h4>
+      <p><strong>Input:</strong> <code>put(key, value)</code> or <code>get(key)</code>.</p>
+      <p><strong>Output:</strong> the request forwarded to the right replicas, and a single response back to the client.</p>
+      <p class="io-story">The coordinator is a concierge: any node can play it, it knows who holds what, and it hides the crowd of replicas behind one simple desk.</p>
+      <p class="io-arrow">&rarr; feeds into: ring lookup</p>
+    </div>
+    <div class="io-block">
+      <h4>Consistent-hash ring (partitioning + replication)</h4>
+      <p><strong>Input:</strong> the key.</p>
+      <p><strong>Output:</strong> an ordered list of N replica nodes &mdash; the first N servers clockwise from the key.</p>
+      <p class="io-story">Same ring as the previous chapter, but the walk does not stop at the first server; it collects N of them, ideally in different data centres.</p>
+      <p class="io-arrow">&rarr; feeds into: quorum</p>
+    </div>
+    <div class="io-block">
+      <h4>Quorum (N, W, R)</h4>
+      <p><strong>Input:</strong> the request fanned out to N replicas, plus the chosen W and R.</p>
+      <p><strong>Output:</strong> success once W write-ACKs or R read replies arrive.</p>
+      <p class="io-story">A vote: the coordinator does not wait for everyone, only for enough voters. W + R &gt; N guarantees the read voters and write voters overlap on at least one up-to-date node.</p>
+      <p class="io-arrow">&rarr; feeds into: versioning (on reads) and the storage engine (on each replica)</p>
+    </div>
+    <div class="io-block">
+      <h4>Versioning with vector clocks</h4>
+      <p><strong>Input:</strong> multiple versions of the same key, each tagged with [server, counter] pairs.</p>
+      <p><strong>Output:</strong> either "one version is the ancestor, keep the newer" or "siblings in conflict, let the client reconcile".</p>
+      <p class="io-story">Each version carries a family tree. If one tree contains the other, there is no fight; if they branched, someone has to merge them.</p>
+      <p class="io-arrow">&rarr; feeds into: the value returned to the client</p>
+    </div>
+    <div class="io-block">
+      <h4>Failure machinery (gossip, sloppy quorum, hinted handoff, Merkle trees)</h4>
+      <p><strong>Input:</strong> heartbeat counters, down nodes, divergent replicas.</p>
+      <p><strong>Output:</strong> an accurate membership view, uninterrupted writes, and replicas re-synchronised.</p>
+      <p class="io-story">The immune system: gossip notices illness, sloppy quorum routes around it, hinted handoff returns borrowed data, and Merkle trees find exactly which cells need repair.</p>
+      <p class="io-arrow">&rarr; feeds into: the quorum having enough healthy voters</p>
+    </div>
+    <div class="io-block">
+      <h4>Node storage engine</h4>
+      <p><strong>Input:</strong> a write or read arriving at one replica.</p>
+      <p><strong>Output:</strong> durable storage (commit log + SSTables) and fast reads (memory cache + Bloom filter).</p>
+      <p class="io-story">Scribble the order in a ledger first so nothing is lost, keep a hot copy on the desk, and file it in sorted drawers when the desk fills up.</p>
+      <p class="io-arrow">&rarr; feeds into: the ACK or value returned to the coordinator</p>
+    </div>
+  </div>
+  <div class="journey">
+    <h4 class="journey-title">Follow one key</h4>
+    <ol class="journey-steps">
+      <li>The client calls <code>put(key1, val1)</code>. It reaches node n6, which acts as coordinator.</li>
+      <li>n6 hashes <code>key1</code> onto the ring and walks clockwise, collecting N = 3 replicas: n0, n1 and n2.</li>
+      <li>The coordinator sends <code>put(key1, val1)</code> to all three in parallel.</li>
+      <li>On each replica the write is first appended to the commit log on disk, then stored in the memory cache.</li>
+      <li>With W = 2, the coordinator replies "success" as soon as two ACKs arrive, without waiting for the slowest node.</li>
+      <li>Suppose n2 is down. Gossip has already marked it offline, so a sloppy quorum uses the next healthy node on the ring instead; when n2 recovers, hinted handoff pushes the write back to it.</li>
+      <li>Later, <code>get(key1)</code> arrives. With R = 2 the coordinator waits for two replies. Since W + R = 4 &gt; 3, at least one reply carries the latest value.</li>
+      <li>On the replica, the read checks the memory cache first; if the value was flushed, a Bloom filter points to the SSTables that might hold <code>key1</code>.</li>
+      <li>If two replies carry sibling vector clocks, both versions go back to the client to reconcile.</li>
+    </ol>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">3</span> Purpose &amp; Concept Beacons</h3>
+  <p class="purpose-statement">Build a decentralised, highly available key-value store where every node has the same responsibilities, data is partitioned and replicated on a hash ring, and the latency-versus-consistency trade-off is a dial (N, W, R) rather than a fixed decision.</p>
+  <div class="analogy">
+    <span class="analogy-label">Mental picture</span>
+    <p>Think of a chain of village libraries arranged around a lake (the hash ring). Every book (key) is shelved at the first three libraries you pass walking clockwise from its spot on the shore (N = 3 replicas). Any librarian can take your request and act as your concierge (the coordinator), and they only need two colleagues to confirm a new edition is shelved (W = 2) or two to report what they hold (R = 2). Librarians constantly pass notes about who is still open (gossip); if one library is closed, the next one keeps your book in a labelled box until it reopens (sloppy quorum and hinted handoff). Once in a while two libraries compare a one-line fingerprint of their whole catalogue, and only drill into shelves whose fingerprints differ (Merkle trees).</p>
+  </div>
+  <div class="beacon-grid">
+    <div class="beacon"><span class="beacon-term">CAP theorem</span><span class="beacon-def">Only two of consistency, availability, partition tolerance; since partitions happen, it is really CP vs AP.</span></div>
+    <div class="beacon"><span class="beacon-term">CP vs AP</span><span class="beacon-def">CP blocks writes to stay correct (banking); AP keeps serving and syncs later (eventual consistency).</span></div>
+    <div class="beacon"><span class="beacon-term">N / W / R</span><span class="beacon-def">Replicas, write ACKs needed, read replies needed &mdash; the tuning knobs for latency vs consistency.</span></div>
+    <div class="beacon"><span class="beacon-term">W + R &gt; N</span><span class="beacon-def">Read and write sets overlap, so strong consistency is guaranteed; typical N = 3, W = R = 2.</span></div>
+    <div class="beacon"><span class="beacon-term">R = 1, W = N</span><span class="beacon-def">Optimised for fast reads. Flip it (W = 1, R = N) for fast writes.</span></div>
+    <div class="beacon"><span class="beacon-term">Eventual consistency</span><span class="beacon-def">Given enough time, all updates propagate and replicas converge.</span></div>
+    <div class="beacon"><span class="beacon-term">Vector clock D([S1, v1] ... [Sn, vn])</span><span class="beacon-def">Per-server version counters that reveal whether versions are ancestor/descendant or conflicting siblings.</span></div>
+    <div class="beacon"><span class="beacon-term">Gossip protocol</span><span class="beacon-def">Nodes share heartbeat counters with random peers; a stale counter means the node is offline.</span></div>
+    <div class="beacon"><span class="beacon-term">Sloppy quorum</span><span class="beacon-def">Use the first W/R healthy servers on the ring instead of insisting on the designated ones.</span></div>
+    <div class="beacon"><span class="beacon-term">Hinted handoff</span><span class="beacon-def">The stand-in server pushes changes back once the downed server recovers.</span></div>
+    <div class="beacon"><span class="beacon-term">Merkle tree</span><span class="beacon-def">Hash tree over key buckets; compare roots, descend only into mismatches, sync only what differs.</span></div>
+    <div class="beacon"><span class="beacon-term">Commit log / memory cache / SSTable / Bloom filter</span><span class="beacon-def">Durable append, hot in-memory copy, sorted on-disk files, and a quick "which file might have it" check.</span></div>
+  </div>
+</div>
+
+<div class="phase">
+  <h3 class="phase-title"><span class="phase-num">4</span> Opportunistic Drilling</h3>
+  <p class="phase-lede">Quorums, vector clocks and the failure toolkit are where interviewers probe and where the numbers live. The storage paths are a short, reliable win. Go deep here and treat the rest as recall.</p>
+
+  <div class="drill">
+    <h4>CAP in one scenario: what happens when n3 is cut off</h4>
+    <p>Three replicas, n1, n2 and n3. n3 drops off the network. Writes accepted by n1 and n2 cannot reach n3; anything written to n3 just before the cut has not reached n1 and n2 either. Somebody is now holding stale data.</p>
+    <p>A CP system responds by blocking writes to n1 and n2 so replicas cannot diverge &mdash; correct, but unavailable. An AP system keeps accepting reads (possibly stale) and writes on n1 and n2, and syncs to n3 when the partition heals &mdash; always up, but only eventually consistent.</p>
+    <div class="pitfall"><strong>Common trap:</strong> proposing a "CA" design. In a distributed system network failure is unavoidable, so partition tolerance is mandatory; CA cannot exist in real-world applications.</div>
+  </div>
+
+  <div class="drill">
+    <h4>Quorum consensus: the latency vs consistency dial</h4>
+    <p>The coordinator sends every write to all N replicas but declares success after W acknowledgements. Every read is sent to replicas and returns after R replies. Waiting for fewer nodes is faster; waiting for more is safer.</p>
+    <p>The magic inequality is W + R &gt; N. If the write set and read set must be larger together than the total, they must share at least one node &mdash; and that node has the newest value. With N = 3, W = R = 2, any two readers overlap any two writers.</p>
+    <div class="anim" data-anim="quorum"></div>
+    <figure class="guide-fig"><img src="06.%20Key-Value%20Store/images/quorum-consensus.png" alt="Coordinator sending put(key1, val1) to s0, s1 and s2 and receiving ACKs"><figcaption>The coordinator fans out put(key1, val1) to s0, s1, s2. With W = 1 it could reply after the first ACK; with W = 2 it waits for two. The dashed ACK arrows are the votes being counted.</figcaption></figure>
+    <table class="compare">
+      <thead><tr><th>Setting</th><th>Optimised for</th><th>Strong consistency?</th></tr></thead>
+      <tbody>
+        <tr><td>R = 1, W = N</td><td>Fast reads</td><td>Yes (1 + N &gt; N)</td></tr>
+        <tr><td>W = 1, R = N</td><td>Fast writes</td><td>Yes (N + 1 &gt; N)</td></tr>
+        <tr><td>N = 3, W = R = 2</td><td>Balanced, the usual choice</td><td>Yes (4 &gt; 3)</td></tr>
+        <tr><td>W + R &le; N</td><td>Lowest latency</td><td>Not guaranteed</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="drill">
+    <h4>Vector clocks: spotting a real conflict</h4>
+    <p>Each data item carries a list of [server, version] pairs. When a server writes the item, it bumps its own counter if it is already in the list, or adds itself with counter 1 if not.</p>
+    <p>To compare two versions X and Y: if every counter in X is less than or equal to its counterpart in Y, X is simply an ancestor and Y wins. If some counter in Y is smaller than in X (and vice versa), they are siblings &mdash; concurrent edits &mdash; and the system hands both to application logic or the client to reconcile.</p>
+    <figure class="guide-fig"><img src="06.%20Key-Value%20Store/images/vector-clock.png" alt="Vector clock evolution from D1 to D5 with a branch at D2"><figcaption>Sx writes twice (D1, D2). Then Sy and Sz both edit D2 concurrently, producing D3([Sx,2],[Sy,1]) and D4([Sx,2],[Sz,1]) &mdash; siblings, since neither dominates. A client reconciles and Sx writes D5([Sx,3],[Sy,1],[Sz,1]).</figcaption></figure>
+    <div class="tradeoff">
+      <div class="pro"><strong>Gains</strong><p>Detects conflicts precisely instead of silently losing one of two concurrent writes.</p></div>
+      <div class="con"><strong>Costs</strong><p>Pushes merge logic onto clients, and the clock grows with every server that writes, so it may need trimming.</p></div>
+    </div>
+  </div>
+
+  <div class="drill">
+    <h4>The failure toolkit: detect, bridge, repair</h4>
+    <p><strong>Detect.</strong> One node's accusation is not enough; you want at least two independent sources. In gossip, each node keeps a member list with heartbeat counters, increments its own counter, and periodically sends heartbeats to random nodes. If a member's counter has not increased for a predefined period, it is considered offline.</p>
+    <p><strong>Bridge temporary failures.</strong> A strict quorum would stall if a designated replica is down. A sloppy quorum instead picks the first W healthy servers (for writes) and first R healthy servers (for reads) on the ring. The stand-in holds the data, and hinted handoff pushes it back when the original returns.</p>
+    <p><strong>Repair permanent failures.</strong> Merkle trees make replica comparison cheap. Divide the key space into buckets, hash each key, hash each bucket, then hash pairs upward until one root hash remains. Two replicas compare roots: equal means in sync; different means descend into child hashes until the mismatched bucket is found, and sync only that data.</p>
+    <ol class="steps">
+      <li>Divide the key space into buckets.</li>
+      <li>Hash each key in a bucket with a uniform hash.</li>
+      <li>Create one hash per bucket.</li>
+      <li>Combine bucket hashes upward to a single root; compare roots, then children, to find the divergent bucket.</li>
+    </ol>
+    <p>For whole data-centre outages, the answer is simply replication across multiple data centres.</p>
+  </div>
+
+  <div class="drill">
+    <h4>Inside one node: the write and read paths</h4>
+    <p>Borrowed from Cassandra. A write is first persisted to the commit log on disk (so a crash cannot lose it), then saved in the memory cache. When the cache fills, it is flushed to an SSTable &mdash; a sorted string table on disk.</p>
+    <figure class="guide-fig"><img src="06.%20Key-Value%20Store/images/write-path.png" alt="Write path: commit log, memory cache, flush to SSTables"><figcaption>Numbered steps: (1) append to the commit log on disk, (2) write to the memory cache, (3) flush to SSTables when full. Note the memory/disk boundary splitting the server.</figcaption></figure>
+    <p>A read checks the memory cache first. If the key is not there, a Bloom filter quickly tells which SSTables might contain it, so the node reads only those, then returns the value.</p>
+  </div>
+</div>
+
+<div class="recall">
+  <h3 class="recall-title">Test yourself</h3>
+  <p class="recall-lede">Write your answer in the margin first, then tap to check yourself.</p>
+  <details class="qa"><summary>Why can't a real distributed key-value store be a CA system?</summary><div class="qa-answer"><p>Network failure is unavoidable, so the system must tolerate partitions. That leaves a choice between consistency and availability only when a partition occurs.</p></div></details>
+  <details class="qa"><summary>With N = 3, why does W = R = 2 guarantee strong consistency but W = R = 1 does not?</summary><div class="qa-answer"><p>2 + 2 = 4 &gt; 3, so any read set overlaps any write set on at least one node holding the latest value. 1 + 1 = 2 &le; 3, so a read might hit only replicas that missed the latest write.</p></div></details>
+  <details class="qa"><summary>What happens during a partition in a CP system versus an AP system?</summary><div class="qa-answer"><p>CP blocks writes to the reachable nodes to avoid inconsistency, sacrificing availability. AP keeps accepting reads and writes, possibly returning stale data, and syncs when the partition heals.</p></div></details>
+  <details class="qa"><summary>Given D3([Sx,2],[Sy,1]) and D4([Sx,2],[Sz,1]), is there a conflict? Why?</summary><div class="qa-answer"><p>Yes. D3 has Sy = 1 where D4 has 0, and D4 has Sz = 1 where D3 has 0, so neither dominates. They are siblings and must be reconciled by the client or application logic.</p></div></details>
+  <details class="qa"><summary>Compare sloppy quorum with hinted handoff.</summary><div class="qa-answer"><p>Sloppy quorum keeps the system available by using the first W or R healthy servers on the ring instead of down ones. Hinted handoff is the follow-up: when the down server recovers, the stand-in pushes the changes back to restore consistency.</p></div></details>
+  <details class="qa"><summary>Why are Merkle trees efficient for syncing replicas after a permanent failure?</summary><div class="qa-answer"><p>Replicas compare root hashes first and only descend into subtrees whose hashes differ, so they locate inconsistent buckets without scanning everything. Only the differing data is transferred.</p></div></details>
+  <details class="qa"><summary>Why does the write path append to a commit log before updating the memory cache?</summary><div class="qa-answer"><p>The commit log on disk makes the write durable; if the node crashes, data only held in the memory cache would otherwise be lost. The cache is later flushed to SSTables when full.</p></div></details>
+</div>

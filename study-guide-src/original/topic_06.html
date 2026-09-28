@@ -1,0 +1,281 @@
+<h3>Introduction</h3>
+<p>A <strong>key-value store</strong> is a type of non-relational database where data is stored as key-value pairs. Each key is unique, and values are accessed using these keys. This chapter details how to design a scalable, high-availability distributed key-value store that supports operations like:</p>
+<ul>
+<li><code>put(key, value)</code> for inserting data.</li>
+<li><code>get(key)</code> for retrieving data.</li>
+</ul>
+
+<h4>Characteristics of the Design</h4>
+<ul>
+<li>Small key-value pairs (&lt;10 KB).</li>
+<li>Supports big data with high availability and scalability.</li>
+<li>Automatic scaling and tunable consistency.</li>
+<li>Low latency.</li>
+</ul>
+
+<h3>Single Server Key-Value Store</h3>
+<h4>Implementation</h4>
+<ul>
+<li>Use a <strong>hash table</strong> to store key-value pairs in memory.</li>
+<li>Optimizations:
+  <ul>
+    <li>Data compression.</li>
+    <li>Storing less frequently accessed data on disk.</li>
+  </ul>
+</li>
+</ul>
+
+<h4>Limitation</h4>
+<p>A single server's memory is limited, requiring a <strong>distributed approach</strong> for scalability.</p>
+
+<h3>Distributed Key-Value Store</h3>
+<p>A <strong>distributed key-value store</strong> partitions data across multiple servers and must address trade-offs outlined by the <strong>CAP theorem</strong>.</p>
+
+<h4>CAP Theorem</h4>
+<ol>
+<li><strong>Consistency:</strong> All clients see the same data simultaneously.</li>
+<li><strong>Availability:</strong> The system responds to every request, even if some nodes are down.</li>
+<li><strong>Partition Tolerance:</strong> The system continues to operate despite network partitions.</li>
+</ol>
+<p><strong>Trade-off:</strong> According to CAP theorem only two of the three guarantees can be achieved.</p>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/cap.png" alt="CAP">
+
+<h4>System Types:</h4>
+<ul>
+<li><strong>CP Systems:</strong> Consistency and partition tolerance while sacrificing availability (e.g., banking systems).</li>
+<li><strong>AP Systems:</strong> Availability and partition tolerance while sacrificing consistency (e.g., eventual consistency).</li>
+<li><strong>CA Systems:</strong> Consistency and Availability while sacrificing partition tolerance.</li>
+</ul>
+<p><strong>Since network failure is unavoidable, a distributed system must tolerate network partition. Thus, a CA system cannot exist in real-world applications.</strong></p>
+<p>In a distributed system, partitions are inevitable. When a partition occurs, we must choose between consistency and availability. For example, if node n3 goes down, any data written to nodes n1 or n2 cannot be propagated to n3. Conversely, if data is written to n3 but not yet propagated to n1 and n2, nodes n1 and n2 will have stale data.</p>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/server-down.png" alt="Server down">
+<ul>
+<li>If we choose CP system, we must block all write operations to n1 and n2 to avoid data inconsistency.</li>
+<li>If we choose AP system, the system keeps accepting reads, even though it might return stale data. For writes, n1 and n2 keep accepting writes, and data will be synced to n3 when the network partition is resolved.</li>
+</ul>
+
+<h3>System Components</h3>
+<h4>1. Data Partitioning</h4>
+<ul>
+<li><strong>Technique:</strong> Consistent Hashing is used to distribute data across multiple servers evenly.</li>
+<li><strong>Advantages:</strong>
+  <ul>
+    <li>Automatic scaling with server addition/removal.</li>
+    <li>Heterogeneity through virtual nodes. The number of virtual nodes for a server is proportional to the server capacity.</li>
+  </ul>
+</li>
+</ul>
+
+<h4>2. Data Replication</h4>
+<ul>
+<li>Replicate data across <code>N</code> servers for high availability.</li>
+<li>The N servers are chosen by walking clockwise from the server position and choose the first N servers on the ring to store data copies. Place replicas in distinct data centers to improve reliability in case of virtual nodes.</li>
+</ul>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/data-replication.png" alt="Data replication">
+
+<h4>3. Consistency</h4>
+<p>Since data is replicated at multiple nodes, it must be synchronized across replicas.</p>
+<ul>
+<li><strong>Quorum Consensus:</strong>
+  <ul>
+    <li><code>N</code>: Total replicas.</li>
+    <li><code>W</code>: Write quorum size. For a write to be considered successful, write must be acknowledged from W replicas.</li>
+    <li><code>R</code>: Read quorum size. For a read to be considered as successful, read must wait for responses from at least R replicas.</li>
+    <li><strong>Rule:</strong> <code>W + R &gt; N</code> ensures strong consistency.</li>
+    <li>The configuration of W, R and N is a typical tradeoff between latency and consistency.</li>
+  </ul>
+</li>
+</ul>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/quorum-consensus.png" alt="Quorum consensus">
+<ul>
+<li>If R = 1 and W = N, the system is optimized for a fast read.</li>
+<li>If W = 1 and R = N, the system is optimized for fast write.</li>
+<li>If W + R &gt; N, strong consistency is guaranteed (Usually N = 3, W = R = 2).</li>
+<li>If W + R &lt;= N, strong consistency is not guaranteed.</li>
+</ul>
+<ul>
+<li><strong>Models</strong>:
+  <ul>
+    <li><strong>Strong Consistency:</strong> A read operation returns a value corresponding to the result of the most updated write data item.</li>
+    <li><strong>Weak Consistency:</strong> Subsequent read operations may not see the most updated value.</li>
+    <li><strong>Eventual Consistency:</strong> Given enough time, all updates are propagated, and all replicas are consisten</li>
+  </ul>
+</li>
+</ul>
+
+<h4>4. Inconsistency Resolution</h4>
+<p>Replication gives high availability but causes inconsistencies among replicas. Versioning and vector locks are used to solve inconsistency problems.</p>
+<ul>
+<li><strong>Versioning:</strong>
+  <ul>
+    <li>Use <strong>vector clocks</strong> to track data versions and resolve conflicts.</li>
+    <li>Versioning means treating each data modification as a new immutable version of data.</li>
+  </ul>
+  <div>
+    <img class="orig-img" src="06.%20Key-Value%20Store/images/consistent-server.png" alt="Consisten hashing">
+    <img class="orig-img" src="06.%20Key-Value%20Store/images/inconsistent-server.png" alt="Inconsistent server">
+  </div>
+  <p>Server 1 changes the name, and server 2 also changes the name. These two changes are performed simultaneously. Now, we have conflicting values, called versions v1 and v2.</p>
+</li>
+</ul>
+
+<ul>
+<li><strong>Vector Clock</strong>
+  <ol>
+    <li><strong>Setup</strong>: A vector clock is a [server, version] pair associated with a data item. It can be used to check if one version precedes, succeeds, or in conflict with others.
+      <ul>
+        <li>Assume a vector clock represented by D([S1, v1], [S2, v2], &hellip;, [Sn, vn]), If data item D is written to server Si, the system must perform one of the following tasks.</li>
+        <li>Where: <code>D</code> is the data item. <code>Si</code> is the server identifier. <code>vi</code> is the version counter for the data at server <code>Si</code>.</li>
+      </ul>
+    </li>
+    <li><strong>Updating the Vector Clock:</strong> When a data item is modified at a server:
+      <ul>
+        <li>If the server exists in the vector clock, its version counter is incremented.</li>
+        <li>Otherwise, a new entry is added to the vector clock.</li>
+      </ul>
+    </li>
+    <li><strong>Conflict Detection:</strong>
+      <ul>
+        <li><strong>No Conflict:</strong> A version X is an ancestor of version Y if all counters in X are less than or equal to those in Y.</li>
+        <li><strong>Conflict Exists:</strong> Two versions are siblings if there is at least one counter in Y that is less than its counterpart in X.</li>
+      </ul>
+    </li>
+    <li><strong>Conflict Resolution:</strong> When conflicts are detected (sibling versions), the system relies on application-specific logic or client intervention to reconcile the data.</li>
+  </ol>
+</li>
+</ul>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/vector-clock.png" alt="Server hashing">
+
+<ul>
+<li><strong>Challenges:</strong>
+  <ul>
+    <li>Increased complexity for clients.</li>
+    <li>Vector clock size may grow with many updates, requiring trimming strategies to limit its size.</li>
+  </ul>
+</li>
+</ul>
+
+<h4>5. Handling Failures</h4>
+
+<p><strong>a. Failure Detection</strong></p>
+<p>It is insufficient to believe that a server is down because another server says so. Usually, it requires at least two independent sources of information to mark a server down.</p>
+<ul>
+<li><strong>Gossip Protocol:</strong>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/gossip-protocol.png" alt="Gossip protocol">
+  <ul>
+    <li>Each node maintains member IDs and heartbeat counters.</li>
+    <li>Each node periodically increments its heartbeat counter.</li>
+    <li>Each node periodically sends heartbeats to a set of random nodes.</li>
+    <li>If the heartbeat has not increased for more than predefined periods, the member is considered as offline</li>
+  </ul>
+</li>
+</ul>
+
+<p><strong>b. Temporary Failures</strong></p>
+<ul>
+<li><strong>Sloppy Quorum:</strong> Use healthy nodes to maintain operations temporarily.
+<img class="orig-img" src="06.%20Key-Value%20Store/images/sloppy-quorum.png" alt="Sloppy Quorum">
+  <ul>
+    <li>After detecting failures, the system needs to deploy certain mechanisms to ensure availability</li>
+    <li>Instead of enforcing the quorum requirement, the system chooses the first W healthy servers for writes and first R healthy servers for reads on the hash ring.</li>
+    <li>Offline servers are ignored. If a server is unavailable, another server will process requests temporarily</li>
+  </ul>
+</li>
+</ul>
+<ul>
+<li><strong>Hinted Handoff:</strong> Offline servers catch up with changes upon recovery.
+  <ul>
+    <li>When the down server is up, changes will be pushed back to achieve data consistency</li>
+  </ul>
+</li>
+</ul>
+
+<p><strong>c. Permanent Failures</strong></p>
+<ul>
+<li>Use <strong>Merkle Trees</strong> for efficient synchronization between replicas.
+A <strong>Merkle Tree</strong> (or hash tree) is a data structure to efficiently detect and resolve inconsistencies between replicas during permanent failures.</li>
+</ul>
+<ul>
+<li>Working
+  <ol>
+    <li><strong>Structure:</strong>
+      <ul>
+        <li><strong>Leaf Nodes</strong> store the hash of individual data blocks.</li>
+        <li><strong>Non-Leaf Nodes</strong> store the hash of their child nodes.</li>
+        <li>The <strong>root hash</strong> represents the combined state of all data in the tree.</li>
+      </ul>
+    </li>
+    <li><strong>Building a Merkle Tree:</strong>
+      <ul>
+        <li><strong>Step 1:</strong> Divide the key space into buckets.
+        <img class="orig-img" src="06.%20Key-Value%20Store/images/key-bucket.png" alt="Key Bucket">
+        </li>
+        <li><strong>Step 2:</strong> Hash each key in a bucket using uniform hashing.
+        <img class="orig-img" src="06.%20Key-Value%20Store/images/hash-key-bucket.png" alt="Hash Key Bucket">
+        </li>
+        <li><strong>Step 3:</strong> Create a single hash for each bucket.
+        <img class="orig-img" src="06.%20Key-Value%20Store/images/hash-bucket.png" alt="Hash Bucket">
+        </li>
+        <li><strong>Step 4:</strong> Combine hashes of buckets to compute higher-level hashes, culminating in the root hash.
+        <img class="orig-img" src="06.%20Key-Value%20Store/images/merkel-tree.png" alt="Merkel Tree">
+        </li>
+      </ul>
+    </li>
+    <li><strong>Synchronization:</strong>
+      <ul>
+        <li>To synchronize two replicas:
+          <ul>
+            <li>Compare their root hashes.</li>
+            <li>If the root hashes match, the replicas are consistent.</li>
+            <li>If the root hashes differ, compare child hashes recursively to identify inconsistent buckets.</li>
+          </ul>
+        </li>
+        <li>Only the inconsistent data is synchronized.</li>
+      </ul>
+    </li>
+  </ol>
+</li>
+</ul>
+<ul>
+<li>Advantages
+  <ul>
+    <li><strong>Efficiency:</strong> Only inconsistent data is synchronized, reducing data transfer.</li>
+    <li><strong>Scalability:</strong> Effective for large datasets with minimal synchronization overhead.</li>
+    <li><strong>Reliability:</strong> Ensures data consistency across replicas.</li>
+  </ul>
+</li>
+</ul>
+
+<h4>6. Handling Data Center Outages</h4>
+<ul>
+<li>Replicate data across multiple data centers to ensure availability during outages.</li>
+</ul>
+
+<h3>Write and Read Paths</h3>
+<h4>1. Write Path (Based on Cassandra architecture)</h4>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/write-path.png" alt="Hash Bucket">
+<ul>
+<li>Persist the write in a <strong>commit log</strong>.</li>
+<li>Save data to a <strong>memory cache</strong>.</li>
+<li>Flush data to <strong>SSTable</strong> (Sorted String Table) on disk when cache is full.</li>
+</ul>
+
+<h4>2. Read Path</h4>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/read-path.png" alt="Hash Bucket">
+<img class="orig-img" src="06.%20Key-Value%20Store/images/read-path-without-cache.png" alt="Hash Bucket">
+<ul>
+<li>Check <strong>memory cache</strong> for the data.</li>
+<li>If absent, use a <strong>Bloom Filter</strong> to locate the data in SSTables.</li>
+<li>Retrieve and return the data.</li>
+</ul>
+
+<h3>Final Architecture</h3>
+<img class="orig-img" src="06.%20Key-Value%20Store/images/final-architecture.png" alt="Hash Bucket">
+<ul>
+<li>Clients communicate with the key-value store through simple APIs: get(key) and put(key, value).</li>
+<li>A coordinator is a node that acts as a proxy between the client and the key-value store.</li>
+<li>Nodes are distributed on a ring using consistent hashing.</li>
+<li>The system is completely decentralized so adding and moving nodes can be automatic.</li>
+<li>Data is replicated at multiple nodes.</li>
+<li>There is no single point of failure as every node has the same set of responsibilities.</li>
+</ul>
